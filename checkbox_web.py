@@ -31,7 +31,7 @@ from checkbox_app import (APP_VERSION, AUTH_MODES, DATA_DIR, LOG_PATH, log, setu
                           CheckboxError, LocalDB, auth_mode, load_config, save_config,
                           build_goods_payload, clean_payment_label, good_tax_codes, new_receipt_id,
                           no_tax_goods, round_cash, sync_all, apply_discounts, return_lines,
-                          return_good_payload, local_time, line_sum)
+                          return_good_payload, local_time, line_sum, clean_phone, mask_phone)
 
 # Порти, які пробує каса: спершу той, що був минулого разу, далі по черзі від 8000
 PORT_RANGE = range(8000, 8020)
@@ -566,6 +566,17 @@ class App:
         details = {"card": card, "terminal": terminal_raw} if (card or terminal_raw) else None
         return extra, label, details
 
+    @staticmethod
+    def _delivery(body):
+        """Телефон покупця → блок delivery (копія чека в SMS/Viber)."""
+        try:
+            phone = clean_phone(body.get("phone"))
+        except ValueError as e:
+            raise UserError(str(e))
+        if phone:
+            log.info("Копія чека на телефон %s", mask_phone(phone))
+        return {"phone": phone} if phone else None
+
     def sell(self, body):
         payment_type = body.get("payment_type")
         if payment_type not in ("CASH", "CASHLESS"):
@@ -589,8 +600,9 @@ class App:
 
         # ID генерується один раз: якщо call() повторить запит після 401, чек не задублюється
         receipt_id = new_receipt_id()
+        delivery = self._delivery(body)
         receipt = self.call(self.api.sell, receipt_id, build_goods_payload(cart, use_leftovers, line_ds),
-                            payment_type, pay_value, rounding_mode, extra or None, receipt_ds)
+                            payment_type, pay_value, rounding_mode, extra or None, receipt_ds, None, delivery)
         if receipt.get("total_sum") is not None and receipt["total_sum"] != total:
             log.warning("Сума чека %s у Checkbox %s ≠ розрахованій касою %s", receipt["id"], receipt["total_sum"], total)
         for g, qty, _ in cart:
@@ -629,7 +641,7 @@ class App:
         extra, label, details = self._payment(body, payment_type)
         receipt, relation_id = self.call(
             self.api.prepayment, new_receipt_id(), build_goods_payload(cart, use_leftovers, line_ds),
-            {"type": payment_type, "value": amount, **extra}, receipt_ds)
+            {"type": payment_type, "value": amount, **extra}, receipt_ds, self._delivery(body))
         if not relation_id:
             log.error("Чек передплати %s створено, але Checkbox не повернув pre_payment_relation_id", receipt["id"])
             raise UserError("Чек передплати пробито, але Checkbox не повернув номер замовлення. "
@@ -685,7 +697,7 @@ class App:
             value = received
         extra, label, details = self._payment(body, payment_type)
         receipt = self.call(self.api.postpayment, p["relation_id"], new_receipt_id(),
-                            {"type": payment_type, "value": value, **extra}, rounding_mode)
+                            {"type": payment_type, "value": value, **extra}, rounding_mode, self._delivery(body))
         kind = "POSTPAYMENT" if closing else "PREPAYMENT"
         self.db.update_prepayment(p["relation_id"], paid=p["paid"] + amount, status="PAID" if closing else None,
                                   receipt=self._chain_entry(receipt, kind, amount, payment_type))
@@ -888,7 +900,7 @@ class App:
         pay_value = round_cash(total, rounding_mode)
         extra, label, details = self._payment(body, payment_type)
         receipt = self.call(self.api.sell, new_receipt_id(), goods, payment_type, pay_value,
-                            rounding_mode, extra or None, None, orig["id"])
+                            rounding_mode, extra or None, None, orig["id"], self._delivery(body))
         if use_leftovers:                     # повернутий товар знову на залишку
             for g in goods:
                 if g.get("good_id"):
@@ -1263,6 +1275,10 @@ PAGE = r"""<!DOCTYPE html>
   .kind.ret { background: #fee2e2; color: #991b1b; } .kind.in { background: #dcfce7; color: #166534; } .kind.out { background: #fef3c7; color: #92400e; }
   .cashnow { font-size: 15px; margin-top: 8px; color: var(--text); }
   .kind.pre { background: #ede9fe; color: #5b21b6; }
+  .phonebox { margin: 0 0 12px; }
+  .phonebox label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  .phonebox input.bad, input.bad { border-color: var(--bad); outline-color: var(--bad); }
+  .phonebox small { font-size: 12px; }
   .stockbox { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
   #askModal { z-index: 60; }
   #scanModal .card { max-width: 620px; }
@@ -1340,6 +1356,11 @@ PAGE = r"""<!DOCTYPE html>
           <div class="line strong"><span>До сплати готівкою</span><span id="toPayCash">0.00 ₴</span></div>
           <div class="line"><span>Отримано, ₴</span><input type="number" id="received" min="0" step="0.5" placeholder="без решти"></div>
           <div class="line" id="restLine"><span>Решта</span><span id="rest"></span></div>
+        </div>
+        <div class="phonebox">
+          <label>📱 Телефон покупця — копія чека в SMS/Viber (необов'язково)
+            <input type="text" id="phone" inputmode="tel" autocomplete="off" placeholder="067 123 45 67"></label>
+          <small class="muted" id="phoneHint"></small>
         </div>
         <div class="pay three">
           <button class="btn ok" id="payCash">Готівка</button>
@@ -1696,6 +1717,9 @@ PAGE = r"""<!DOCTYPE html>
     <label><input type="radio" name="retType" value="CASHLESS"> На картку / безготівка</label>
   </div>
   <div id="retCardBox" class="status wait" style="display:none"></div>
+  <div class="form one" style="margin-top:12px">
+    <label>📱 Телефон покупця — копія чека повернення в SMS/Viber (необов'язково)<input type="text" id="retPhone" inputmode="tel" autocomplete="off" placeholder="067 123 45 67"></label>
+  </div>
   <div class="pay" style="margin-top:16px">
     <button class="btn sec" id="retCancel">Скасувати</button>
     <button class="btn danger" id="retSubmit">Пробити повернення</button>
@@ -1731,6 +1755,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="form">
     <label>Сума, ₴<input type="text" id="postAmount" inputmode="decimal"></label>
     <label id="postRecvWrap">Отримано готівкою, ₴<input type="text" id="postReceived" inputmode="decimal" placeholder="без решти"></label>
+    <label class="wide">📱 Телефон покупця — копія чека в SMS/Viber (необов'язково)<input type="text" id="postPhone" inputmode="tel" autocomplete="off" placeholder="067 123 45 67"></label>
   </div>
   <div id="postCalc" class="status wait"></div>
   <p class="muted" style="margin:12px 0 6px">Чим платить:</p>
@@ -2077,6 +2102,28 @@ $('#search').onkeydown = e => {
   if (!g) return toast(list.length ? 'Знайдено кілька товарів — оберіть зі списку' : 'Товар не знайдено', true);
   addToCart(g.id); $('#search').value = ''; renderSearch();
 };
+
+// --- телефон покупця (delivery.phone, формат 380XXXXXXXXX) — те саме правило, що й clean_phone() ---
+function cleanPhone(v) {          // '' — не вказано; null — невірний; інакше 380XXXXXXXXX
+  let d = String(v || '').replace(/\D/g, '');
+  if (!d) return '';
+  if (d.length === 10 && d[0] === '0') d = '38' + d;
+  else if (d.length === 9) d = '380' + d;
+  return /^380\d{9}$/.test(d) ? d : null;
+}
+const fmtPhone = p => `+${p.slice(0, 3)} ${p.slice(3, 5)} ${p.slice(5, 8)} ${p.slice(8, 10)} ${p.slice(10)}`;
+function phoneOf(sel) {           // значення поля або виняток, якщо номер невірний
+  const p = cleanPhone($(sel).value);
+  if (p === null) { $(sel).classList.add('bad'); $(sel).focus(); throw new Error('Невірний номер телефону — напр. 067 123 45 67'); }
+  return p;
+}
+function renderPhone() {
+  const v = $('#phone').value, p = cleanPhone(v);
+  $('#phone').classList.toggle('bad', p === null && v.trim().length >= 10);
+  $('#phoneHint').textContent = p ? `Чек надійде на ${fmtPhone(p)}` : p === null && v.trim().length >= 10 ? 'Невірний номер' : '';
+}
+$('#phone').oninput = renderPhone;
+['#postPhone', '#retPhone'].forEach(id => $(id).addEventListener('input', () => $(id).classList.remove('bad')));
 
 // --- кошик ---
 // Додати кількість товару в кошик; повертає номер рядка або null (недостатньо залишку — показано повідомлення)
@@ -2521,8 +2568,11 @@ async function pay(type, btn, card, label, opts = {}) {   // повертає tr
   if (!opts.marksChecked && !(await confirmMarks())) return false;
   const de = discountError();
   if (de) { toast('Виправте знижку: ' + de, true); return false; }
+  let phone;
+  try { phone = phoneOf('#phone'); } catch (e) { toast(e.message, true); return false; }
   const body = { items: cart, payment_type: type };
   if (cartDisc) body.discount = cartDisc;
+  if (phone) body.phone = phone;
   if (card) body.card = card;
   if (label) body.label = label;
   if (opts.terminalRaw) body.terminal_raw = opts.terminalRaw;
@@ -2542,7 +2592,7 @@ async function pay(type, btn, card, label, opts = {}) {   // повертає tr
       if (!(await openShiftNow())) throw e;
       r = await api('/api/sell', body);
     }
-    cart = []; cartDisc = null; $('#received').value = '';
+    cart = []; cartDisc = null; $('#received').value = ''; $('#phone').value = ''; renderPhone();
     const last = $('#last');
     last.style.display = 'block';
     const extra = (r.round_sum ? ` · заокруглення ${uah(r.round_sum)} ₴` : '') + (r.rest ? ` · решта ${uah(r.rest)} ₴` : '');
@@ -2718,6 +2768,7 @@ async function openTermPay() {
   if (!cart.length) return toast('Кошик порожній', true);
   const de = discountError();
   if (de) return toast('Виправте знижку: ' + de, true);   // до списання з картки, а не після
+  try { phoneOf('#phone'); } catch (e) { return toast(e.message, true); }
   if (!(await confirmMarks())) return;
   term = { amount: cartTotal, messages: [] };
   showTermModal();
@@ -2984,6 +3035,7 @@ async function openReturn(id) {
   try { info = await api('/api/receipt?id=' + encodeURIComponent(id)); } catch (e) { return toast(e.message, true); }
   if (!info.lines.some(l => l.max > 0)) return toast('За цим чеком усі товари вже повернуто', true);
   ret = { info, qty: {}, on: new Set() };
+  $('#retPhone').value = '';
   info.lines.forEach(l => { if (l.max > 0) { ret.qty[l.line] = l.max; ret.on.add(l.line); } });
   $('#retFn').textContent = info.fiscal_code || info.id.slice(0, 8);
   const payWas = info.payment_type === 'CASH' ? 'готівка' : 'безготівка';
@@ -3063,6 +3115,7 @@ $('#retSubmit').onclick = async e => {
   const items = info.lines.filter(l => ret.on.has(l.line) && ret.qty[l.line] > 0).map(l => ({ line: l.line, qty: ret.qty[l.line] }));
   if (!items.length) return toast('Оберіть товари для повернення', true);
   const body = { id: info.id, items, payment_type: type };
+  try { const ph = phoneOf('#retPhone'); if (ph) body.phone = ph; } catch (err) { return toast(err.message, true); }
   if (type === info.payment_type && info.payment_label && !STD_LABELS.includes(info.payment_label)) body.label = info.payment_label;
   const origCard = type === 'CASHLESS' && info.payment_type === 'CASHLESS' && Object.keys(info.card || {}).length ? info.card : null;
   if (origCard) body.card = origCard;
@@ -3137,8 +3190,9 @@ $('#preSubmit').onclick = async e => {
   const type = radioVal('preType');
   const body = { items: cart, payment_type: type, amount, note: $('#preNote').value.trim() };
   if (cartDisc) body.discount = cartDisc;
+  try { const ph = phoneOf('#phone'); if (ph) body.phone = ph; } catch (err) { closePre(); return toast(err.message, true); }
   const done = r => {
-    cart = []; cartDisc = null; renderCart(); closePre();
+    cart = []; cartDisc = null; renderCart(); closePre(); $('#phone').value = ''; renderPhone();
     toast(`Передплату пробито: ${uah(r.amount)} ₴, залишок ${uah(r.left)} ₴ (замовлення ${r.relation_id})`);
     showReceipt(r.id, { title: `Чек передплати · замовлення ${r.relation_id}` });
   };
@@ -3243,7 +3297,7 @@ function openPost(id) {
   post = p;
   $('#postTitle').textContent = `Доплата · ${p.note || 'замовлення ' + p.relation_id}`;
   $('#postInfo').textContent = `Сума замовлення ${uah(p.total)} ₴ · сплачено ${uah(p.paid)} ₴ · залишок ${uah(p.left)} ₴`;
-  $('#postAmount').value = (p.left / 100).toFixed(2); $('#postReceived').value = '';
+  $('#postAmount').value = (p.left / 100).toFixed(2); $('#postReceived').value = ''; $('#postPhone').value = '';
   renderPost();
   $('#postModal').classList.add('show'); $('#postAmount').focus(); $('#postAmount').select();
 }
@@ -3277,6 +3331,7 @@ $('#postSubmit').onclick = async e => {
   if (c.recv != null && c.recv < c.value) return toast('Отримано менше, ніж до сплати', true);
   const body = { relation_id: post.relation_id, payment_type: c.type, amount: c.amount };
   if (c.recv != null) body.received = c.recv;
+  try { const ph = phoneOf('#postPhone'); if (ph) body.phone = ph; } catch (err) { return toast(err.message, true); }
   const p = post;
   const done = r => {
     closePost(); loadPrepayments(); loadShift();
@@ -3567,7 +3622,7 @@ def _tray_image(Image):
 def start_tray(url):
     """
     Значок у треї Windows: каса працює й після закриття вкладки, і її видно.
-    Меню: «Відкрити касу» (також клік по значку), «Журнал роботи», «Вийти».
+    Меню: «Відкрити касу» (також клік по значку), «Відкрити папку з логами», «Відкрити поточний лог», «Вийти».
     Потрібні pystray і Pillow; якщо їх немає — каса просто працює без значка.
     """
     if os.name != "nt" and os.environ.get("CHECKBOX_FORCE_TRAY") != "1":
@@ -3581,6 +3636,16 @@ def start_tray(url):
 
     def open_kasa(icon=None, item=None):
         webbrowser.open(url)
+
+    def open_log_file(icon=None, item=None):
+        if hasattr(os, "startfile") and LOG_PATH.exists():
+            try:
+                os.startfile(str(LOG_PATH))          # програма, що відкриває .log
+            except OSError:                          # для .log немає програми — Блокнот
+                import subprocess
+                subprocess.Popen(["notepad.exe", str(LOG_PATH)])
+        else:
+            open_logs()
 
     def open_logs(icon=None, item=None):
         folder = str(LOG_PATH.parent)
@@ -3596,7 +3661,8 @@ def start_tray(url):
 
     menu = pystray.Menu(
         pystray.MenuItem("Відкрити касу", open_kasa, default=True),
-        pystray.MenuItem("Журнал роботи", open_logs),
+        pystray.MenuItem("Відкрити папку з логами", open_logs),
+        pystray.MenuItem("Відкрити поточний лог", open_log_file),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Вийти", quit_kasa),
     )

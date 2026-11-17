@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.2.7"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.3.0"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -475,7 +475,7 @@ class CheckboxAPI:
 
     # --- чеки ---
     def sell(self, receipt_id, goods, payment_type, pay_value, rounding_mode=None,
-             payment_extra=None, discounts=None, related_receipt_id=None):
+             payment_extra=None, discounts=None, related_receipt_id=None, delivery=None):
         """
         Чек продажу або повернення (для повернення в товарах is_return: true).
         receipt_id    — UUID v4, який генерує інтеграція (обов'язково).
@@ -498,6 +498,8 @@ class CheckboxAPI:
             body["discounts"] = discounts
         if related_receipt_id:
             body["related_receipt_id"] = related_receipt_id
+        if delivery:
+            body["delivery"] = delivery
         if payment_type == "CASH" and rounding_mode:
             body["rounding"] = True
             body["rounding_mode"] = rounding_mode
@@ -540,7 +542,7 @@ class CheckboxAPI:
                 return rid
         return None
 
-    def prepayment(self, receipt_id, goods, payment, discounts=None):
+    def prepayment(self, receipt_id, goods, payment, discounts=None, delivery=None):
         """
         Чек передплати: усі товари замовлення, оплата — лише внесок (менше за суму товарів).
         Повертає (чек, pre_payment_relation_id).
@@ -548,16 +550,20 @@ class CheckboxAPI:
         body = {"id": receipt_id, "goods": goods, "payments": [payment]}
         if discounts:
             body["discounts"] = discounts
+        if delivery:
+            body["delivery"] = delivery
         resp = self._post_receipt("/prepayment-receipts", body)
         receipt = self._wait_receipt(receipt_id)
         return receipt, self.relation_id_of(resp) or self.relation_id_of(receipt)
 
-    def postpayment(self, relation_id, receipt_id, payment, rounding_mode=None):
+    def postpayment(self, relation_id, receipt_id, payment, rounding_mode=None, delivery=None):
         """
         Наступний чек ланцюжка: оплата, менша за залишок, — ще одна передплата;
         рівна залишку (або більша, з рештою готівкою) — післяплата, що закриває замовлення.
         """
         body = {"id": receipt_id, "payments": [payment]}
+        if delivery:
+            body["delivery"] = delivery
         if payment.get("type") == "CASH" and rounding_mode:
             body["rounding"] = True
             body["rounding_mode"] = rounding_mode
@@ -1258,6 +1264,27 @@ def payment_title(payment_type, label=None):
 def line_sum(price, qty):
     """Сума рядка: ціна (коп.) × кількість (тисячні), заокруглення 0.5 копійки — вгору."""
     return (price * qty + 500) // 1000
+
+
+def clean_phone(value):
+    """
+    Телефон покупця для delivery.phone (копія чека в SMS/Viber): формат 380XXXXXXXXX.
+    Приймає «+38 (067) 123-45-67», «0671234567», «671234567». Порожньо → None; невірно → ValueError.
+    """
+    digits = re.sub(r"\D", "", str(value or ""))
+    if not digits:
+        return None
+    if len(digits) == 10 and digits.startswith("0"):
+        digits = "38" + digits
+    elif len(digits) == 9:
+        digits = "380" + digits
+    if not re.fullmatch(r"380\d{9}", digits):
+        raise ValueError("Невірний номер телефону — потрібен український номер, напр. 067 123 45 67")
+    return digits
+
+
+def mask_phone(phone):
+    return phone[:5] + "*****" + phone[-2:] if phone else ""
 
 
 def new_receipt_id():
