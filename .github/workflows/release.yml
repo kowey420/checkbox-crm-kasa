@@ -1,6 +1,7 @@
 # Випуск нової версії каси.
-# Як випустити: змінити APP_VERSION у checkbox_app.py (напр. "1.1.0"), закомітити й надіслати тег:
-#   git tag v1.1.0 && git push origin v1.1.0
+# Як випустити: змінити APP_VERSION у checkbox_app.py (напр. "1.1.0"), закомітити й надіслати, далі
+#   - або на GitHub: Actions → «Випуск» → Run workflow (тег v1.1.0 створиться сам),
+#   - або тегом: git tag v1.1.0 && git push origin v1.1.0
 # GitHub збере Kasa.exe (Windows), Kasa-mac.zip, kasa-py.zip і SHA256SUMS.txt та опублікує випуск.
 # Каси з налаштованим оновленням побачать банер «Доступна нова версія».
 
@@ -9,6 +10,7 @@ name: Випуск
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,15 +18,27 @@ permissions:
 jobs:
   check-version:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - name: Версія в коді збігається з тегом
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           V=$(python3 -c "import re; print(re.search(r'APP_VERSION = \"([^\"]+)\"', open('checkbox_app.py', encoding='utf-8').read()).group(1))")
-          if [ "v$V" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::APP_VERSION = $V у checkbox_app.py, а тег — $GITHUB_REF_NAME. Виправте одне з них."
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "v$V" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::APP_VERSION = $V у checkbox_app.py, а тег — $GITHUB_REF_NAME. Виправте одне з них."
+              exit 1
+            fi
+          elif gh release view "v$V" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Випуск v$V вже існує. Збільште APP_VERSION у checkbox_app.py."
             exit 1
           fi
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+          echo "Випуск v$V"
       - name: Код компілюється на Python 3.9 (вбудований у macOS)
         run: |
           python3 - <<'PY'
@@ -84,7 +98,7 @@ jobs:
           path: out/*
 
   release:
-    needs: [windows, mac-and-py]
+    needs: [check-version, windows, mac-and-py]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -98,6 +112,8 @@ jobs:
           cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.check-version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: |
             out/Kasa.exe
             out/Kasa-mac.zip

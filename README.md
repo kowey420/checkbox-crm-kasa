@@ -50,14 +50,13 @@ Python не потрібен. Дані зберігаються в `%LOCALAPPDAT
 
 ## Випуск нової версії
 1. Змініть `APP_VERSION` у `checkbox_app.py`, наприклад `"1.1.0"`.
-2. Закомітьте й надішліть тег:
-   ```
-   git commit -am "Версія 1.1.0"
-   git tag v1.1.0
-   git push && git push origin v1.1.0
-   ```
-3. GitHub Actions (`.github/workflows/release.yml`) збере `Kasa.exe`, `Kasa-mac.zip`, `kasa-py.zip`,
-   `SHA256SUMS.txt` і опублікує випуск. Якщо версія в коді не збігається з тегом — збирання зупиниться.
+2. Закомітьте й надішліть зміни (`git commit -am "Версія 1.1.0" && git push`).
+3. Запустіть випуск одним зі способів:
+   - на GitHub: **Actions → «Випуск» → Run workflow** — тег `v1.1.0` створиться сам;
+   - або тегом: `git tag v1.1.0 && git push origin v1.1.0`.
+4. GitHub Actions (`.github/workflows/release.yml`) збере `Kasa.exe`, `Kasa-mac.zip`, `kasa-py.zip`,
+   `SHA256SUMS.txt` і опублікує випуск. Якщо версія в коді не збігається з тегом або такий випуск
+   уже є — збирання зупиниться.
 
 ## Структура
 | Файл | Що робить |
