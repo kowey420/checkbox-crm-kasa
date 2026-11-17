@@ -21,7 +21,7 @@ jobs:
     outputs:
       tag: ${{ steps.ver.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Версія в коді збігається з тегом
         id: ver
         env:
@@ -52,8 +52,8 @@ jobs:
     needs: check-version
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Залежності
@@ -63,7 +63,7 @@ jobs:
           pyinstaller --noconfirm --clean --onefile --noconsole --name Kasa --icon kasa.ico
           --hidden-import goods_csv --hidden-import kasa_update --hidden-import pystray._win32
           --collect-data certifi --add-data "kasa.ico;." checkbox_web.py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: dist/Kasa.exe
@@ -72,8 +72,8 @@ jobs:
     needs: check-version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Залежності
@@ -92,7 +92,7 @@ jobs:
                   z.write(f, f)
           print("kasa-py.zip:", files)
           PY
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: other
           path: out/*
@@ -101,7 +101,7 @@ jobs:
     needs: [check-version, windows, mac-and-py]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: out
           merge-multiple: true
@@ -110,7 +110,7 @@ jobs:
           cd out
           sha256sum Kasa.exe Kasa-mac.zip kasa-py.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.check-version.outputs.tag }}
           target_commitish: ${{ github.sha }}

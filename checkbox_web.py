@@ -30,7 +30,8 @@ from checkbox_app import (APP_VERSION, AUTH_MODES, DATA_DIR, LOG_PATH, log, setu
                           ROUNDING_MODES, CheckboxAPI,
                           CheckboxError, LocalDB, auth_mode, load_config, save_config,
                           build_goods_payload, clean_payment_label, good_tax_codes, new_receipt_id,
-                          no_tax_goods, round_cash, sync_all)
+                          no_tax_goods, round_cash, sync_all, apply_discounts, return_lines,
+                          return_good_payload, local_time, line_sum)
 
 # Порти, які пробує каса: спершу той, що був минулого разу, далі по черзі від 8000
 PORT_RANGE = range(8000, 8020)
@@ -396,7 +397,7 @@ class App:
 
     # ---- зміна ----
     def shift(self):
-        return {"shift": self.call(self.api.current_shift)}
+        return {"shift": self.call(self.api.current_shift), "last_z": self.last_z()}
 
     def _sync_quietly(self):
         """Синхронізація при відкритті/закритті зміни: помилка не зриває саму операцію зі зміною."""
@@ -419,12 +420,56 @@ class App:
         sync = self._sync_quietly()          # правки дня — у Checkbox ще до Z-звіту
         shift = self.call(self.api.close_shift)
         z = shift.get("z_report") or {}
+        if z.get("id"):
+            with self.db.con:
+                self.db.con.execute("INSERT OR REPLACE INTO meta VALUES ('last_z_report', ?)",
+                                    (json.dumps({"id": z["id"], "serial": shift.get("serial"),
+                                                 "closed_at": local_time(shift.get("closed_at"))}),))
+        log.info("Зміну №%s закрито, Z-звіт %s", shift.get("serial"), z.get("id"))
         return {"shift": shift, "z_report_id": z.get("id"), "sync": sync}
 
     def x_report(self):
         if not self.call(self.api.current_shift):
             raise UserError("Немає відкритої зміни")
-        return {"text": self.call(self.api.x_report)}
+        report = self.call(self.api.create_x_report)
+        return {"report_id": report["id"]}
+
+    def report_text(self, report_id):
+        if not self.RECEIPT_ID.match(report_id or ""):
+            raise UserError("Невірний ID звіту")
+        return {"text": self.call(self.api.report_text, report_id)}
+
+    def report_png(self, report_id):
+        if not self.RECEIPT_ID.match(report_id or ""):
+            raise UserError("Невірний ID звіту")
+        png = self.call(self.api.report_png, report_id)
+        if not png.startswith(b"\x89PNG"):
+            raise CheckboxError("Checkbox повернув не PNG")
+        return png
+
+    def last_z(self):
+        try:
+            return json.loads(self.db.meta("last_z_report") or "null")
+        except ValueError:
+            return None
+
+    # ---- службове внесення / винесення ----
+    def service(self, body):
+        value = body.get("value")
+        if not isinstance(value, int) or isinstance(value, bool) or not value or abs(value) > 10 ** 10:
+            raise UserError("Невірна сума")
+        shift = self.call(self.api.current_shift)
+        if not shift:
+            raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
+        if value < 0:
+            cash = (shift.get("balance") or {}).get("balance")
+            if isinstance(cash, int) and -value > cash:
+                raise UserError(f"У касі лише {cash / 100:.2f} грн готівки")
+        kind = "SERVICE_IN" if value > 0 else "SERVICE_OUT"
+        receipt = self.call(self.api.service, new_receipt_id(), value)
+        self.db.add_sale(receipt, "CASH", [], None, None, kind, total=abs(value))
+        log.info("%s: чек %s, %.2f грн", "Внесення" if value > 0 else "Винесення", receipt["id"], abs(value) / 100)
+        return {"id": receipt["id"], "fiscal_code": receipt.get("fiscal_code"), "value": value}
 
     # ---- продаж ----
     def sell(self, body):
@@ -461,7 +506,16 @@ class App:
             all_marks.update(marks)
 
             cart.append((row, qty, marks))
-            total += round(row["price"] * qty / 1000)
+
+        try:
+            line_ds, receipt_ds, line_totals, total = apply_discounts(
+                [{"base": line_sum(g["price"], q), "tax_codes": good_tax_codes(g), "name": g["name"],
+                  "spec": it.get("disc")} for (g, q, _), it in zip(cart, items)],
+                body.get("discount"))
+        except ValueError as e:
+            raise UserError(str(e))
+        if total <= 0:
+            raise UserError("Сума чека має бути більшою за нуль")
 
         rounding_mode = self.rounding_mode() if payment_type == "CASH" else None
         to_pay = round_cash(total, rounding_mode)
@@ -489,20 +543,101 @@ class App:
 
         # ID генерується один раз: якщо call() повторить запит після 401, чек не задублюється
         receipt_id = new_receipt_id()
-        receipt = self.call(self.api.sell, receipt_id, build_goods_payload(cart, use_leftovers),
-                            payment_type, pay_value, rounding_mode, extra or None)
+        receipt = self.call(self.api.sell, receipt_id, build_goods_payload(cart, use_leftovers, line_ds),
+                            payment_type, pay_value, rounding_mode, extra or None, receipt_ds)
+        if receipt.get("total_sum") is not None and receipt["total_sum"] != total:
+            log.warning("Сума чека %s у Checkbox %s ≠ розрахованій касою %s", receipt["id"], receipt["total_sum"], total)
         for g, qty, _ in cart:
             self.db.decrease_count(g["id"], qty)
         self.db.add_sale(receipt, payment_type,
-                         [{"name": g["name"], "code": g["code"], "qty": qty, "price": g["price"],
+                         [{"name": g["name"], "code": g["code"], "qty": qty, "price": g["price"], "sum": t,
                            **({"excise_barcodes": m} if m else {})}
-                          for g, qty, m in cart], label, details)
+                          for (g, qty, m), t in zip(cart, line_totals)], label, details)
         log.info("Продаж: чек %s, ФН %s, %.2f грн, %s%s, позицій %d", receipt["id"], receipt.get("fiscal_code"),
                  (receipt.get("total_sum") or total) / 100, payment_type, f" ({label})" if label else "", len(cart))
         return {"id": receipt["id"], "fiscal_code": receipt.get("fiscal_code"),
                 "total_sum": receipt.get("total_sum", total),
                 "round_sum": receipt.get("round_sum"),
                 "rest": receipt.get("rest")}
+
+    # ---- повернення ----
+    def _sale_for_return(self, receipt_id):
+        if not self.RECEIPT_ID.match(receipt_id or ""):
+            raise UserError("Невірний ID чека")
+        r = self.call(self.api.get_receipt, receipt_id)
+        if (r.get("type") or "SELL") != "SELL":
+            raise UserError("Повернути можна лише чек продажу")
+        if r.get("status") not in (None, "DONE"):
+            raise UserError(f"Чек ще не фіскалізовано (статус {r.get('status')})")
+        lines = return_lines(r, self.db.returned_qty(r["id"]))
+        for ln in lines:            # ваговий: за локальним товаром, інакше — за дробовою кількістю
+            row = self.db.con.execute("SELECT is_weight FROM goods WHERE TRIM(code)=TRIM(?)",
+                                      (str(ln["code"]),)).fetchone()
+            ln["is_weight"] = bool(row["is_weight"]) if row else bool(ln["qty"] % 1000)
+        return r, lines
+
+    def receipt_info(self, receipt_id):
+        """Чек продажу для вікна повернення: рядки з уже повернутим, оплата оригіналу."""
+        r, lines = self._sale_for_return(receipt_id)
+        pays = r.get("payments") or []
+        p = pays[0] if pays else {}
+        card = {k: p.get(k) for k in CARD_TEXT_FIELDS if p.get(k)}
+        return {"id": r["id"], "fiscal_code": r.get("fiscal_code"), "total_sum": r.get("total_sum"),
+                "created_at": local_time(r.get("fiscal_date") or r.get("created_at")),
+                "payment_type": p.get("type") or "CASH", "payment_label": p.get("label"),
+                "payments": len(pays), "card": card, "lines": lines,
+                "cash_rounding": self.rounding_mode()}
+
+    def return_receipt(self, body):
+        if not self.call(self.api.current_shift):
+            raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
+        orig, lines = self._sale_for_return(body.get("id"))
+        payment_type = body.get("payment_type")
+        if payment_type not in ("CASH", "CASHLESS"):
+            raise UserError("Невірний тип оплати")
+        use_leftovers = self.db.meta("use_leftovers")
+        goods, items, total, seen = [], [], 0, set()
+        for it in body.get("items") or []:
+            idx, qty = it.get("line"), it.get("qty")
+            if not isinstance(idx, int) or not 0 <= idx < len(lines) or idx in seen:
+                raise UserError("Невірна позиція чека")
+            seen.add(idx)
+            ln = lines[idx]
+            if not isinstance(qty, int) or qty <= 0 or (not ln["is_weight"] and qty % 1000):
+                raise UserError(f"Невірна кількість: {ln['name']}")
+            if qty > ln["max"]:
+                raise UserError(f"{ln['name']}: можна повернути не більше {ln['max'] / 1000:g}")
+            item, amount = return_good_payload(ln, qty, use_leftovers)
+            goods.append(item)
+            total += amount
+            items.append({"line": idx, "name": ln["name"], "code": ln["code"], "qty": qty,
+                          "price": ln["price"], "sum": amount})
+        if not goods:
+            raise UserError("Оберіть товари для повернення")
+        if total <= 0:
+            raise UserError("Сума повернення має бути більшою за нуль")
+        rounding_mode = self.rounding_mode() if payment_type == "CASH" else None
+        pay_value = round_cash(total, rounding_mode)
+        card = clean_card_details(body.get("card")) if payment_type == "CASHLESS" else None
+        try:
+            label = clean_payment_label(body.get("label"))
+        except ValueError as e:
+            raise UserError(str(e))
+        extra = dict(card or {})
+        if label:
+            extra["label"] = label
+        receipt = self.call(self.api.sell, new_receipt_id(), goods, payment_type, pay_value,
+                            rounding_mode, extra or None, None, orig["id"])
+        if use_leftovers:                     # повернутий товар знову на залишку
+            for g in goods:
+                if g.get("good_id"):
+                    self.db.decrease_count(g["good_id"], -g["quantity"])
+        self.db.add_sale(receipt, payment_type, items, label, {"card": card} if card else None,
+                         "RETURN", orig["id"], total)
+        log.info("Повернення: чек %s до %s, %.2f грн, %s, позицій %d", receipt["id"], orig["id"],
+                 total / 100, payment_type, len(items))
+        return {"id": receipt["id"], "fiscal_code": receipt.get("fiscal_code"),
+                "total_sum": receipt.get("total_sum", total), "round_sum": receipt.get("round_sum")}
 
     # ---- журнал ----
     # ---- журнал чеків: останні JOURNAL_DAYS днів ----
@@ -587,11 +722,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _run_png(self, receipt_id):
+    def _run_png(self, fn, object_id):
         """Як _run, але відповідь — зображення, а помилка — JSON з кодом 4xx/5xx."""
         try:
             with APP_LOCK:
-                png = APP.receipt_png(receipt_id)
+                png = fn(object_id)
             self._send(200, png, "image/png")
         except UserError as e:
             self._send(400, {"error": str(e)})
@@ -640,7 +775,13 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/api/receipt_text":
             self._run(APP.receipt_text, (q.get("id") or [""])[0])
         elif u.path == "/api/receipt_png":
-            self._run_png((q.get("id") or [""])[0])
+            self._run_png(APP.receipt_png, (q.get("id") or [""])[0])
+        elif u.path == "/api/report_png":
+            self._run_png(APP.report_png, (q.get("id") or [""])[0])
+        elif u.path == "/api/report_text":
+            self._run(APP.report_text, (q.get("id") or [""])[0])
+        elif u.path == "/api/receipt":
+            self._run(APP.receipt_info, (q.get("id") or [""])[0])
         else:
             self._send(404, {"error": "not found"})
 
@@ -661,6 +802,10 @@ class Handler(BaseHTTPRequestHandler):
             self._run(routes[path])
         elif path == "/api/sell":
             self._run(APP.sell, body)
+        elif path == "/api/return":
+            self._run(APP.return_receipt, body)
+        elif path == "/api/service":
+            self._run(APP.service, body)
         elif path == "/api/config":
             self._run(APP.save_config, body)
         elif path == "/api/terminal/devices":
@@ -839,6 +984,14 @@ PAGE = r"""<!DOCTYPE html>
   #toast { position: fixed; right: 20px; bottom: 20px; padding: 12px 16px; border-radius: 8px; background: var(--text); color: #fff; opacity: 0; transform: translateY(10px); transition: .2s; max-width: 420px; pointer-events: none; }
   #toast.show { opacity: 1; transform: none; } #toast.err { background: var(--bad); }
   .stats { display: flex; gap: 24px; margin-bottom: 12px; }
+  .discrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; }
+  .disc { color: var(--ok); font-size: 12px; } .disc.up { color: var(--warn); }
+  s.old { color: var(--muted); font-size: 12px; font-weight: 400; }
+  .retlines td input[type=number] { width: 90px; padding: 5px 7px; text-align: right; }
+  .retlines tr.off td { color: var(--muted); }
+  .kind { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: #f3f4f6; }
+  .kind.ret { background: #fee2e2; color: #991b1b; } .kind.in { background: #dcfce7; color: #166534; } .kind.out { background: #fef3c7; color: #92400e; }
+  .cashnow { font-size: 15px; margin-top: 8px; color: var(--text); }
   .stats b { font-size: 18px; display: block; }
 </style>
 </head>
@@ -876,6 +1029,7 @@ PAGE = r"""<!DOCTYPE html>
           <thead><tr><th>Товар</th><th class="num">К-сть</th><th class="num">Сума</th><th></th></tr></thead>
           <tbody id="cart"></tbody>
         </table>
+        <div class="discrow"><button class="markbtn" id="cartDiscBtn">％ Знижка / надбавка на чек</button><span id="cartDiscSum" class="disc"></span></div>
         <div class="total"><span>Разом</span><span id="total">0.00 ₴</span></div>
         <div id="cashBox" class="cashbox">
           <div class="line" id="roundLine"><span>Заокруглення (готівка)</span><span id="roundSum"></span></div>
@@ -929,12 +1083,22 @@ PAGE = r"""<!DOCTYPE html>
   <section id="shift" class="tab">
     <div class="card">
       <div id="shiftInfo" class="muted">Завантаження…</div>
+      <div id="cashNow" class="cashnow"></div>
       <div class="row" style="margin-top:14px">
         <button class="btn ok" id="openShift">Відкрити зміну</button>
         <button class="btn sec" id="xReport">X-звіт</button>
         <button class="btn danger" id="closeShift">Закрити зміну (Z-звіт)</button>
       </div>
-      <pre id="reportText" style="display:none;margin-top:16px"></pre>
+      <p class="muted" id="lastZ" style="margin:12px 0 0;font-size:13px"></p>
+    </div>
+    <div class="card" style="margin-top:20px">
+      <h3 style="margin:0">Службове внесення і винесення готівки</h3>
+      <p class="muted" style="margin:6px 0 12px">Розмінні гроші на початку зміни або інкасація. Це не продаж — суми потрапляють у Z-звіт окремо.</p>
+      <div class="row">
+        <input type="text" id="svcSum" inputmode="decimal" placeholder="Сума, ₴" style="max-width:180px">
+        <button class="btn ok" id="svcIn">＋ Внесення</button>
+        <button class="btn" id="svcOut" style="background:var(--warn)">− Винесення</button>
+      </div>
     </div>
   </section>
 
@@ -952,8 +1116,9 @@ PAGE = r"""<!DOCTYPE html>
 </main>
 
 <div class="modal" id="modal"><div class="card">
-  <div class="row" style="justify-content:space-between"><h3 style="margin:0">Чек</h3>
-    <span class="row"><button class="btn sec small" id="receiptPrint" style="display:none">🖨 Друк</button><button class="x" id="modalClose">✕</button></span></div>
+  <div class="row" style="justify-content:space-between"><h3 style="margin:0" id="modalTitle">Чек</h3>
+    <span class="row"><button class="btn danger small" id="receiptReturn" style="display:none">↩ Повернення</button>
+      <button class="btn sec small" id="receiptPrint" style="display:none">🖨 Друк</button><button class="x" id="modalClose">✕</button></span></div>
   <div id="modalImgWrap" class="receipt-img" style="display:none"><img id="modalImg" alt="Чек"></div>
   <pre id="modalText"></pre>
 </div></div>
@@ -1138,11 +1303,60 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn" id="exciseDone">Готово</button>
   </div>
 </div></div>
+<div class="modal" id="discModal"><div class="card">
+  <div class="row" style="justify-content:space-between">
+    <h3 style="margin:0" id="discTitle">Знижка</h3>
+    <button class="x" id="discClose">✕</button>
+  </div>
+  <p class="muted" style="margin:4px 0 12px" id="discFor"></p>
+  <div class="seg">
+    <label><input type="radio" name="discType" value="DISCOUNT" checked> Знижка</label>
+    <label><input type="radio" name="discType" value="EXTRA_CHARGE"> Надбавка</label>
+  </div>
+  <div class="seg" style="margin-top:8px">
+    <label><input type="radio" name="discMode" value="PERCENT" checked> У відсотках, %</label>
+    <label><input type="radio" name="discMode" value="VALUE"> Сумою, ₴</label>
+  </div>
+  <div class="form" style="margin-top:12px">
+    <label>Значення<input type="text" id="discValue" inputmode="decimal" placeholder="10"></label>
+    <label>Назва в чеку (необов'язково)<input type="text" id="discName" maxlength="100" placeholder="Напр. Знижка постійного клієнта"></label>
+  </div>
+  <div id="discPreview" class="status wait" style="display:none"></div>
+  <p class="muted" style="font-size:12px;margin:10px 0 0">У чек знижка йде сумою в гривнях — відсоток каса перераховує сама, як радить Checkbox.</p>
+  <div class="pay" style="margin-top:16px">
+    <button class="btn sec" id="discRemove">Прибрати</button>
+    <button class="btn" id="discApply">Застосувати</button>
+  </div>
+</div></div>
+<div class="modal" id="retModal"><div class="card wide">
+  <div class="row" style="justify-content:space-between">
+    <h3 style="margin:0">Повернення · чек <span id="retFn"></span></h3>
+    <button class="x" id="retClose">✕</button>
+  </div>
+  <p class="muted" style="margin:4px 0 10px" id="retInfo"></p>
+  <table class="retlines">
+    <thead><tr><th></th><th>Товар</th><th class="num">Продано</th><th class="num">Повернути</th><th class="num">Сума, ₴</th></tr></thead>
+    <tbody id="retLines"></tbody>
+  </table>
+  <div class="total"><span>До повернення</span><span id="retTotal">0.00 ₴</span></div>
+  <p class="muted" style="margin:-10px 0 12px;font-size:13px" id="retRound"></p>
+  <p class="muted" style="margin:0 0 6px">Як повертаємо гроші:</p>
+  <div class="seg">
+    <label><input type="radio" name="retType" value="CASH" checked> Готівкою</label>
+    <label><input type="radio" name="retType" value="CASHLESS"> На картку / безготівка</label>
+  </div>
+  <div id="retCardBox" class="status wait" style="display:none"></div>
+  <div class="pay" style="margin-top:16px">
+    <button class="btn sec" id="retCancel">Скасувати</button>
+    <button class="btn danger" id="retSubmit">Пробити повернення</button>
+  </div>
+</div></div>
 <div id="toast"></div>
 
 <script>
 const $ = s => document.querySelector(s);
 let goods = [], cart = [], useLeftovers = false, roundingMode = null, cartTotal = 0, taxes = [];
+let cartDisc = null;   // знижка/надбавка на весь чек: { type, mode, value, name }
 
 const taxBadges = codes => {
   if (!codes || !codes.length) return '<span class="tax none" title="Товар без податкової ставки — чек буде без податку">—</span>';
@@ -1210,28 +1424,36 @@ function showText(text) {
   $('#modalText').style.display = ''; $('#modalText').textContent = text; $('#modal').classList.add('show');
 }
 const pngUrl = id => '/api/receipt_png?id=' + encodeURIComponent(id);
-// PNG чека у вікні; якщо зображення недоступне — текстовий варіант
-function showReceipt(id) {
-  const img = $('#modalImg');
-  let retried = false;
+const reportPngUrl = id => '/api/report_png?id=' + encodeURIComponent(id);
+let shownDoc = null;    // що відкрито у вікні: { id, report, returnable }
+// PNG чека чи звіту у вікні; якщо зображення недоступне — текстовий варіант
+function showReceipt(id, opts = {}) {
+  const img = $('#modalImg'), url = opts.report ? reportPngUrl : pngUrl;
+  shownDoc = { id, ...opts };
+  let tries = 0;
+  $('#modalTitle').textContent = opts.title || 'Чек';
+  $('#receiptReturn').style.display = opts.returnable ? '' : 'none';
   img.onload = () => { $('#modalText').style.display = 'none'; $('#modalImgWrap').style.display = ''; $('#receiptPrint').style.display = ''; };
   img.onerror = async () => {
-    if (!retried) { retried = true; return setTimeout(() => { img.src = pngUrl(id) + '&r=1'; }, 1200); }   // Checkbox міг ще готувати зображення
-    try { showText((await api('/api/receipt_text?id=' + encodeURIComponent(id))).text); }
-    catch (err) { toast(err.message, true); $('#modal').classList.remove('show'); }
+    if (tries++ < (opts.report ? 3 : 1)) return setTimeout(() => { img.src = url(id) + '&r=' + tries; }, 1500);   // Checkbox міг ще готувати зображення
+    try {
+      const t = await api((opts.report ? '/api/report_text?id=' : '/api/receipt_text?id=') + encodeURIComponent(id));
+      $('#modalImgWrap').style.display = 'none'; $('#modalText').style.display = ''; $('#modalText').textContent = t.text;
+    } catch (err) { toast(err.message, true); $('#modal').classList.remove('show'); }
   };
-  $('#modalText').style.display = ''; $('#modalText').textContent = 'Завантажую чек…';
+  $('#modalText').style.display = ''; $('#modalText').textContent = opts.report ? 'Формую звіт…' : 'Завантажую чек…';
   $('#modalImgWrap').style.display = 'none'; $('#receiptPrint').style.display = 'none';
   $('#modal').classList.add('show');
-  img.dataset.id = id; img.src = pngUrl(id);
+  img.src = url(id);
 }
 $('#receiptPrint') && ($('#receiptPrint').onclick = () => {
   const w = window.open('', '_blank', 'width=420,height=700');
   if (!w) return toast('Браузер заблокував вікно друку — дозвольте спливаючі вікна для каси', true);
-  w.document.write(`<!DOCTYPE html><title>Чек</title><style>body{margin:0;text-align:center}img{max-width:100%}</style>
-    <img src="${pngUrl($('#modalImg').dataset.id)}" onload="window.focus();window.print();setTimeout(()=>window.close(),300)">`);
+  w.document.write(`<!DOCTYPE html><title>${esc($('#modalTitle').textContent)}</title><style>body{margin:0;text-align:center}img{max-width:100%}</style>
+    <img src="${$('#modalImg').src}" onload="window.focus();window.print();setTimeout(()=>window.close(),300)">`);
   w.document.close();
 });
+$('#receiptReturn').onclick = () => { const id = shownDoc && shownDoc.id; $('#modal').classList.remove('show'); if (id) openReturn(id); };
 $('#modalClose').onclick = () => $('#modal').classList.remove('show');
 $('#modal').onclick = e => { if (e.target.id === 'modal') $('#modal').classList.remove('show'); };
 
@@ -1474,6 +1696,37 @@ $('#exciseDone').onclick = closeExcise;
 $('#exciseClose').onclick = closeExcise;
 $('#exciseNone').onclick = () => { cart[exciseIdx].marks = []; closeExcise(); };
 $('#exciseModal').onclick = e => { if (e.target.id === 'exciseModal') closeExcise(); };
+// --- знижки й надбавки: ті самі правила, що й apply_discounts() у checkbox_app.py ---
+const lineSum = (price, qty) => Math.floor((price * qty + 500) / 1000);
+const DISC_TITLE = { DISCOUNT: 'Знижка', EXTRA_CHARGE: 'Надбавка' };
+function discAmount(spec, base) {        // зі знаком: знижка — мінус; помилка — виняток з поясненням
+  if (!spec) return 0;
+  let a;
+  if (spec.mode === 'PERCENT') {
+    const pv = Math.round(spec.value * 100);
+    if (spec.type === 'DISCOUNT' && pv >= 10000) throw new Error('Знижка має бути меншою за 100%');
+    a = Math.floor((base * pv + 5000) / 10000);
+  } else a = spec.value;
+  if (!(a > 0)) throw new Error(`${DISC_TITLE[spec.type]} менша за 1 копійку`);
+  if (spec.type === 'DISCOUNT' && a >= base) throw new Error(`Знижка має бути меншою за суму (${uah(base)} ₴)`);
+  return spec.type === 'DISCOUNT' ? -a : a;
+}
+function discLabel(spec, amount) {
+  const title = spec.name || DISC_TITLE[spec.type] + (spec.mode === 'PERCENT' ? ` ${spec.value}%` : '');
+  return `${title} ${amount > 0 ? '+' : '−'}${uah(Math.abs(amount))} ₴`;
+}
+function computeTotals() {
+  const lines = cart.map(c => {
+    const g = goods.find(x => x.id === c.id), base = lineSum(g.price, c.qty);
+    let d = 0, err = null;
+    try { d = discAmount(c.disc, base); } catch (e) { err = e.message; }
+    return { base, d, err, total: base + d };
+  });
+  const sub = lines.reduce((a, l) => a + l.total, 0);
+  let rd = 0, rerr = null;
+  try { rd = cartDisc ? discAmount(cartDisc, sub) : 0; } catch (e) { rerr = e.message; }
+  return { lines, sub, rd, rerr, total: sub + rd };
+}
 function renderCart() {
   cart = cart.filter(c => {
     if (goods.some(g => g.id === c.id)) return true;
@@ -1481,24 +1734,94 @@ function renderCart() {
     if (same) { c.id = same.id; return true; }
     return false;
   });
-  let total = 0;
+  if (!cart.length) cartDisc = null;
+  const T = computeTotals();
   $('#cart').innerHTML = cart.map((c, i) => {
-    const g = goods.find(x => x.id === c.id);
-    const sum = Math.round(g.price * c.qty / 1000); total += sum;
+    const g = goods.find(x => x.id === c.id), L = T.lines[i];
     let markBtn = '';
     if (isExciseGood(g) && !g.is_weight) {
       c.marks = c.marks || [];
       const need = Math.round(c.qty / 1000), have = c.marks.length;
-      markBtn = `<br><button class="markbtn ${have >= need ? 'ok' : 'warn'}" data-marks="${i}">🏷 Марки ${have}/${need}</button>`;
+      markBtn = ` <button class="markbtn ${have >= need ? 'ok' : 'warn'}" data-marks="${i}">🏷 Марки ${have}/${need}</button>`;
     }
-    return `<tr><td>${esc(g.name)}<br><small class="muted">${uah(g.price)} ₴ / ${g.is_weight ? 'кг' : 'шт'}</small> ${taxBadges(g.tax_codes)}${markBtn}</td>
+    const discBtn = c.disc
+      ? `<button class="markbtn ${L.err ? 'warn' : 'ok'}" data-disc="${i}" title="${esc(L.err || 'Змінити')}">${L.err ? '⚠ ' + esc(L.err) : esc(discLabel(c.disc, L.d))}</button>`
+      : `<button class="markbtn" data-disc="${i}" title="Знижка або надбавка на цей товар">％</button>`;
+    const sumCell = L.d && !L.err ? `<s class="old">${uah(L.base)}</s><br>${uah(L.total)}` : uah(L.base);
+    return `<tr><td>${esc(g.name)}<br><small class="muted">${uah(g.price)} ₴ / ${g.is_weight ? 'кг' : 'шт'}</small> ${taxBadges(g.tax_codes)}<br>${discBtn}${markBtn}</td>
       <td class="num"><input type="number" min="0" step="${g.is_weight ? '0.001' : '1'}" value="${c.qty / 1000}" data-i="${i}"></td>
-      <td class="num">${uah(sum)}</td><td><button class="x" data-del="${i}">✕</button></td></tr>`;
+      <td class="num">${sumCell}</td><td><button class="x" data-del="${i}">✕</button></td></tr>`;
   }).join('') || '<tr><td colspan="4" class="muted">Порожньо</td></tr>';
-  $('#total').textContent = uah(total) + ' ₴';
-  cartTotal = total;
+  $('#cartDiscBtn').style.display = cart.length ? '' : 'none';
+  $('#cartDiscSum').className = 'disc' + (T.rd > 0 ? ' up' : '');
+  $('#cartDiscSum').textContent = !cartDisc ? '' : T.rerr ? '⚠ ' + T.rerr : discLabel(cartDisc, T.rd);
+  if (T.rerr) $('#cartDiscSum').className = 'zero';
+  $('#cartDiscBtn').textContent = cartDisc ? '％ Змінити знижку на чек' : '％ Знижка / надбавка на чек';
+  $('#total').textContent = uah(T.total) + ' ₴';
+  cartTotal = T.total;
   renderCash();
 }
+// --- вікно знижки: target — номер рядка кошика або 'receipt' ---
+let discTarget = null;
+const radioVal = name => document.querySelector(`input[name="${name}"]:checked`).value;
+const setRadio = (name, v) => { const r = document.querySelector(`input[name="${name}"][value="${v}"]`); if (r) r.checked = true; };
+function discBase() {
+  const T = computeTotals();
+  return discTarget === 'receipt' ? T.sub : T.lines[discTarget].base;
+}
+function readDisc() {         // специфікація з форми або виняток
+  const raw = $('#discValue').value.trim().replace(',', '.');
+  const v = parseFloat(raw);
+  if (!raw || !(v > 0)) throw new Error('Вкажіть значення більше нуля');
+  const mode = radioVal('discMode');
+  const spec = { type: radioVal('discType'), mode, name: $('#discName').value.trim().replace(/\s+/g, ' ') };
+  if (mode === 'PERCENT') {
+    if (Math.abs(v * 100 - Math.round(v * 100)) > 1e-6) throw new Error('Відсоток — не більше двох знаків після коми');
+    spec.value = v;
+  } else spec.value = Math.round(v * 100);
+  if (!spec.name) delete spec.name;
+  return spec;
+}
+function renderDiscPreview() {
+  const box = $('#discPreview');
+  if (!$('#discValue').value.trim()) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  try {
+    const base = discBase(), a = discAmount(readDisc(), base);
+    box.className = 'status ok';
+    box.textContent = `${uah(base)} ₴ → ${uah(base + a)} ₴ (${a > 0 ? '+' : '−'}${uah(Math.abs(a))} ₴)`;
+  } catch (e) { box.className = 'status bad'; box.textContent = e.message; }
+}
+function openDisc(target) {
+  discTarget = target;
+  const cur = target === 'receipt' ? cartDisc : cart[target].disc;
+  $('#discTitle').textContent = target === 'receipt' ? 'Знижка / надбавка на чек' : 'Знижка / надбавка на товар';
+  $('#discFor').textContent = target === 'receipt' ? `Сума товарів: ${uah(computeTotals().sub)} ₴`
+    : `${goods.find(x => x.id === cart[target].id).name} · ${uah(discBase())} ₴`;
+  setRadio('discType', cur ? cur.type : 'DISCOUNT');
+  setRadio('discMode', cur ? cur.mode : 'PERCENT');
+  $('#discValue').value = cur ? (cur.mode === 'VALUE' ? (cur.value / 100).toFixed(2) : cur.value) : '';
+  $('#discName').value = (cur && cur.name) || '';
+  $('#discRemove').style.display = cur ? '' : 'none';
+  renderDiscPreview();
+  $('#discModal').classList.add('show'); $('#discValue').focus(); $('#discValue').select();
+}
+function closeDisc() { $('#discModal').classList.remove('show'); discTarget = null; $('#search').focus(); }
+function setDisc(spec) {
+  if (discTarget === 'receipt') cartDisc = spec; else cart[discTarget].disc = spec;
+}
+$('#discApply').onclick = () => {
+  let spec;
+  try { spec = readDisc(); discAmount(spec, discBase()); } catch (e) { toast(e.message, true); return $('#discValue').focus(); }
+  setDisc(spec); closeDisc(); renderCart();
+};
+$('#discRemove').onclick = () => { setDisc(null); closeDisc(); renderCart(); };
+$('#discClose').onclick = closeDisc;
+$('#discModal').onclick = e => { if (e.target.id === 'discModal') closeDisc(); };
+$('#discValue').oninput = renderDiscPreview;
+document.querySelectorAll('input[name="discType"], input[name="discMode"]').forEach(r => r.onchange = renderDiscPreview);
+$('#discModal').onkeydown = e => { if (e.key === 'Enter') $('#discApply').click(); if (e.key === 'Escape') closeDisc(); };
+$('#cartDiscBtn').onclick = () => openDisc('receipt');
 function receivedKop() {
   const v = $('#received').value.trim();
   return v === '' ? null : Math.round(parseFloat(v.replace(',', '.')) * 100);
@@ -1537,9 +1860,10 @@ $('#cart').onchange = e => {
 };
 $('#cart').onclick = e => {
   const m = e.target.dataset.marks; if (m !== undefined) return openExcise(+m);
+  const d = e.target.closest('[data-disc]'); if (d) return openDisc(+d.dataset.disc);
   const i = e.target.dataset.del; if (i !== undefined) { cart.splice(i, 1); renderCart(); }
 };
-$('#clearCart').onclick = () => { cart = []; renderCart(); };
+$('#clearCart').onclick = () => { cart = []; cartDisc = null; renderCart(); };
 
 function marksIncomplete() {
   return cart.filter(c => {
@@ -1562,7 +1886,10 @@ function loadLastPng(img, id, attempt = 0) {
 async function pay(type, btn, card, label, opts = {}) {   // повертає true, якщо чек пробито
   if (!cart.length) { toast('Кошик порожній', true); return false; }
   if (!opts.marksChecked && !confirmMarks()) return false;
+  const de = discountError();
+  if (de) { toast('Виправте знижку: ' + de, true); return false; }
   const body = { items: cart, payment_type: type };
+  if (cartDisc) body.discount = cartDisc;
   if (card) body.card = card;
   if (label) body.label = label;
   if (opts.terminalRaw) body.terminal_raw = opts.terminalRaw;
@@ -1582,7 +1909,7 @@ async function pay(type, btn, card, label, opts = {}) {   // повертає tr
       if (!(await openShiftNow())) throw e;
       r = await api('/api/sell', body);
     }
-    cart = []; $('#received').value = '';
+    cart = []; cartDisc = null; $('#received').value = '';
     const last = $('#last');
     last.style.display = 'block';
     const extra = (r.round_sum ? ` · заокруглення ${uah(r.round_sum)} ₴` : '') + (r.rest ? ` · решта ${uah(r.rest)} ₴` : '');
@@ -1736,8 +2063,14 @@ async function beginTermFlow() {
   if (open === false) return termRender('shift_closed', 'Зміна закрита. Відкрийте її, щоб прийняти оплату — інакше чек не буде пробито.');
   termRender('shift_unknown', "Не вдалося перевірити зміну в Checkbox. Перевірте зв'язок і спробуйте ще раз.");
 }
+function discountError() {
+  const T = computeTotals(), bad = T.lines.find(l => l.err);
+  return bad ? bad.err : T.rerr;
+}
 function openTermPay() {
   if (!cart.length) return toast('Кошик порожній', true);
+  const de = discountError();
+  if (de) return toast('Виправте знижку: ' + de, true);   // до списання з картки, а не після
   if (!confirmMarks()) return;
   term = { amount: cartTotal, messages: [] };
   $('#termSum').textContent = uah(term.amount) + ' ₴';
@@ -1815,17 +2148,28 @@ $('#syncBtn').onclick = e => busy(e.target, async () => {
 });
 
 // --- зміна ---
+let shiftOpen = false;
 async function loadShift() {
   try {
-    const { shift } = await api('/api/shift');
+    const { shift, last_z } = await api('/api/shift');
     const b = $('#shiftBadge');
+    shiftOpen = !!shift;
     if (shift) {
       b.textContent = `Зміна №${shift.serial ?? ''} відкрита`; b.className = 'badge open';
       $('#shiftInfo').innerHTML = `Зміна <b>№${esc(shift.serial)}</b> · статус <b>${esc(shift.status)}</b> · відкрита ${esc((shift.opened_at || '').replace('T', ' ').slice(0, 19))}`;
+      const bal = shift.balance || {};
+      $('#cashNow').innerHTML = bal.balance != null ? `Готівка в касі: <b>${uah(bal.balance)} ₴</b>` +
+        `<small class="muted"> · на початку ${uah(bal.initial || 0)} · продажі ${uah(bal.cash_sales || 0)} · повернення ${uah(bal.cash_returns || 0)}` +
+        ` · внесено ${uah(bal.service_in || 0)} · винесено ${uah(bal.service_out || 0)}</small>` : '';
     } else {
       b.textContent = 'Зміна закрита'; b.className = 'badge';
       $('#shiftInfo').textContent = 'Зміна не відкрита.';
+      $('#cashNow').textContent = '';
     }
+    $('#openShift').style.display = shift ? 'none' : '';
+    $('#xReport').style.display = $('#closeShift').style.display = shift ? '' : 'none';
+    $('#lastZ').innerHTML = last_z ? `Останній Z-звіт: зміна №${esc(last_z.serial ?? '?')}, ${esc((last_z.closed_at || '').replace('T', ' ').slice(0, 16))} · <a href="#" id="lastZLink">показати</a>` : '';
+    if (last_z) $('#lastZLink').onclick = e => { e.preventDefault(); showReceipt(last_z.id, { report: true, title: `Z-звіт · зміна №${last_z.serial ?? ''}` }); };
   } catch (e) { $('#shiftBadge').textContent = 'Зміна: помилка'; toast(e.message, true); }
 }
 $('#openShift').onclick = e => busy(e.target, async () => { if (!(await openShiftNow())) throw new Error('Зміну не відкрито'); });
@@ -1834,15 +2178,39 @@ $('#closeShift').onclick = e => {
   if (!confirm('Закрити зміну і сформувати Z-звіт?' + extra)) return;
   busy(e.target, async () => {
     const r = await api('/api/shift/close', {});
-    toast('Зміну закрито' + (r.z_report_id ? ', Z-звіт ' + r.z_report_id : '') + syncSummary(r.sync),
-          !!(r.sync && (r.sync.sync_error || r.sync.push_error)));
+    toast('Зміну закрито' + syncSummary(r.sync), !!(r.sync && (r.sync.sync_error || r.sync.push_error)));
     await loadShift(); loadGoods().catch(() => {});
+    if (r.z_report_id) showReceipt(r.z_report_id, { report: true, title: `Z-звіт · зміна №${r.shift.serial ?? ''}` });
   });
 };
 $('#xReport').onclick = e => busy(e.target, async () => {
   const r = await api('/api/xreport', {});
-  const p = $('#reportText'); p.textContent = r.text; p.style.display = 'block';
+  showReceipt(r.report_id, { report: true, title: 'X-звіт' });
 });
+// --- службове внесення / винесення ---
+async function service(sign, btn) {
+  const raw = $('#svcSum').value.trim().replace(',', '.');
+  const kop = Math.round(parseFloat(raw) * 100);
+  if (!raw || !(kop > 0) || !/^\d+(\.\d{1,2})?$/.test(raw)) { toast('Вкажіть суму, напр. 500 або 125.50', true); return $('#svcSum').focus(); }
+  const what = sign > 0 ? 'Внесення' : 'Винесення';
+  if (!confirm(`${what} ${uah(kop)} ₴ готівки?`)) return;
+  await busy(btn, async () => {
+    let r;
+    try { r = await api('/api/service', { value: sign * kop }); }
+    catch (e) {
+      if (e.code !== 'SHIFT_CLOSED' || !confirm('Зміна закрита. Відкрити зміну і провести ' + what.toLowerCase() + '?')) throw e;
+      if (!(await openShiftNow())) throw e;
+      r = await api('/api/service', { value: sign * kop });
+    }
+    $('#svcSum').value = '';
+    toast(`${what}: ${uah(kop)} ₴`);
+    await loadShift();
+    showReceipt(r.id, { title: `Службовий чек · ${what.toLowerCase()}` });
+  });
+}
+$('#svcIn').onclick = e => service(1, e.target);
+$('#svcOut').onclick = e => service(-1, e.target);
+$('#svcSum').onkeydown = e => { if (e.key === 'Enter') $('#svcIn').click(); };
 
 // --- журнал ---
 // Журнал: чеки за 7 днів, згруповані по днях у розгортуваних списках
@@ -1853,8 +2221,12 @@ function dayTitle(day) {           // day — «РРРР-ММ-ДД»
   const date = d.toLocaleDateString('uk-UA', { day: 'numeric', month: 'long' });
   return diff === 0 ? `Сьогодні, ${date}` : diff === 1 ? `Вчора, ${date}` : `${WEEKDAYS[d.getDay()]}, ${date}`;
 }
-const isReturn = s => (s.receipt_type || '').toUpperCase().includes('RETURN');
+const rtype = s => (s.receipt_type || 'SELL').toUpperCase();
+const isReturn = s => rtype(s).includes('RETURN');
+const isService = s => rtype(s).startsWith('SERVICE');
+const KINDS = { SELL: ['', 'Продаж'], RETURN: ['ret', 'Повернення'], SERVICE_IN: ['in', 'Внесення'], SERVICE_OUT: ['out', 'Винесення'] };
 function payTitle(s) {
+  if (isService(s)) return 'Готівка';
   const base = s.payment_type === 'CASH' ? 'Готівка' : s.payment_type ? 'Картка' : '—';
   return s.payment_label ? `${esc(s.payment_label)} <small class="muted">(${s.payment_type === 'CASH' ? 'готівка' : 'безготівка'})</small>` : base;
 }
@@ -1862,10 +2234,14 @@ let openDays = null;    // які дні й зміни розгорнуті (щ�
 const hm = t => (t || '').slice(11, 16);
 const dm = t => t ? `${t.slice(8, 10)}.${t.slice(5, 7)} ${hm(t)}` : '';
 function totals(list) {
-  const sum = t => list.filter(x => !isReturn(x) && (t ? x.payment_type === t : true)).reduce((a, x) => a + (x.total || 0), 0);
+  const sales = list.filter(x => !isReturn(x) && !isService(x));
+  const sum = t => sales.filter(x => t ? x.payment_type === t : true).reduce((a, x) => a + (x.total || 0), 0);
+  const of = k => list.filter(x => rtype(x) === k).reduce((a, x) => a + (x.total || 0), 0);
   const ret = list.filter(isReturn).reduce((a, x) => a + (x.total || 0), 0);
+  const sin = of('SERVICE_IN'), sout = of('SERVICE_OUT');
   return `чеків: ${list.length} · продажі ${uah(sum())} ₴
-    <small class="muted">(готівка ${uah(sum('CASH'))}, безготівка ${uah(sum('CASHLESS'))})</small>${ret ? ` · повернення ${uah(ret)} ₴` : ''}`;
+    <small class="muted">(готівка ${uah(sum('CASH'))}, безготівка ${uah(sum('CASHLESS'))})</small>${ret ? ` · повернення ${uah(ret)} ₴` : ''}` +
+    (sin || sout ? ` <small class="muted">· внесено ${uah(sin)} · винесено ${uah(sout)}</small>` : '');
 }
 function shiftTitle(sh, day) {
   if (!sh.id) return 'Зміна невідома <small class="muted">(завантажте чеки з Checkbox, щоб підтягнути зміни)</small>';
@@ -1876,13 +2252,13 @@ function shiftTitle(sh, day) {
 }
 function receiptRows(list) {
   return `<table><thead><tr><th>Час</th><th>Тип</th><th>Оплата</th><th class="num">Сума, ₴</th><th>Фіскальний №</th><th></th></tr></thead><tbody>
-    ${list.map(s => `<tr class="click" data-id="${esc(s.receipt_id)}">
+    ${list.map(s => { const k = KINDS[rtype(s)] || ['', rtype(s)]; return `<tr class="click" data-id="${esc(s.receipt_id)}" data-type="${esc(rtype(s))}">
       <td>${esc(hm(s.created_at))}</td>
-      <td>${isReturn(s) ? '<span class="zero">Повернення</span>' : 'Продаж'}</td>
+      <td><span class="kind ${k[0]}">${esc(k[1])}</span></td>
       <td>${payTitle(s)}</td>
-      <td class="num">${isReturn(s) ? '−' : ''}${uah(s.total)}</td>
+      <td class="num">${isReturn(s) || rtype(s) === 'SERVICE_OUT' ? '−' : rtype(s) === 'SERVICE_IN' ? '+' : ''}${uah(s.total)}</td>
       <td>${esc(s.fiscal_code || '—')}</td>
-      <td class="muted" style="font-size:11px">${s.source === 'checkbox' ? 'з Checkbox' : 'з каси'}</td></tr>`).join('')}
+      <td class="muted" style="font-size:11px">${s.source === 'checkbox' ? 'з Checkbox' : 'з каси'}</td></tr>`; }).join('')}
     </tbody></table>`;
 }
 async function loadSales() {
@@ -1923,13 +2299,101 @@ $('#salesDays').addEventListener('toggle', e => {
 }, true);
 $('#salesDays').onclick = e => {
   const tr = e.target.closest('tr[data-id]'); if (!tr) return;
-  showReceipt(tr.dataset.id);
+  const k = KINDS[tr.dataset.type];
+  showReceipt(tr.dataset.id, { returnable: tr.dataset.type === 'SELL', title: k ? `Чек · ${k[1].toLowerCase()}` : 'Чек' });
 };
 $('#fetchReceipts').onclick = e => busy(e.target, async () => {
   const r = await api('/api/sales/fetch', {});
   toast(`З Checkbox отримано чеків: ${r.fetched}, нових у журналі: ${r.new}` + (r.removed ? ` · видалено старих: ${r.removed}` : ''));
   await loadSales();
 });
+
+// --- повернення за чеком продажу (ті самі правила суми, що й return_amount() у checkbox_app.py) ---
+let ret = null;    // { info, qty: {line: тисячні}, on: Set }
+const shareOf = (t, part, whole) => whole > 0 ? Math.floor((t * part * 2 + whole) / (2 * whole)) : 0;
+const retAmount = (ln, q) => { const before = ln.qty - ln.max; return shareOf(ln.total, before + q, ln.qty) - shareOf(ln.total, before, ln.qty); };
+const STD_LABELS = ['Готівка', 'Картка', 'Безготівка'];
+async function openReturn(id) {
+  let info;
+  try { info = await api('/api/receipt?id=' + encodeURIComponent(id)); } catch (e) { return toast(e.message, true); }
+  if (!info.lines.some(l => l.max > 0)) return toast('За цим чеком усі товари вже повернуто', true);
+  ret = { info, qty: {}, on: new Set() };
+  info.lines.forEach(l => { if (l.max > 0) { ret.qty[l.line] = l.max; ret.on.add(l.line); } });
+  $('#retFn').textContent = info.fiscal_code || info.id.slice(0, 8);
+  const payWas = info.payment_type === 'CASH' ? 'готівка' : 'безготівка';
+  $('#retInfo').textContent = `Продаж ${info.created_at.replace('T', ' ').slice(0, 16)} · ${uah(info.total_sum)} ₴ · ${info.payment_label || payWas}` +
+    (info.payments > 1 ? ' (кілька оплат — повернення однією)' : '');
+  setRadio('retType', info.payment_type === 'CASHLESS' ? 'CASHLESS' : 'CASH');
+  renderReturn();
+  $('#retModal').classList.add('show');
+}
+function retTotalNow() {
+  return ret.info.lines.reduce((a, l) => a + (ret.on.has(l.line) ? retAmount(l, ret.qty[l.line] || 0) : 0), 0);
+}
+function renderReturn() {
+  const { info } = ret;
+  $('#retLines').innerHTML = info.lines.map(l => {
+    const off = l.max <= 0, on = ret.on.has(l.line), q = ret.qty[l.line] || 0;
+    const sold = qtyStr(l.qty, l.is_weight) + (l.returned ? `<br><small class="muted">повернуто ${qtyStr(l.returned, l.is_weight)}</small>` : '');
+    return `<tr class="${off || !on ? 'off' : ''}">
+      <td><input type="checkbox" data-ron="${l.line}" ${on ? 'checked' : ''} ${off ? 'disabled' : ''}></td>
+      <td>${esc(l.name)}<br><small class="muted">${uah(l.price)} ₴${l.total !== lineSum(l.price, l.qty) ? ` · у чеку ${uah(l.total)} ₴ зі знижкою` : ''}</small></td>
+      <td class="num">${sold}</td>
+      <td class="num">${off ? '—' : `<input type="number" min="0" max="${l.max / 1000}" step="${l.is_weight ? '0.001' : '1'}" value="${q / 1000}" data-rq="${l.line}" ${on ? '' : 'disabled'}>`}</td>
+      <td class="num">${on && q ? uah(retAmount(l, q)) : '—'}</td></tr>`;
+  }).join('');
+  const total = retTotalNow(), type = radioVal('retType');
+  const pay = type === 'CASH' ? roundCash(total, info.cash_rounding) : total;
+  $('#retTotal').textContent = uah(pay) + ' ₴';
+  $('#retRound').textContent = pay !== total ? `Заокруглення готівки: ${uah(total)} → ${uah(pay)} ₴` : '';
+  const box = $('#retCardBox');
+  box.style.display = type === 'CASHLESS' ? '' : 'none';
+  const c = info.card || {};
+  box.innerHTML = info.payment_type === 'CASHLESS'
+    ? `Спершу проведіть повернення ${uah(pay)} ₴ на платіжному терміналі, потім пробийте чек.` +
+      (Object.keys(c).length ? `<br><small>У чек підуть дані ЕПЗ з продажу: ${esc([c.card_mask, c.payment_system, c.rrn && 'RRN ' + c.rrn, c.bank_name].filter(Boolean).join(' · '))}</small>` : '')
+    : 'Продаж був готівкою. Безготівкове повернення — без даних картки.';
+}
+$('#retLines').onchange = e => {
+  const on = e.target.dataset.ron, rq = e.target.dataset.rq;
+  if (on !== undefined) e.target.checked ? ret.on.add(+on) : ret.on.delete(+on);
+  if (rq !== undefined) {
+    const l = ret.info.lines.find(x => x.line === +rq);
+    let q = Math.round(parseFloat(e.target.value.replace(',', '.')) * 1000) || 0;
+    if (!l.is_weight) q = Math.round(q / 1000) * 1000;
+    if (q > l.max) { q = l.max; toast(`Можна повернути не більше ${qtyStr(l.max, l.is_weight)}`, true); }
+    if (q <= 0) { ret.on.delete(l.line); q = l.max; }
+    ret.qty[l.line] = q;
+  }
+  renderReturn();
+};
+document.querySelectorAll('input[name="retType"]').forEach(r => r.onchange = renderReturn);
+function closeReturn() { $('#retModal').classList.remove('show'); ret = null; }
+$('#retClose').onclick = closeReturn; $('#retCancel').onclick = closeReturn;
+$('#retModal').onkeydown = e => { if (e.key === 'Escape') closeReturn(); };
+$('#retSubmit').onclick = async e => {
+  const { info } = ret, type = radioVal('retType');
+  const items = info.lines.filter(l => ret.on.has(l.line) && ret.qty[l.line] > 0).map(l => ({ line: l.line, qty: ret.qty[l.line] }));
+  if (!items.length) return toast('Оберіть товари для повернення', true);
+  const body = { id: info.id, items, payment_type: type };
+  if (type === info.payment_type && info.payment_label && !STD_LABELS.includes(info.payment_label)) body.label = info.payment_label;
+  if (type === 'CASHLESS' && info.payment_type === 'CASHLESS' && Object.keys(info.card || {}).length) body.card = info.card;
+  const pay = $('#retTotal').textContent;
+  if (!confirm(`Пробити чек повернення на ${pay}?` + (type === 'CASHLESS' ? '\n\nПовернення на терміналі вже проведено?' : ''))) return;
+  await busy(e.target, async () => {
+    let r;
+    try { r = await api('/api/return', body); }
+    catch (err) {
+      if (err.code !== 'SHIFT_CLOSED' || !confirm('Зміна закрита. Відкрити зміну і пробити повернення?')) throw err;
+      if (!(await openShiftNow())) throw err;
+      r = await api('/api/return', body);
+    }
+    closeReturn();
+    toast(`Повернення пробито: ${uah(r.total_sum)} ₴`);
+    loadSales(); loadGoods().catch(() => {}); loadShift();
+    showReceipt(r.id, { title: 'Чек · повернення' });
+  });
+};
 
 // --- налаштування ---
 let cfgCache = null;

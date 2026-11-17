@@ -31,7 +31,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.0.0"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.1.0"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -399,13 +399,16 @@ class CheckboxAPI:
 
     # --- чеки ---
     def sell(self, receipt_id, goods, payment_type, pay_value, rounding_mode=None,
-             payment_extra=None):
+             payment_extra=None, discounts=None, related_receipt_id=None):
         """
+        Чек продажу або повернення (для повернення в товарах is_return: true).
         receipt_id    — UUID v4, який генерує інтеграція (обов'язково).
         pay_value     — сума оплати в копійках; для готівки із заокругленням —
                         вже заокруглена сума (або більша, якщо видається решта).
         payment_extra — додаткові поля платежу, напр. дані ЕПЗ для картки
                         (card_mask, rrn, auth_code, bank_name ...).
+        discounts     — знижки/надбавки на весь чек.
+        related_receipt_id — для повернення: UUID чека продажу.
         """
         payment = {"type": payment_type, "value": pay_value}
         if payment_extra:
@@ -415,11 +418,24 @@ class CheckboxAPI:
             "goods": goods,
             "payments": [payment],
         }
+        if discounts:
+            body["discounts"] = discounts
+        if related_receipt_id:
+            body["related_receipt_id"] = related_receipt_id
         if payment_type == "CASH" and rounding_mode:
             body["rounding"] = True
             body["rounding_mode"] = rounding_mode
+        return self._create_receipt("/receipts/sell", body)
+
+    def service(self, receipt_id, value):
+        """Службове внесення (value > 0) або винесення (value < 0) готівки, копійки."""
+        return self._create_receipt("/receipts/service", {
+            "id": receipt_id, "payment": {"type": "CASH", "value": value}})
+
+    def _create_receipt(self, path, body):
+        receipt_id = body["id"]
         try:
-            self._req("POST", "/receipts/sell", json=body)
+            self._req("POST", path, json=body)
         except net.RequestException:
             # Зв'язок обірвався: перевіряємо, чи чек усе ж створено, щоб не пробити його двічі
             try:
@@ -427,8 +443,11 @@ class CheckboxAPI:
             except (CheckboxError, net.RequestException):
                 raise CheckboxError(
                     f"Немає зв'язку, і чек {receipt_id} не знайдено. "
-                    "Перевірте в кабінеті перед повторним продажем.")
+                    "Перевірте в кабінеті перед повторною спробою.")
         return self._wait_receipt(receipt_id)
+
+    def get_receipt(self, receipt_id):
+        return self._req("GET", f"/receipts/{receipt_id}")
 
     def _wait_receipt(self, receipt_id, timeout=60):
         start = time.time()
@@ -466,9 +485,19 @@ class CheckboxAPI:
         return self._req("GET", f"/receipts/{receipt_id}/png", raw=True)
 
     # --- звіти ---
+    def create_x_report(self):
+        """X-звіт поточної зміни; повертає об'єкт звіту (з id)."""
+        return self._req("POST", "/reports")
+
     def x_report(self):
-        report = self._req("POST", "/reports")
-        return self._req("GET", f"/reports/{report['id']}/text")
+        return self.report_text(self.create_x_report()["id"])
+
+    def report_text(self, report_id):
+        return self._req("GET", f"/reports/{report_id}/text")
+
+    def report_png(self, report_id):
+        """Зображення X- чи Z-звіту (PNG, байти)."""
+        return self._req("GET", f"/reports/{report_id}/png", raw=True)
 
 
 # ───────────────────────── Локальна БД ─────────────────────────
@@ -529,6 +558,8 @@ class LocalDB:
             self.con.execute("ALTER TABLE sales ADD COLUMN receipt_type TEXT")
         if "source" not in scols:            # kasa — пробито з цієї каси; checkbox — завантажено з Checkbox
             self.con.execute("ALTER TABLE sales ADD COLUMN source TEXT")
+        if "related_id" not in scols:        # для повернення — UUID чека продажу
+            self.con.execute("ALTER TABLE sales ADD COLUMN related_id TEXT")
         for col in ("shift_id", "shift_serial", "shift_opened_at", "shift_closed_at"):   # зміна чека
             if col not in scols:
                 self.con.execute(f"ALTER TABLE sales ADD COLUMN {col} TEXT")
@@ -659,17 +690,32 @@ class LocalDB:
             self.con.execute("UPDATE goods SET count = count - ? WHERE id=? AND count IS NOT NULL",
                              (qty, good_id))
 
-    def add_sale(self, receipt, payment_type, items, payment_label=None, payment_details=None):
+    def add_sale(self, receipt, payment_type, items, payment_label=None, payment_details=None,
+                 receipt_type="SELL", related_id=None, total=None):
         with self.con:
             self.con.execute(
                 "INSERT OR REPLACE INTO sales (receipt_id, created_at, fiscal_code, payment_type, "
-                "total, items, payment_label, payment_details, receipt_type, source) "
-                "VALUES (?,?,?,?,?,?,?,?, 'SELL', 'kasa')",
+                "total, items, payment_label, payment_details, receipt_type, source, related_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?, 'kasa', ?)",
                 (receipt["id"], datetime.now().isoformat(timespec="seconds"),
                  receipt.get("fiscal_code"), payment_type,
-                 receipt.get("total_sum"), json.dumps(items, ensure_ascii=False), payment_label,
-                 json.dumps(payment_details, ensure_ascii=False) if payment_details else None))
+                 abs(total if total is not None else (receipt.get("total_sum") or 0)),
+                 json.dumps(items, ensure_ascii=False), payment_label,
+                 json.dumps(payment_details, ensure_ascii=False) if payment_details else None,
+                 receipt_type, related_id))
         self.set_receipt_shift(receipt)
+
+    def returned_qty(self, sale_id):
+        """Скільки вже повернуто за чеком продажу: {позиція: тисячні}. Позиція — номер рядка чека."""
+        out = {}
+        for r in self.con.execute("SELECT items FROM sales WHERE receipt_type='RETURN' AND lower(related_id)=lower(?)",
+                                  (sale_id,)):
+            for it in json.loads(r["items"] or "[]"):
+                key = it.get("line")
+                if key is None:
+                    key = "code:" + str(it.get("code"))
+                out[key] = out.get(key, 0) + (it.get("qty") or 0)
+        return out
 
     def sales(self, limit=50, since=None):
         if since:
@@ -714,9 +760,10 @@ class LocalDB:
                   "qty": g.get("quantity"), "price": (g.get("good") or {}).get("price")} for g in r.get("goods") or []]
         cur = self.con.execute(
             "INSERT OR IGNORE INTO sales (receipt_id, created_at, fiscal_code, payment_type, total, items, "
-            "payment_label, receipt_type, source) VALUES (?,?,?,?,?,?,?,?, 'checkbox')",
+            "payment_label, receipt_type, source, related_id) VALUES (?,?,?,?,?,?,?,?, 'checkbox', ?)",
             (r["id"], local_time(r.get("fiscal_date") or r.get("created_at")), r.get("fiscal_code"), ptype,
-             r.get("total_sum"), json.dumps(items, ensure_ascii=False), label, r.get("type")))
+             abs(r.get("total_sum") or 0), json.dumps(items, ensure_ascii=False), label, r.get("type"),
+             r.get("related_receipt_id")))
         self.con.commit()
         self.set_receipt_shift(r)        # і для нових, і для вже наявних записів без зміни
         return cur.rowcount == 1
@@ -768,13 +815,14 @@ def is_excise_tax(t):
     return bool(t.get("extra_rate")) or "акциз" in (t.get("label") or "").lower()
 
 
-def build_goods_payload(cart, use_leftovers):
+def build_goods_payload(cart, use_leftovers, line_discounts=None):
     """
     cart — список (row, qty_thousandths) або (row, qty_thousandths, excise_barcodes).
     good_id передається, якщо ведеться облік залишків.
+    line_discounts — знижки/надбавки кожного рядка (з apply_discounts).
     """
     payload = []
-    for g, qty, *rest in cart:
+    for i, (g, qty, *rest) in enumerate(cart):
         good = {"code": g["code"], "name": g["name"], "price": g["price"]}
         codes = good_tax_codes(g)
         if codes:
@@ -783,10 +831,214 @@ def build_goods_payload(cart, use_leftovers):
         if marks:
             good["excise_barcodes"] = list(marks)
         item = {"good": good, "quantity": qty}
+        if line_discounts and line_discounts[i]:
+            item["discounts"] = line_discounts[i]
         if use_leftovers and not str(g["id"]).startswith(LocalDB.LOCAL_ID_PREFIX):
             item["good_id"] = g["id"]   # нового (ще не синхронізованого) товару в Checkbox поки немає
         payload.append(item)
     return payload
+
+
+# ───────────── Знижки й надбавки ─────────────
+# Інтерфейс задає знижку відсотком або сумою, а в Checkbox вона завжди йде абсолютним значенням
+# (mode VALUE, копійки) — так рекомендує документація: сума в чеку не залежить від заокруглень сервера.
+
+DISCOUNT_TYPES = {"DISCOUNT": "Знижка", "EXTRA_CHARGE": "Надбавка"}
+DISCOUNT_NAME_MAX = 100
+
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def discount_amount(spec, base, where):
+    """
+    spec — {"type": DISCOUNT|EXTRA_CHARGE, "mode": PERCENT|VALUE, "value": …, "name": …};
+    для VALUE value — копійки (ціле), для PERCENT — відсоток (до двох знаків після коми).
+    base — сума, від якої рахується знижка (копійки). Повертає payload знижки Checkbox або None.
+    """
+    if not spec:
+        return None
+    if not isinstance(spec, dict):
+        raise ValueError(f"Невірна знижка: {where}")
+    kind, mode, v = spec.get("type"), spec.get("mode"), spec.get("value")
+    if kind not in DISCOUNT_TYPES or mode not in ("PERCENT", "VALUE") or not _num(v) or v <= 0:
+        raise ValueError(f"Невірна знижка: {where}")
+    title = DISCOUNT_TYPES[kind]
+    if mode == "PERCENT":
+        pv = round(v * 100)                     # соті частки відсотка
+        if abs(v * 100 - pv) > 1e-6:
+            raise ValueError(f"{where}: відсоток — не більше двох знаків після коми")
+        if kind == "DISCOUNT" and pv >= 10000:
+            raise ValueError(f"{where}: знижка має бути меншою за 100%")
+        if pv > 100000:
+            raise ValueError(f"{where}: надбавка — не більше 1000%")
+        amount = (base * pv + 5000) // 10000    # заокруглення до копійки (0.5 — вгору)
+        default = f"{title} {v:g}%"
+    else:
+        if not isinstance(v, int):
+            raise ValueError(f"{where}: сума знижки — у копійках")
+        amount, default = v, title
+    if amount <= 0:
+        raise ValueError(f"{where}: {title.lower()} менша за 1 копійку")
+    if kind == "DISCOUNT" and amount >= base:
+        raise ValueError(f"{where}: знижка має бути меншою за суму ({base / 100:.2f} грн)")
+    name = " ".join(str(spec.get("name") or "").split())[:DISCOUNT_NAME_MAX] or default
+    return {"type": kind, "mode": "VALUE", "value": amount, "name": name}
+
+
+def tax_fields(codes):
+    """Податки, від яких рахується знижка: tax_code для однієї ставки, tax_codes — для кількох."""
+    codes = list(codes or [])
+    if not codes:
+        return {}
+    return {"tax_code": codes[0]} if len(codes) == 1 else {"tax_codes": codes}
+
+
+def discount_delta(d):
+    return -d["value"] if d["type"] == "DISCOUNT" else d["value"]
+
+
+def apply_discounts(lines, receipt_spec=None):
+    """
+    lines — список {"base": копійки, "tax_codes": [...], "spec": знижка рядка або None, "name": …}.
+    Повертає (знижки кожного рядка, знижки чека, суми рядків після знижок, разом).
+    Знижка на чек іде в чек цілою, якщо всі товари мають однакові податки;
+    інакше її розподілено між товарами пропорційно сумі (щоб податки рахувались правильно).
+    """
+    per_line, totals = [], []
+    for i, ln in enumerate(lines):
+        ds = []
+        d = discount_amount(ln.get("spec"), ln["base"], ln.get("name") or f"позиція {i + 1}")
+        if d:
+            d.update(tax_fields(ln["tax_codes"]))
+            ds.append(d)
+        per_line.append(ds)
+        totals.append(ln["base"] + sum(discount_delta(x) for x in ds))
+    sub = sum(totals)
+    receipt_ds = []
+    rd = discount_amount(receipt_spec, sub, "знижка на чек") if receipt_spec else None
+    if rd:
+        tax_sets = {tuple(ln["tax_codes"] or ()) for ln in lines}
+        if len(tax_sets) == 1:
+            rd.update(tax_fields(next(iter(tax_sets))))
+            receipt_ds.append(rd)
+            return per_line, receipt_ds, totals, sub + discount_delta(rd)
+        amount = rd["value"]
+        shares = [amount * t // sub for t in totals]
+        for i in sorted(range(len(totals)), key=lambda k: -totals[k])[:amount - sum(shares)]:
+            shares[i] += 1
+        for i, share in enumerate(shares):
+            if share <= 0:
+                continue
+            if rd["type"] == "DISCOUNT" and share >= totals[i]:
+                raise ValueError("Знижка на чек завелика для розподілу між товарами")
+            x = {"type": rd["type"], "mode": "VALUE", "value": share, "name": rd["name"],
+                 **tax_fields(lines[i]["tax_codes"])}
+            per_line[i].append(x)
+            totals[i] += discount_delta(x)
+    return per_line, receipt_ds, totals, sum(totals)
+
+
+# ───────────── Повернення ─────────────
+
+def _line_tax_codes(line):
+    """Коди податків рядка з чека Checkbox (good.tax — коди або об'єкти; або line.taxes)."""
+    good = line.get("good") or {}
+    objs = [t for t in (line.get("taxes") or []) if isinstance(t, dict) and t.get("code") is not None]
+    if objs:
+        return ordered_tax_codes(objs)
+    codes = []
+    for t in good.get("tax") or []:
+        c = t.get("code") if isinstance(t, dict) else t
+        if c is not None and c not in codes:
+            codes.append(c)
+    return codes
+
+
+def _line_total(line):
+    """Сума рядка після його знижок/надбавок, копійки."""
+    if isinstance(line.get("total_sum"), int):
+        return line["total_sum"]
+    good = line.get("good") or {}
+    base = line.get("sum") if isinstance(line.get("sum"), int) else line_sum(good.get("price", 0), line.get("quantity", 0))
+    for d in line.get("discounts") or []:
+        amount = d.get("sum") if isinstance(d.get("sum"), int) else (d.get("value") if d.get("mode") == "VALUE" else 0)
+        base += -amount if d.get("type") == "DISCOUNT" else amount
+    return base
+
+
+def share_of(total, part, whole):
+    """Частка суми total, що припадає на part із whole (заокруглення 0.5 — вгору)."""
+    if whole <= 0:
+        return 0
+    return (total * part * 2 + whole) // (2 * whole)
+
+
+def return_lines(receipt, returned):
+    """
+    Рядки чека продажу для повернення. Сума кожного рядка враховує його знижки
+    і частку знижки на весь чек, тож повне повернення дає рівно суму продажу.
+    returned — вже повернуто: {номер рядка або "code:<код>": тисячні}.
+    """
+    src = [ln for ln in receipt.get("goods") or [] if not ln.get("is_return")]
+    totals = [_line_total(ln) for ln in src]
+    receipt_disc = sum(totals) - receipt["total_sum"] if isinstance(receipt.get("total_sum"), int) else 0
+    if receipt_disc:                       # знижка/надбавка на весь чек → розподіл між рядками
+        shares = [share_of(receipt_disc, t, sum(totals)) for t in totals]
+        shares[-1] += receipt_disc - sum(shares)
+        totals = [t - sh for t, sh in zip(totals, shares)]
+    by_code = dict((k[5:], v) for k, v in returned.items() if isinstance(k, str) and k.startswith("code:"))
+    out = []
+    for i, (ln, eff) in enumerate(zip(src, totals)):
+        good = ln.get("good") or {}
+        qty = ln.get("quantity") or 0
+        done = returned.get(i, 0)
+        code = str(good.get("code"))
+        if by_code.get(code):                  # повернення, завантажені з Checkbox (без номера рядка)
+            take = min(by_code[code], qty - done)
+            done += take
+            by_code[code] -= take
+        out.append({
+            "line": i, "code": good.get("code"), "name": good.get("name"), "price": good.get("price") or 0,
+            "barcode": good.get("barcode"), "qty": qty, "returned": done, "max": max(qty - done, 0),
+            "total": eff, "tax_codes": _line_tax_codes(ln), "good_id": ln.get("good_id"),
+            "excise_barcodes": list(good.get("excise_barcodes") or ln.get("excise_barcodes") or []),
+            "discount_name": next((d.get("name") for d in ln.get("discounts") or [] if d.get("name")), None),
+        })
+    return out
+
+
+def return_amount(line, qty):
+    """Сума повернення qty (тисячні) з рядка: частка від уже повернутого до нового підсумку."""
+    before = line["qty"] - line["max"]
+    return share_of(line["total"], before + qty, line["qty"]) - share_of(line["total"], before, line["qty"])
+
+
+def return_good_payload(line, qty, use_leftovers):
+    """Товар для чека повернення: is_return, та сама ціна, різниця з сумою — знижкою чи надбавкою."""
+    good = {"code": line["code"], "name": line["name"], "price": line["price"]}
+    if line["tax_codes"]:
+        good["tax"] = list(line["tax_codes"])
+    if line.get("barcode"):
+        good["barcode"] = line["barcode"]
+    marks = line.get("excise_barcodes") or []
+    if marks:
+        before = (line["qty"] - line["max"]) // 1000
+        part = marks[before:before + qty // 1000]
+        if part:
+            good["excise_barcodes"] = part
+    item = {"good": good, "quantity": qty, "is_return": True}
+    if use_leftovers and line.get("good_id"):
+        item["good_id"] = line["good_id"]
+    amount = return_amount(line, qty)
+    diff = amount - line_sum(line["price"], qty)
+    if diff:
+        kind = "DISCOUNT" if diff < 0 else "EXTRA_CHARGE"
+        item["discounts"] = [{"type": kind, "mode": "VALUE", "value": abs(diff),
+                              "name": line.get("discount_name") or DISCOUNT_TYPES[kind],
+                              **tax_fields(line["tax_codes"])}]
+    return item, amount
 
 
 PAYMENT_LABEL_MAX = 100
@@ -803,6 +1055,11 @@ def clean_payment_label(label):
 def payment_title(payment_type, label=None):
     base = "Готівка" if payment_type == "CASH" else "Картка"
     return label or base
+
+
+def line_sum(price, qty):
+    """Сума рядка: ціна (коп.) × кількість (тисячні), заокруглення 0.5 копійки — вгору."""
+    return (price * qty + 500) // 1000
 
 
 def new_receipt_id():
