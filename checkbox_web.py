@@ -1167,6 +1167,11 @@ PAGE = r"""<!DOCTYPE html>
   .kind.ret { background: #fee2e2; color: #991b1b; } .kind.in { background: #dcfce7; color: #166534; } .kind.out { background: #fef3c7; color: #92400e; }
   .cashnow { font-size: 15px; margin-top: 8px; color: var(--text); }
   .kind.pre { background: #ede9fe; color: #5b21b6; }
+  #askModal { z-index: 60; }
+  #askModal .card { max-width: 460px; }
+  #askText { margin: 10px 0 0; white-space: pre-line; line-height: 1.5; }
+  #askText b { white-space: nowrap; }
+  .askicon { font-size: 22px; line-height: 1; }
   .chain-receipts { margin: 6px 0 0; padding: 0; list-style: none; font-size: 13px; }
   .chain-receipts li { padding: 2px 0; }
   .prebar { height: 6px; border-radius: 3px; background: #e5e7eb; overflow: hidden; margin-top: 4px; min-width: 90px; }
@@ -1588,6 +1593,14 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn other" id="postSubmit">Пробити післяплату</button>
   </div>
 </div></div>
+<div class="modal" id="askModal" role="dialog" aria-modal="true"><div class="card">
+  <div class="row" style="gap:10px"><span class="askicon" id="askIcon">❓</span><h3 style="margin:0" id="askTitle">Підтвердження</h3></div>
+  <p id="askText"></p>
+  <div class="pay" style="margin-top:18px">
+    <button class="btn sec" id="askNo">Скасувати</button>
+    <button class="btn" id="askYes">Так</button>
+  </div>
+</div></div>
 <div id="toast"></div>
 
 <script>
@@ -1652,6 +1665,34 @@ function toast(msg, err) {
   const t = $('#toast'); t.textContent = msg; t.className = 'show' + (err ? ' err' : '');
   clearTimeout(toastTimer); toastTimer = setTimeout(() => t.className = '', err ? 6000 : 3000);
 }
+// Підтвердження у вікні каси замість системного confirm(): await ask(текст, { title, ok, cancel, danger, icon })
+let askResolve = null;
+function ask(text, o = {}) {
+  if (askResolve) askResolve(false);          // попереднє питання, якщо ще відкрите, — «ні»
+  $('#askTitle').textContent = o.title || 'Підтвердження';
+  $('#askIcon').textContent = o.icon || (o.danger ? '⚠️' : '❓');
+  $('#askText').textContent = text;
+  $('#askYes').textContent = o.ok || 'Так';
+  $('#askNo').textContent = o.cancel || 'Скасувати';
+  $('#askYes').className = 'btn' + (o.danger ? ' danger' : '');
+  $('#askModal').classList.add('show');
+  setTimeout(() => (o.danger ? $('#askNo') : $('#askYes')).focus(), 0);   // небезпечне — не підтверджується випадковим Enter
+  return new Promise(res => { askResolve = res; });
+}
+function askDone(v) {
+  $('#askModal').classList.remove('show');
+  const r = askResolve; askResolve = null;
+  if (r) r(v);
+}
+$('#askYes').onclick = () => askDone(true);
+$('#askNo').onclick = () => askDone(false);
+$('#askModal').onclick = e => { if (e.target.id === 'askModal') askDone(false); };
+$('#askModal').addEventListener('keydown', e => {
+  e.stopPropagation();                        // Enter/Escape не мають дійти до вікна під питанням
+  if (e.key === 'Escape') askDone(false);
+  if (e.key === 'Enter') { e.preventDefault(); askDone(document.activeElement !== $('#askNo')); }
+});
+const askOpenShift = what => ask(`Зміна закрита. Відкрити зміну і ${what}?`, { title: 'Зміна закрита', ok: 'Відкрити зміну', icon: '🕘' });
 async function busy(btn, fn) {   // true — успіх, false — помилка (вже показана)
   btn.disabled = true;
   try { await fn(); return true; } catch (e) { toast(e.message, true); return false; } finally { btn.disabled = false; }
@@ -1787,7 +1828,7 @@ $('#goodAddBtn').onclick = () => openGood(null);
 $('#goodDiscard').onclick = async () => {
   if (!editing) return;
   const msg = editing.pending === 'new' ? 'Видалити цей новий товар з каси?' : 'Повернути товар до стану з Checkbox?';
-  if (!confirm(msg)) return;
+  if (!(await ask(msg, { title: 'Скасувати зміни товару?', ok: 'Скасувати зміни', cancel: 'Залишити', danger: true }))) return;
   try {
     await api('/api/goods/discard', { code: editing.code.trim() });
     $('#goodModal').classList.remove('show'); editing = null;
@@ -1805,7 +1846,7 @@ $('#goodSave').onclick = async e => {
     barcode: $('#gBarcode').value, uktzed: $('#gUktzed').value, is_weight: $('#gWeight').checked,
     tax_codes: [...document.querySelectorAll('#gTaxes input:checked')].map(i => +i.value),
   };
-  if (!body.tax_codes.length && taxes.length && !confirm('Товар без податкової ставки. Зберегти так?')) return;
+  if (!body.tax_codes.length && taxes.length && !(await ask('Товар без податкової ставки — чек з ним буде без податку. Зберегти так?', { title: 'Без податку', ok: 'Зберегти', icon: '⚠️' }))) return;
   btn.disabled = true; $('#goodCancel').disabled = true;
   try {
     const r = await api('/api/goods/save', body);
@@ -2109,9 +2150,10 @@ function marksIncomplete() {
     return g && isExciseGood(g) && !g.is_weight && (c.marks || []).length < Math.round(c.qty / 1000);
   }).map(c => goods.find(x => x.id === c.id).name);
 }
-function confirmMarks() {
+async function confirmMarks() {
   const missing = marksIncomplete();
-  return !missing.length || confirm(`Не для всіх одиниць додано акцизні марки:\n• ${missing.join('\n• ')}\n\nПробити чек усе одно?`);
+  return !missing.length || await ask(`Не для всіх одиниць додано акцизні марки:\n• ${missing.join('\n• ')}\n\nПробити чек усе одно?`,
+                                      { title: 'Акцизні марки', ok: 'Пробити без марок', cancel: 'Додати марки', icon: '🏷' });
 }
 // Зображення останнього чека під кошиком; Checkbox може готувати PNG секунду-дві — пробуємо ще раз
 function loadLastPng(img, id, attempt = 0) {
@@ -2123,7 +2165,7 @@ function loadLastPng(img, id, attempt = 0) {
 }
 async function pay(type, btn, card, label, opts = {}) {   // повертає true, якщо чек пробито
   if (!cart.length) { toast('Кошик порожній', true); return false; }
-  if (!opts.marksChecked && !confirmMarks()) return false;
+  if (!opts.marksChecked && !(await confirmMarks())) return false;
   const de = discountError();
   if (de) { toast('Виправте знижку: ' + de, true); return false; }
   const body = { items: cart, payment_type: type };
@@ -2143,7 +2185,7 @@ async function pay(type, btn, card, label, opts = {}) {   // повертає tr
     try {
       r = await api('/api/sell', body);
     } catch (e) {
-      if (e.code !== 'SHIFT_CLOSED' || opts.noShiftPrompt || !confirm('Зміна закрита. Відкрити зміну і пробити чек?')) throw e;
+      if (e.code !== 'SHIFT_CLOSED' || opts.noShiftPrompt || !(await askOpenShift('пробити чек'))) throw e;
       if (!(await openShiftNow())) throw e;
       r = await api('/api/sell', body);
     }
@@ -2319,11 +2361,11 @@ function discountError() {
   const T = computeTotals(), bad = T.lines.find(l => l.err);
   return bad ? bad.err : T.rerr;
 }
-function openTermPay() {
+async function openTermPay() {
   if (!cart.length) return toast('Кошик порожній', true);
   const de = discountError();
   if (de) return toast('Виправте знижку: ' + de, true);   // до списання з картки, а не після
-  if (!confirmMarks()) return;
+  if (!(await confirmMarks())) return;
   term = { amount: cartTotal, messages: [] };
   showTermModal();
 }
@@ -2334,14 +2376,17 @@ function showTermModal() {
   $('#termModal').classList.add('show');
   beginTermFlow();
 }
-function closeTermPay() {
+async function closeTermPay() {
   if (!term) return $('#termModal').classList.remove('show');
-  const W = termWords(term);
-  if (term.state === 'approved' || term.state === 'opening') return toast('Зачекайте — операція ще триває', true);
-  if (term.state === 'fiscal_failed' &&
-      !confirm(`${W.doneUnsent}, а чек не пробито. Закрити без чека?`)) return;
-  if (['sending', 'progress'].includes(term.state)) {
-    if (!confirm(`${W.running}. Скасування в програмі може не скасувати її на терміналі — перевірте екран терміналу. Закрити?`)) return;
+  const t = term, W = termWords(t);
+  if (t.state === 'approved' || t.state === 'opening') return toast('Зачекайте — операція ще триває', true);
+  if (t.state === 'fiscal_failed' &&
+      !(await ask(`${W.doneUnsent}, а чек не пробито.\nЗакрити без чека?`, { title: 'Чек не пробито', ok: 'Закрити без чека', cancel: 'Повернутися', danger: true }))) return;
+  if (term !== t) return;
+  if (['sending', 'progress'].includes(t.state)) {
+    if (!(await ask(`${W.running}. Скасування в програмі може не скасувати її на терміналі — перевірте екран терміналу.\nЗакрити вікно?`,
+                    { title: 'Операція на терміналі триває', ok: 'Закрити', cancel: 'Чекати далі', danger: true }))) return;
+    if (term !== t) return;
     term.finished = true; try { term.ws && term.ws.close(); } catch (e) {}
   }
   const op = term.op;
@@ -2366,10 +2411,12 @@ $('#termOpenShift').onclick = async () => {
 };
 $('#termModal').onkeydown = e => { if (e.key === 'Escape') closeTermPay(); };
 $('#termFiscalRetry').onclick = () => fiscalizeAfterTerm();
-$('#termManual').onclick = () => {
+$('#termManual').onclick = async () => {
   if (term && term.op) {
-    if (!confirm(term.op.refund ? 'Повернення на терміналі точно пройшло? Буде пробито чек повернення.'
-                                : 'Оплата на терміналі точно пройшла? Чек буде пробито без даних картки.')) return;
+    const t = term;
+    if (!(await ask(t.op.refund ? 'Повернення на терміналі точно пройшло? Буде пробито чек повернення.'
+                                : 'Оплата на терміналі точно пройшла? Чек буде пробито без даних картки.',
+                    { title: 'Підтвердіть за екраном терміналу', ok: 'Так, пробити чек', cancel: 'Ні' })) || term !== t) return;
     term.approvedMsg = null;
     return fiscalizeAfterTerm();
   }
@@ -2438,9 +2485,9 @@ async function loadShift() {
   } catch (e) { $('#shiftBadge').textContent = 'Зміна: помилка'; toast(e.message, true); }
 }
 $('#openShift').onclick = e => busy(e.target, async () => { if (!(await openShiftNow())) throw new Error('Зміну не відкрито'); });
-$('#closeShift').onclick = e => {
+$('#closeShift').onclick = async e => {
   const extra = pendingCount ? `\n\nПеред закриттям у Checkbox буде відправлено невідправлені зміни товарів: ${pendingCount}.` : '';
-  if (!confirm('Закрити зміну і сформувати Z-звіт?' + extra)) return;
+  if (!(await ask('Закрити зміну і сформувати Z-звіт?' + extra, { title: 'Закриття зміни', ok: 'Закрити зміну', danger: true, icon: '🧾' }))) return;
   busy(e.target, async () => {
     const r = await api('/api/shift/close', {});
     toast('Зміну закрито' + syncSummary(r.sync), !!(r.sync && (r.sync.sync_error || r.sync.push_error)));
@@ -2458,12 +2505,12 @@ async function service(sign, btn) {
   const kop = Math.round(parseFloat(raw) * 100);
   if (!raw || !(kop > 0) || !/^\d+(\.\d{1,2})?$/.test(raw)) { toast('Вкажіть суму, напр. 500 або 125.50', true); return $('#svcSum').focus(); }
   const what = sign > 0 ? 'Внесення' : 'Винесення';
-  if (!confirm(`${what} ${uah(kop)} ₴ готівки?`)) return;
+  if (!(await ask(`${what} ${uah(kop)} ₴ готівки?`, { title: what + ' готівки', ok: what, icon: sign > 0 ? '➕' : '➖' }))) return;
   await busy(btn, async () => {
     let r;
     try { r = await api('/api/service', { value: sign * kop }); }
     catch (e) {
-      if (e.code !== 'SHIFT_CLOSED' || !confirm('Зміна закрита. Відкрити зміну і провести ' + what.toLowerCase() + '?')) throw e;
+      if (e.code !== 'SHIFT_CLOSED' || !(await askOpenShift('провести ' + what.toLowerCase()))) throw e;
       if (!(await openShiftNow())) throw e;
       r = await api('/api/service', { value: sign * kop });
     }
@@ -2648,7 +2695,7 @@ async function sendReturn(body, opts = {}) {     // пробиває чек по
   let r;
   try { r = await api('/api/return', body); }
   catch (err) {
-    if (err.code !== 'SHIFT_CLOSED' || opts.noShiftPrompt || !confirm('Зміна закрита. Відкрити зміну і пробити повернення?')) throw err;
+    if (err.code !== 'SHIFT_CLOSED' || opts.noShiftPrompt || !(await askOpenShift('пробити повернення'))) throw err;
     if (!(await openShiftNow())) throw err;
     r = await api('/api/return', body);
   }
@@ -2669,9 +2716,10 @@ $('#retSubmit').onclick = async e => {
   const pay = ret.pay;
   if (type === 'CASHLESS' && canRefundViaTerminal() && ret.viaTerm !== false) {
     // POSSrv «Відміна транзакції / Повернення коштів»: сума і реквізити транзакції продажу
-    if (!confirm(`Повернути ${uah(pay)} ₴ на картку через термінал і пробити чек повернення?`)) return;
     const tr = info.terminal || {};
     if (!tr.rrn) return toast('Немає RRN продажу — без нього термінал не поверне кошти. Зніміть позначку «через термінал» і проведіть повернення на терміналі вручну.', true);
+    if (!(await ask(`Повернути ${uah(pay)} ₴ на картку через термінал і пробити чек повернення?\n\nКартка продажу: ${[info.card && info.card.card_mask, tr.rrn && 'RRN ' + tr.rrn].filter(Boolean).join(' · ')}`,
+                    { title: 'Повернення на картку', ok: `Повернути ${uah(pay)} ₴`, danger: true, icon: '💳' }))) return;
     // головне для повернення — RRN продажу та id пристрою
     const payload = { amount: pay, id: termCfg.device_id, rrn: tr.rrn, ...(tr.invoicenum ? { invoicenum: tr.invoicenum } : {}),
                       ...(tr.auth_code ? { auth_code: tr.auth_code } : {}) };
@@ -2687,7 +2735,8 @@ $('#retSubmit').onclick = async e => {
     showTermModal();
     return;
   }
-  if (!confirm(`Пробити чек повернення на ${uah(pay)} ₴?` + (type === 'CASHLESS' ? '\n\nПовернення на терміналі вже проведено?' : ''))) return;
+  if (!(await ask(`Пробити чек повернення на ${uah(pay)} ₴?` + (type === 'CASHLESS' ? '\n\nПовернення на терміналі вже проведено?' : '\n\nВидайте покупцю готівку з каси.'),
+                  { title: 'Чек повернення', ok: 'Пробити повернення', danger: true, icon: '↩️' }))) return;
   await busy(e.target, () => sendReturn(body));
 };
 
@@ -2696,7 +2745,7 @@ const kopOf = v => { const t = String(v || '').trim().replace(',', '.'); return 
 async function withShift(fn, what) {      // виконати; якщо зміна закрита — запропонувати відкрити і повторити
   try { return await fn(); }
   catch (e) {
-    if (e.code !== 'SHIFT_CLOSED' || !confirm(`Зміна закрита. Відкрити зміну і ${what}?`)) throw e;
+    if (e.code !== 'SHIFT_CLOSED' || !(await askOpenShift(what))) throw e;
     if (!(await openShiftNow())) throw e;
     return await fn();
   }
@@ -2709,10 +2758,10 @@ function payViaTerminal(amount, send, back) {
   showTermModal();
 }
 // нове замовлення з кошика
-function openPre() {
+async function openPre() {
   if (!cart.length) return toast('Кошик порожній', true);
   const de = discountError(); if (de) return toast('Виправте знижку: ' + de, true);
-  if (!confirmMarks()) return;
+  if (!(await confirmMarks())) return;
   $('#preTotal').textContent = uah(cartTotal) + ' ₴';
   $('#preAmount').value = ''; $('#preNote').value = '';
   renderPre();
@@ -2786,8 +2835,8 @@ $('#prepayTable').onclick = async e => {
   if (d.ret) {
     const p = prepayList.find(x => x.relation_id === d.ret);
     const card = p.receipts.some(c => c.payment_type === 'CASHLESS');
-    if (!confirm(`Повернути все замовлення «${p.note || p.relation_id}»?\n\nCheckbox пробиє чек повернення на кожен чек замовлення (${p.receipts.length}), разом ${uah(p.paid)} ₴.` +
-                 (card ? '\nБезготівкові частини поверніть покупцю на терміналі окремо.' : '') + '\nЧастково замовлення не повертається.')) return;
+    if (!(await ask(`Повернути все замовлення «${p.note || p.relation_id}»?\n\nCheckbox пробиє чек повернення на кожен чек замовлення (${p.receipts.length}), разом ${uah(p.paid)} ₴.` +
+                 (card ? '\nБезготівкові частини поверніть покупцю на терміналі окремо.' : '') + '\nЧастково замовлення не повертається.', { title: 'Повернення замовлення', ok: 'Повернути замовлення', danger: true, icon: '↩️' }))) return;
     return busy(a, async () => {
       const r = await withShift(() => api('/api/prepay/return', { relation_id: p.relation_id }), 'повернути замовлення');
       toast(`Замовлення повернуто: ${uah(r.paid)} ₴` + (r.receipts.length ? `, чеків повернення: ${r.receipts.length}` : ' — чеки повернення в журналі після «Завантажити з Checkbox»'));
@@ -3010,8 +3059,8 @@ $('#termCfgSave').onclick = e => busy(e.target, async () => {
 
 // --- вихід ---
 $('#quitBtn').onclick = async () => {
-  if (cart.length && !confirm('У кошику є товари. Все одно зупинити касу?')) return;
-  if (!cart.length && !confirm('Зупинити касу?')) return;
+  if (!(await ask(cart.length ? 'У кошику є товари. Все одно зупинити касу?' : 'Зупинити касу? Вкладку можна буде закрити.',
+                  { title: 'Вихід', ok: 'Зупинити касу', danger: !!cart.length, icon: '⏻' }))) return;
   try { await api('/api/quit', {}); } catch (e) {}
   document.body.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:8px;font:16px system-ui">
     <b style="font-size:20px">Касу зупинено</b><span style="color:#6b7280">Цю вкладку можна закрити. Щоб почати знову — запустіть Касу ще раз.</span></div>`;
@@ -3057,7 +3106,7 @@ $('#checkUpdBtn').onclick = e => busy(e.target, async () => {
 });
 async function runUpdate() {
   const warn = cart.length ? 'У кошику є товари — після оновлення кошик буде порожній.\n\n' : '';
-  if (!confirm(`${warn}Оновити касу до версії ${updateInfo.latest}? Каса перезапуститься — це до хвилини.`)) return;
+  if (!(await ask(`${warn}Оновити касу до версії ${updateInfo.latest}? Каса перезапуститься — це до хвилини.`, { title: 'Оновлення', ok: 'Оновити', icon: '⬆️' }))) return;
   const ov = $('#updateOverlay'); ov.style.display = 'flex';
   $('#updateStage').textContent = `Завантажую й встановлюю версію ${updateInfo.latest}…`;
   try { await api('/api/update/install', {}); }
