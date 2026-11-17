@@ -203,6 +203,14 @@ def restart_command():
 def spawn_restarted():
     """Запустити нову копію каси (після того, як стара звільнила порт)."""
     env = dict(os.environ, CHECKBOX_NO_BROWSER="1", CHECKBOX_RESTARTED="1")
+    if getattr(sys, "frozen", False):
+        # Без цього нова копія Kasa.exe (onefile) підхоплює тимчасову папку _MEI… старої,
+        # і стара при виході не може її видалити: «Failed to remove temporary directory».
+        # PyInstaller ≥ 6.9: нова копія розпакується у власну папку, як при звичайному запуску.
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        for key in list(env):
+            if key.startswith("_PYI_") or key.startswith("_MEIPASS"):
+                env.pop(key)
     kw = {"env": env, "cwd": str(APP_DIR), "close_fds": True}
     if os.name == "nt":
         flags = 0x00000200                                  # CREATE_NEW_PROCESS_GROUP

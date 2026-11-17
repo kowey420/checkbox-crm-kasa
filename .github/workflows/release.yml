@@ -57,7 +57,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Залежності
-        run: pip install pyinstaller certifi pystray pillow
+        run: pip install "pyinstaller>=6.9" certifi pystray pillow
       - name: Зібрати Kasa.exe
         run: >
           pyinstaller --noconfirm --clean --onefile --noconsole --name Kasa --icon kasa.ico
