@@ -1168,6 +1168,19 @@ PAGE = r"""<!DOCTYPE html>
   .cashnow { font-size: 15px; margin-top: 8px; color: var(--text); }
   .kind.pre { background: #ede9fe; color: #5b21b6; }
   #askModal { z-index: 60; }
+  #scanModal .card { max-width: 620px; }
+  #scanInput { font-size: 20px; padding: 14px 16px; letter-spacing: .02em; }
+  #scanInput.mark { outline: 3px solid var(--warn); }
+  .scanhint { margin: 8px 0 0; padding: 10px 12px; border-radius: 8px; font-size: 14px; background: #eff6ff; color: var(--accent-2); }
+  .scanhint.ok { background: #ecfdf5; color: #065f46; } .scanhint.bad { background: #fef2f2; color: #991b1b; } .scanhint.warn { background: #fffbeb; color: #92400e; }
+  .scanlist { margin-top: 12px; max-height: 42vh; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+  .scanlist table td { padding: 7px 10px; }
+  .scanlist tr.scanned td { background: #f0fdf4; transition: background .6s; }
+  .scantotal { display: flex; justify-content: space-between; align-items: baseline; margin: 14px 0 4px; font-size: 22px; font-weight: 700; }
+  .scanpay { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 12px; }
+  .scanpay button { padding: 13px; font-size: 15px; }
+  .qbtn { border: 1px solid var(--line); background: #fff; border-radius: 6px; width: 26px; height: 26px; cursor: pointer; font: inherit; line-height: 1; }
+  .qbtn:hover { border-color: var(--accent); color: var(--accent); }
   #askModal .card { max-width: 460px; }
   #askText { margin: 10px 0 0; white-space: pre-line; line-height: 1.5; }
   #askText b { white-space: nowrap; }
@@ -1205,7 +1218,10 @@ PAGE = r"""<!DOCTYPE html>
   <section id="pos" class="tab active">
     <div class="grid">
       <div class="card">
-        <input type="text" id="search" placeholder="Штрихкод, код або назва — Enter додає в кошик" autofocus>
+        <div class="row">
+          <input type="text" id="search" placeholder="Штрихкод, код або назва — Enter додає в кошик" autofocus>
+          <button class="btn" id="scanBtn" style="white-space:nowrap" title="Сканувати товари один за одним, потім одразу оплата (F2)">▦ Сканувати підряд</button>
+        </div>
         <div class="results" id="results"></div>
       </div>
       <div class="card">
@@ -1601,6 +1617,32 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn" id="askYes">Так</button>
   </div>
 </div></div>
+<div class="modal" id="scanModal"><div class="card">
+  <div class="row" style="justify-content:space-between">
+    <h3 style="margin:0">▦ Сканування товарів</h3>
+    <span class="row"><label class="chk" style="font-size:12px;color:var(--muted)"><input type="checkbox" id="scanSound" checked> звук</label>
+      <button class="x" id="scanX" title="Готово">✕</button></span>
+  </div>
+  <p class="muted" style="margin:4px 0 10px;font-size:13px">Скануйте товари один за одним — кожен скан додається в кошик. Можна ввести штрихкод чи код вручну і натиснути Enter.</p>
+  <input type="text" id="scanInput" autocomplete="off" spellcheck="false" placeholder="Скануйте штрихкод…">
+  <div class="row" id="scanWeightRow" style="display:none;margin-top:8px">
+    <input type="text" id="scanWeight" inputmode="decimal" placeholder="Вага, кг (напр. 0.456)" style="max-width:220px">
+    <button class="btn sec small" id="scanWeightOk">Додати</button>
+    <button class="btn sec small" id="scanWeightCancel">Не додавати</button>
+  </div>
+  <div class="scanhint" id="scanHint">Готово до сканування</div>
+  <div class="scanlist"><table><tbody id="scanList"></tbody></table></div>
+  <div class="row" style="justify-content:space-between;margin-top:8px">
+    <button class="btn sec small" id="scanUndo">↶ Прибрати останнє</button>
+    <span class="muted" style="font-size:13px" id="scanCount"></span>
+  </div>
+  <div class="scantotal"><span>Разом</span><span id="scanTotal">0.00 ₴</span></div>
+  <div class="scanpay">
+    <button class="btn sec" id="scanDone">✓ Готово</button>
+    <button class="btn ok" id="scanCash">Готівка</button>
+    <button class="btn" id="scanCard">Картка</button>
+  </div>
+</div></div>
 <div id="toast"></div>
 
 <script>
@@ -1875,6 +1917,19 @@ $('#search').onkeydown = e => {
 };
 
 // --- кошик ---
+// Додати кількість товару в кошик; повертає номер рядка або null (недостатньо залишку — показано повідомлення)
+function addQty(g, qty, quiet) {
+  const line = cart.find(c => c.id === g.id);
+  const newQty = (line ? line.qty : 0) + qty;
+  if (useLeftovers && g.count != null && newQty > g.count) {
+    if (!quiet) toast(`Недостатньо залишку: є ${qtyStr(g.count, g.is_weight)}`, true);
+    return null;
+  }
+  if (line) { line.qty = newQty; return cart.indexOf(line); }
+  cart.push({ id: g.id, code: g.code.trim(), qty, marks: [] });
+  return cart.length - 1;
+}
+const findByCode = q => goods.find(g => g.code.trim() === q || g.barcode === q);
 function addToCart(id) {
   const g = goods.find(x => x.id === id);
   let qty = 1000;
@@ -1884,16 +1939,152 @@ function addToCart(id) {
     qty = Math.round(parseFloat(v.replace(',', '.')) * 1000);
     if (!(qty > 0)) return toast('Невірна вага', true);
   }
-  const line = cart.find(c => c.id === id);
-  const newQty = (line ? line.qty : 0) + qty;
-  if (useLeftovers && g.count != null && newQty > g.count)
-    return toast(`Недостатньо залишку: є ${qtyStr(g.count, g.is_weight)}`, true);
-  let idx;
-  if (line) { line.qty = newQty; idx = cart.indexOf(line); }
-  else { cart.push({ id, code: g.code.trim(), qty, marks: [] }); idx = cart.length - 1; }
+  const idx = addQty(g, qty);
+  if (idx == null) return;
   renderCart();
   if (isExciseGood(g) && !g.is_weight) openExcise(idx); else $('#search').focus();
 }
+
+
+// --- сканування підряд ---
+let scan = null;   // { last: індекс рядка, history: [{idx, qty, mark}], weightFor: товар, markFor: індекс рядка }
+const SCAN_SOUND_KEY = 'checkbox_scan_sound';
+let audioCtx = null;
+function beep(ok) {
+  if (!$('#scanSound').checked) return;
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'square'; o.frequency.value = ok ? 1400 : 220;
+    g.gain.value = 0.05; o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + (ok ? 0.07 : 0.25));
+  } catch (e) {}
+}
+function scanHint(text, kind) { $('#scanHint').className = 'scanhint' + (kind ? ' ' + kind : ''); $('#scanHint').textContent = text; }
+function needMarks(i) {
+  const c = cart[i], g = c && goods.find(x => x.id === c.id);
+  return g && isExciseGood(g) && !g.is_weight ? Math.round(c.qty / 1000) - (c.marks || []).length : 0;
+}
+function renderScan() {
+  renderCart();
+  const T = computeTotals();
+  $('#scanList').innerHTML = cart.map((c, i) => {
+    const g = goods.find(x => x.id === c.id), L = T.lines[i], miss = needMarks(i);
+    return `<tr class="${i === scan.last ? 'scanned' : ''}"><td>${esc(g.name)}${miss > 0 ? ` <span class="pend err">марок бракує: ${miss}</span>` : ''}
+        <br><small class="muted">${esc(g.barcode || g.code)} · ${uah(g.price)} ₴</small></td>
+      <td class="num" style="white-space:nowrap">${g.is_weight ? '' : `<button class="qbtn" data-sm="${i}" title="Мінус одна">−</button> `}<b>${qtyStr(c.qty, g.is_weight)}</b>${g.is_weight ? '' : ` <button class="qbtn" data-sp="${i}" title="Плюс одна">+</button>`}</td>
+      <td class="num">${uah(L.total)}</td><td><button class="x" data-sd="${i}" title="Прибрати">✕</button></td></tr>`;
+  }).join('') || '<tr><td class="muted">Ще нічого не відскановано</td></tr>';
+  const last = $('#scanList tr.scanned'); if (last) last.scrollIntoView({ block: 'nearest' });
+  $('#scanTotal').textContent = uah(T.total) + ' ₴';
+  const units = cart.reduce((a, c) => a + (goods.find(x => x.id === c.id).is_weight ? 1 : Math.round(c.qty / 1000)), 0);
+  $('#scanCount').textContent = cart.length ? `позицій: ${cart.length} · одиниць: ${units}` : '';
+  $('#scanInput').classList.toggle('mark', scan.markFor != null);
+  $('#scanInput').placeholder = scan.markFor != null ? 'Скануйте акцизну марку…' : 'Скануйте штрихкод…';
+}
+function scanFocus() { setTimeout(() => (scan && scan.weightFor ? $('#scanWeight') : $('#scanInput')).focus(), 0); }
+function openScan() {
+  if (scan) return scanFocus();
+  scan = { last: null, history: [], weightFor: null, markFor: null };
+  try { $('#scanSound').checked = localStorage.getItem(SCAN_SOUND_KEY) !== '0'; } catch (e) {}
+  $('#scanInput').value = ''; $('#scanWeightRow').style.display = 'none';
+  scanHint(cart.length ? 'Кошик уже має товари — скановані додадуться до них' : 'Готово до сканування');
+  renderScan();
+  $('#scanModal').classList.add('show'); scanFocus();
+}
+function closeScan() {
+  $('#scanModal').classList.remove('show'); scan = null; renderCart(); $('#search').focus();
+}
+function askMarkIfNeeded(i) {
+  if (needMarks(i) > 0) {
+    scan.markFor = i;
+    const g = goods.find(x => x.id === cart[i].id);
+    scanHint(`Тепер відскануйте акцизну марку: ${g.name} (бракує ${needMarks(i)}). Без марки — Esc`, 'warn');
+  } else scan.markFor = null;
+}
+function scanCode(q) {
+  // очікуємо акцизну марку — але штрихкод товару з бази теж приймаємо як новий товар
+  if (scan.markFor != null && !findByCode(q)) {
+    const i = scan.markFor, c = cart[i];
+    if (allMarks(-1).includes(q)) { beep(false); return scanHint('Ця акцизна марка вже додана', 'bad'); }
+    c.marks.push(q); scan.history.push({ idx: i, mark: q }); beep(true);
+    scanHint(`Марку додано: ${goods.find(x => x.id === c.id).name}`, 'ok');
+    askMarkIfNeeded(i);
+    return renderScan();
+  }
+  const g = findByCode(q);
+  if (!g) { beep(false); return scanHint(`Товар «${q}» не знайдено. Перевірте код або синхронізуйте товари.`, 'bad'); }
+  if (g.is_weight) {
+    scan.weightFor = g; $('#scanWeightRow').style.display = ''; $('#scanWeight').value = '';
+    beep(true); scanHint(`Ваговий товар: ${g.name}. Введіть вагу в кілограмах і натисніть Enter`, 'warn');
+    return scanFocus();
+  }
+  const i = addQty(g, 1000, true);
+  if (i == null) { beep(false); return scanHint(`Недостатньо залишку: ${g.name} (є ${qtyStr(g.count, g.is_weight)})`, 'bad'); }
+  scan.last = i; scan.history.push({ idx: i, qty: 1000 }); beep(true);
+  scanHint(`+ ${g.name} — ${uah(g.price)} ₴`, 'ok');
+  askMarkIfNeeded(i);
+  renderScan();
+}
+function scanWeightAdd() {
+  const g = scan.weightFor, kg = parseFloat($('#scanWeight').value.trim().replace(',', '.'));
+  const qty = Math.round(kg * 1000);
+  if (!(qty > 0)) { beep(false); return scanHint('Невірна вага — напр. 0.456', 'bad'); }
+  const i = addQty(g, qty, true);
+  if (i == null) { beep(false); return scanHint(`Недостатньо залишку: ${g.name} (є ${qtyStr(g.count, true)})`, 'bad'); }
+  scan.weightFor = null; $('#scanWeightRow').style.display = 'none';
+  scan.last = i; scan.history.push({ idx: i, qty }); beep(true);
+  scanHint(`+ ${g.name} — ${qtyStr(qty, true)}`, 'ok');
+  renderScan(); scanFocus();
+}
+function scanWeightCancel() { scan.weightFor = null; $('#scanWeightRow').style.display = 'none'; scanHint('Ваговий товар не додано'); scanFocus(); }
+$('#scanBtn').onclick = openScan;
+document.addEventListener('keydown', e => {
+  if (e.key === 'F2' && !document.querySelector('.modal.show:not(#scanModal)')) { e.preventDefault(); openScan(); }
+});
+$('#scanInput').onkeydown = e => {
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    if (scan.markFor != null) { scan.markFor = null; scanHint('Без акцизної марки — її можна додати пізніше в кошику', 'warn'); return renderScan(); }
+    return closeScan();
+  }
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  const q = $('#scanInput').value.trim(); $('#scanInput').value = '';
+  if (q) scanCode(q);
+};
+$('#scanWeight').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); scanWeightAdd(); } if (e.key === 'Escape') { e.preventDefault(); scanWeightCancel(); } };
+$('#scanWeightOk').onclick = scanWeightAdd;
+$('#scanWeightCancel').onclick = scanWeightCancel;
+$('#scanSound').onchange = () => { try { localStorage.setItem(SCAN_SOUND_KEY, $('#scanSound').checked ? '1' : '0'); } catch (e) {} scanFocus(); };
+$('#scanList').onclick = e => {
+  const b = e.target.closest('[data-sm],[data-sp],[data-sd]'); if (!b) return;
+  const i = +(b.dataset.sm ?? b.dataset.sp ?? b.dataset.sd), c = cart[i], g = goods.find(x => x.id === c.id), n = cart.length;
+  if (b.dataset.sp !== undefined) { if (addQty(g, 1000) != null) { scan.last = i; askMarkIfNeeded(i); } }
+  else if (b.dataset.sm !== undefined) {
+    if (c.qty > 1000) { c.qty -= 1000; if (c.marks.length > c.qty / 1000) c.marks.length = c.qty / 1000; } else cart.splice(i, 1);
+    scan.markFor = null; scan.last = null;
+  } else { cart.splice(i, 1); scan.markFor = null; scan.last = null; }
+  if (cart.length !== n) scan.history = [];   // рядки зсунулись — «прибрати останнє» починається заново
+  renderScan(); scanFocus();
+};
+$('#scanUndo').onclick = () => {
+  const h = scan.history.pop();
+  if (!h) { scanHint('Немає що прибирати'); return scanFocus(); }
+  const c = cart[h.idx];
+  if (c) {
+    if (h.mark) c.marks = c.marks.filter(m => m !== h.mark);
+    else { c.qty -= h.qty; if (c.qty <= 0) cart.splice(h.idx, 1); else if (c.marks.length > Math.round(c.qty / 1000)) c.marks.length = Math.round(c.qty / 1000); }
+  }
+  scan.markFor = null; scan.last = null;
+  scanHint(h.mark ? 'Прибрано останню марку' : 'Прибрано останній скан');
+  renderScan(); scanFocus();
+};
+$('#scanDone').onclick = closeScan;
+$('#scanX').onclick = closeScan;
+$('#scanCash').onclick = () => { if (!cart.length) { scanHint('Кошик порожній', 'bad'); return scanFocus(); } closeScan(); $('#payCash').click(); };
+$('#scanCard').onclick = () => { if (!cart.length) { scanHint('Кошик порожній', 'bad'); return scanFocus(); } closeScan(); $('#payCard').click(); };
+$('#scanModal').onclick = e => { if (e.target.id === 'scanModal' || e.target.closest('.card')) { if (!e.target.closest('button,input,label')) scanFocus(); } };
 
 // --- інша оплата ---
 const LABELS_KEY = 'checkbox_payment_labels';
