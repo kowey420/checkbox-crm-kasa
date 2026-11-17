@@ -267,8 +267,6 @@ class App:
             raise UserError("Невірний режим заокруглення")
         new["cash_rounding"] = rounding
         # у вікні їх немає: вшиті значення дописуються в config.json, щоб було видно, де їх змінити
-        new.setdefault("client_name", DEFAULT_CLIENT_NAME)
-        new.setdefault("client_version", DEFAULT_CLIENT_VERSION)
 
         # Спершу перевіряємо, що з новими даними можна увійти, і лише потім зберігаємо
         api = self.api_factory(new)

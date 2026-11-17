@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.3.0"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.3.1"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -206,10 +206,11 @@ def multipart_body(field, filename, content, mime="text/csv"):
 # Адреса API статична; у config.json її можна перевизначити вручну, але в інтерфейсі вона не показується
 DEFAULT_BASE_URL = "https://api.checkbox.in.ua/api/v1"
 # Значення заголовків X-Client-Name / X-Client-Version, якщо в config.json їх немає
-DEFAULT_CLIENT_NAME = "Petruk AM"
-DEFAULT_CLIENT_VERSION = "alpha"
-# значення, які помилково вшивались раніше: у конфігах їх замінюємо на актуальні
-_OLD_DEFAULT_CLIENT = ("py-accounting", "1.0")
+DEFAULT_CLIENT_NAME = "Checkbox CRM Kasa"
+DEFAULT_CLIENT_VERSION = APP_VERSION          # завжди версія каси: оновилась каса — оновився заголовок
+# значення, які вшивались раніше: з конфігів їх прибираємо, щоб діяли актуальні
+_OLD_CLIENT_NAMES = ("py-accounting", "Petruk AM")
+_OLD_CLIENT_VERSIONS = ("1.0", "alpha")
 AUTH_MODES = ("password", "pin")
 ROUNDING_MODES = ("ROUND_50", "ROUND_10")
 
@@ -236,10 +237,19 @@ def load_config():
     if not CONFIG_PATH.exists():
         return {}
     cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    if cfg.get("client_name") == _OLD_DEFAULT_CLIENT[0]:
-        cfg["client_name"] = DEFAULT_CLIENT_NAME
-        if cfg.get("client_version") in (None, "", _OLD_DEFAULT_CLIENT[1]):
-            cfg["client_version"] = DEFAULT_CLIENT_VERSION
+    # Client-Name / Client-Version: старі вшиті значення прибираємо — тоді діють «Checkbox CRM Kasa» і версія каси.
+    # Власні значення в config.json (якщо їх вписали вручну) лишаються.
+    changed = False
+    if cfg.get("client_name") in _OLD_CLIENT_NAMES or cfg.get("client_name") == DEFAULT_CLIENT_NAME:
+        cfg.pop("client_name")
+        changed = True
+    if "client_name" not in cfg and "client_version" in cfg:
+        cfg.pop("client_version")                    # версія за замовчуванням — завжди поточна версія каси
+        changed = True
+    elif cfg.get("client_version") in _OLD_CLIENT_VERSIONS:
+        cfg.pop("client_version")
+        changed = True
+    if changed:
         try:
             save_config(cfg)          # виправляємо файл одразу, щоб значення не повернулось
         except OSError:
