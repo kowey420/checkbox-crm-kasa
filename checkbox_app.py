@@ -31,7 +31,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.2.3"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.2.4"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -868,6 +868,13 @@ class LocalDB:
                 "UPDATE prepayments SET paid=?, status=?, receipts=?, updated_at=? WHERE relation_id=?",
                 (p["paid"] if paid is None else paid, status or p["status"], json.dumps(receipts, ensure_ascii=False),
                  datetime.now().isoformat(timespec="seconds"), relation_id))
+
+    def set_prepayment_state(self, relation_id, total, paid, status=None):
+        """Суми й статус замовлення з Checkbox."""
+        with self.con:
+            self.con.execute("UPDATE prepayments SET total=?, paid=?, status=COALESCE(?, status), updated_at=? "
+                             "WHERE relation_id=?",
+                             (total, paid, status, datetime.now().isoformat(timespec="seconds"), relation_id))
 
     def prepayments(self, limit=200):
         return [self._prepayment_dict(r) for r in self.con.execute(

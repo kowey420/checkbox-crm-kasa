@@ -690,15 +690,75 @@ class App:
         log.info("Повернення замовлення %s: чеків повернення у відповіді %d", p["relation_id"], len(found))
         return {"relation_id": p["relation_id"], "receipts": [r["id"] for r in found], "paid": p["paid"]}
 
+    # pre_payment_status Checkbox → статус замовлення в касі
+    PRE_STATUS = {"PARTIAL_PAID": "OPEN", "CREATED": "OPEN", "NEW": "OPEN", "PAID": "PAID", "COMPLETED": "PAID",
+                  "CANCELLED": "RETURNED", "CANCELED": "RETURNED", "RETURNED": "RETURNED"}
+
+    @staticmethod
+    def _chain_receipts(chain, kind):
+        """Чеки однієї частини ланцюжка (список, один чек або лише id) → короткі записи для касира."""
+        if chain is None:
+            return []
+        out = []
+        for r in chain if isinstance(chain, list) else [chain]:
+            if isinstance(r, str):
+                out.append({"id": r, "kind": kind})
+                continue
+            if not isinstance(r, dict):
+                continue
+            pays = r.get("payments") or []
+            paid = sum(x.get("value") or 0 for x in pays if isinstance(x, dict))
+            ptypes = {x.get("type") for x in pays if isinstance(x, dict)}
+            labels = [x.get("label") for x in pays if isinstance(x, dict) and x.get("label")]
+            out.append({
+                "id": r.get("id"), "kind": "RETURN" if (r.get("type") == "RETURN" or kind == "RETURN") else kind,
+                "fiscal_code": r.get("fiscal_code"), "serial": r.get("serial"), "status": r.get("status"),
+                "at": local_time(r.get("fiscal_date") or r.get("created_at")) if (r.get("fiscal_date") or r.get("created_at")) else None,
+                "sum": paid if pays else r.get("total_sum"),
+                "payment": "CASH" if ptypes == {"CASH"} else "CASHLESS" if ptypes == {"CASHLESS"} else ("MIXED" if ptypes else None),
+                "label": ", ".join(dict.fromkeys(labels)) or None,
+            })
+        return out
+
+    def _state_summary(self, st):
+        """Відповідь GET /prepayment-receipts/{id} → те, що потрібно касиру."""
+        chain = st.get("receipts_chain") or {}
+        ids = st.get("receipt_chain") or {}
+        receipts = (self._chain_receipts(chain.get("pre_payment_receipts") or ids.get("pre_payment_receipts"), "PREPAYMENT")
+                    + self._chain_receipts(chain.get("after_payment_receipt") or ids.get("after_payment_receipt"), "POSTPAYMENT")
+                    + self._chain_receipts(chain.get("returned_receipts") or ids.get("returned_receipts"), "RETURN"))
+        receipts.sort(key=lambda r: r.get("at") or "")
+        goods = []
+        first = next((r for r in (chain.get("pre_payment_receipts") or []) if isinstance(r, dict)), None)
+        for ln in (first or {}).get("goods") or []:
+            g = ln.get("good") or {}
+            qty = ln.get("quantity") or 0
+            goods.append({"name": g.get("name"), "qty": qty, "price": g.get("price"),
+                          "sum": ln.get("total_sum") if isinstance(ln.get("total_sum"), int) else ln.get("sum"),
+                          "is_weight": bool(qty % 1000)})
+        raw = str(st.get("pre_payment_status") or st.get("status") or "").upper()
+        return {
+            "relation_id": str(st.get("relation_id") or ""), "status_raw": raw or None,
+            "status": self.PRE_STATUS.get(raw), "total": st.get("total_sum"), "paid": st.get("paid_sum"),
+            "paid_cash": st.get("paid_by_cash_sum"), "left": st.get("left_to_pay"),
+            "created_at": local_time(st["created_at"]) if st.get("created_at") else None,
+            "returned_at": local_time(st["last_returned_receipt_at"]) if st.get("last_returned_receipt_at") else None,
+            "goods": goods, "receipts": receipts,
+        }
+
     def prepay_state(self, relation_id):
         p = self.db.prepayment(str(relation_id or ""))
         if not p:
             raise UserError("Замовлення не знайдено в касі")
         state = self.call(self.api.prepayment_state, p["relation_id"])
-        status = str((state or {}).get("status") or "").upper() if isinstance(state, dict) else ""
-        if status in ("CANCELLED", "RETURNED") and p["status"] != "RETURNED":
-            self.db.update_prepayment(p["relation_id"], status="RETURNED")
-        return {"state": state}
+        if not isinstance(state, dict):
+            raise CheckboxError("Неочікувана відповідь про стан замовлення")
+        summary = self._state_summary(state)
+        # Checkbox — джерело правди: суми й статус могли змінитися поза касою (доплата в кабінеті тощо)
+        if isinstance(summary["paid"], int) and isinstance(summary["total"], int):
+            self.db.set_prepayment_state(p["relation_id"], summary["total"], summary["paid"], summary["status"])
+        summary["note"] = p["note"]
+        return {"summary": summary, "state": state}
 
     def prepayments(self):
         return {"prepayments": self.db.prepayments(), "cash_rounding": self.rounding_mode()}
@@ -1189,6 +1249,12 @@ PAGE = r"""<!DOCTYPE html>
   .chain-receipts li { padding: 2px 0; }
   .prebar { height: 6px; border-radius: 3px; background: #e5e7eb; overflow: hidden; margin-top: 4px; min-width: 90px; }
   .prebar i { display: block; height: 100%; background: #7c3aed; }
+  .sumgrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 12px; }
+  .sumgrid div { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .sumgrid span { display: block; font-size: 12px; color: var(--muted); }
+  .sumgrid b { font-size: 18px; }
+  .sumgrid small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+  #psModal h4 { margin: 16px 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); }
   .stats b { font-size: 18px; display: block; }
 </style>
 </head>
@@ -1331,6 +1397,27 @@ PAGE = r"""<!DOCTYPE html>
   </section>
 </main>
 
+<div class="modal" id="psModal"><div class="card wide">
+  <div class="row" style="justify-content:space-between">
+    <h3 style="margin:0" id="psTitle">Замовлення</h3>
+    <button class="x" id="psClose">✕</button>
+  </div>
+  <p class="muted" style="margin:4px 0 0" id="psSub"></p>
+  <div class="sumgrid" id="psSums"></div>
+  <div class="prebar" style="height:8px;margin-top:10px"><i id="psBar"></i></div>
+  <h4>Товари</h4>
+  <table><tbody id="psGoods"></tbody></table>
+  <h4>Чеки замовлення</h4>
+  <table>
+    <thead><tr><th>Чек</th><th>Дата</th><th>Оплата</th><th class="num">Сума, ₴</th><th>Фіскальний №</th></tr></thead>
+    <tbody id="psReceipts"></tbody>
+  </table>
+  <details style="margin-top:14px"><summary class="muted" style="font-size:12px">Повна відповідь Checkbox (для підтримки)</summary><pre id="psRaw" style="max-height:260px"></pre></details>
+  <div class="pay" style="margin-top:16px">
+    <button class="btn sec" id="psOk">Закрити</button>
+    <button class="btn other" id="psPay">Доплатити</button>
+  </div>
+</div></div>
 <div class="modal" id="modal"><div class="card">
   <div class="row" style="justify-content:space-between"><h3 style="margin:0" id="modalTitle">Чек</h3>
     <span class="row"><button class="btn danger small" id="receiptReturn" style="display:none">↩ Повернення</button>
@@ -3022,7 +3109,7 @@ $('#prepayTable').onclick = async e => {
   if (d.chain) { openChains.has(d.chain) ? openChains.delete(d.chain) : openChains.add(d.chain); return loadPrepayments(); }
   if (d.receipt) return showReceipt(d.receipt, { title: 'Чек замовлення' });
   if (d.pay) return openPost(d.pay);
-  if (d.state) return busy(a, async () => { const r = await api('/api/prepay/state?id=' + encodeURIComponent(d.state)); showText(JSON.stringify(r.state, null, 2)); $('#modalTitle').textContent = 'Стан замовлення в Checkbox'; loadPrepayments(); });
+  if (d.state) return busy(a, async () => { showPrepayState(await api('/api/prepay/state?id=' + encodeURIComponent(d.state))); loadPrepayments(); });
   if (d.ret) {
     const p = prepayList.find(x => x.relation_id === d.ret);
     const card = p.receipts.some(c => c.payment_type === 'CASHLESS');
@@ -3035,6 +3122,44 @@ $('#prepayTable').onclick = async e => {
     });
   }
 };
+
+// стан замовлення в Checkbox — коротко, для касира
+const PS_STATUS = { OPEN: ['pre', 'Очікує доплати'], PAID: ['in', 'Сплачено повністю'], RETURNED: ['ret', 'Повернуто'] };
+const PAY_NAME = { CASH: 'Готівка', CASHLESS: 'Картка / безготівка', MIXED: 'Змішана' };
+let psRelation = null;
+function showPrepayState(r) {
+  const s = r.summary;
+  psRelation = s.relation_id;
+  $('#psTitle').textContent = `${s.note || 'Замовлення'} · № ${s.relation_id}`;
+  const st = PS_STATUS[s.status] || ['', s.status_raw || 'невідомо'];
+  $('#psSub').innerHTML = `<span class="kind ${st[0]}">${esc(st[1])}</span>` +
+    (s.created_at ? ` <span class="muted">· створено ${esc(dm(s.created_at))}</span>` : '') +
+    (s.returned_at ? ` <span class="muted">· повернуто ${esc(dm(s.returned_at))}</span>` : '');
+  const cashPart = s.paid_cash != null && s.paid ? `<small>готівкою ${uah(s.paid_cash)}, безготівково ${uah(s.paid - s.paid_cash)}</small>` : '';
+  $('#psSums').innerHTML = `<div><span>Сума замовлення</span><b>${uah(s.total)} ₴</b></div>
+    <div><span>Сплачено</span><b>${uah(s.paid)} ₴</b>${cashPart}</div>
+    <div><span>Залишок до сплати</span><b>${s.status === 'RETURNED' ? '—' : uah(s.left) + ' ₴'}</b></div>`;
+  $('#psBar').style.width = (s.total ? Math.min(100, Math.round((s.paid || 0) * 100 / s.total)) : 0) + '%';
+  $('#psGoods').innerHTML = s.goods.map(g => `<tr><td>${esc(g.name)}</td><td class="num">${qtyStr(g.qty, g.is_weight)}</td>
+    <td class="num">${uah(g.sum)} ₴</td></tr>`).join('') || '<tr><td class="muted">Товари не вказано у відповіді</td></tr>';
+  $('#psReceipts').innerHTML = s.receipts.map(c => {
+    const k = KINDS[c.kind] || ['', c.kind];
+    return `<tr class="click" data-id="${esc(c.id)}"><td><span class="kind ${k[0]}">${esc(k[1])}</span></td>
+      <td>${c.at ? esc(dm(c.at)) : '—'}</td><td>${esc(c.label || PAY_NAME[c.payment] || '—')}</td>
+      <td class="num">${c.sum != null ? (c.kind === 'RETURN' ? '−' : '') + uah(c.sum) : '—'}</td>
+      <td>${esc(c.fiscal_code || (c.serial != null ? '№ ' + c.serial : '—'))}</td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="muted">Чеків немає</td></tr>';
+  $('#psRaw').textContent = JSON.stringify(r.state, null, 2);
+  $('#psPay').style.display = s.status === 'OPEN' ? '' : 'none';
+  $('#psOk').parentElement.style.gridTemplateColumns = s.status === 'OPEN' ? '' : '1fr';
+  $('#psModal').classList.add('show');
+}
+const closePs = () => $('#psModal').classList.remove('show');
+$('#psClose').onclick = closePs; $('#psOk').onclick = closePs;
+$('#psModal').onclick = e => { if (e.target.id === 'psModal') closePs(); };
+$('#psModal').onkeydown = e => { if (e.key === 'Escape') closePs(); };
+$('#psReceipts').onclick = e => { const tr = e.target.closest('tr[data-id]'); if (tr) showReceipt(tr.dataset.id, { title: 'Чек замовлення' }); };
+$('#psPay').onclick = async () => { closePs(); await loadPrepayments(); if (prepayList.some(p => p.relation_id === psRelation)) openPost(psRelation); };
 
 // доплата: менше за залишок — ще одна передплата; весь залишок — післяплата, що закриває замовлення
 let post = null;
