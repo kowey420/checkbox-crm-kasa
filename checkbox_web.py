@@ -472,18 +472,13 @@ class App:
         return {"id": receipt["id"], "fiscal_code": receipt.get("fiscal_code"), "value": value}
 
     # ---- продаж ----
-    def sell(self, body):
+    def _cart(self, body):
+        """Кошик з інтерфейсу → (рядки, знижки рядків, знижки чека, суми рядків, разом, облік залишків)."""
         items = body.get("items") or []
-        payment_type = body.get("payment_type")
-        if payment_type not in ("CASH", "CASHLESS"):
-            raise UserError("Невірний тип оплати")
         if not items:
             raise UserError("Кошик порожній")
-        if not self.call(self.api.current_shift):
-            raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
-
         use_leftovers = self.db.meta("use_leftovers")
-        cart, total, all_marks = [], 0, set()
+        cart, all_marks = [], set()
         for it in items:
             row = self.db.con.execute("SELECT * FROM goods WHERE id=?", (it.get("id"),)).fetchone()
             if not row:
@@ -517,20 +512,12 @@ class App:
         if total <= 0:
             raise UserError("Сума чека має бути більшою за нуль")
 
-        rounding_mode = self.rounding_mode() if payment_type == "CASH" else None
-        to_pay = round_cash(total, rounding_mode)
-        pay_value = to_pay
-        received = body.get("received")
-        if payment_type == "CASH" and received is not None:
-            if not isinstance(received, int) or received < to_pay:
-                raise UserError(f"Отримано менше, ніж до сплати ({to_pay / 100:.2f} грн)")
-            pay_value = received
+        return cart, line_ds, receipt_ds, line_totals, total, use_leftovers
 
+    def _payment(self, body, payment_type):
+        """Дані ЕПЗ, сира відповідь терміналу й назва оплати з запиту."""
         card = clean_card_details(body.get("card")) if payment_type == "CASHLESS" else None
         terminal_raw = body.get("terminal_raw") if payment_type == "CASHLESS" else None
-        details = None
-        if card or terminal_raw:
-            details = {"card": card, "terminal": terminal_raw}
         if terminal_raw:
             log.info("POSSrv відповідь: %s", terminal_for_log(terminal_raw))
         try:
@@ -540,6 +527,29 @@ class App:
         extra = dict(card or {})
         if label:
             extra["label"] = label
+        details = {"card": card, "terminal": terminal_raw} if (card or terminal_raw) else None
+        return extra, label, details
+
+    def sell(self, body):
+        payment_type = body.get("payment_type")
+        if payment_type not in ("CASH", "CASHLESS"):
+            raise UserError("Невірний тип оплати")
+        if not body.get("items"):
+            raise UserError("Кошик порожній")
+        if not self.call(self.api.current_shift):
+            raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
+        cart, line_ds, receipt_ds, line_totals, total, use_leftovers = self._cart(body)
+
+        rounding_mode = self.rounding_mode() if payment_type == "CASH" else None
+        to_pay = round_cash(total, rounding_mode)
+        pay_value = to_pay
+        received = body.get("received")
+        if payment_type == "CASH" and received is not None:
+            if not isinstance(received, int) or received < to_pay:
+                raise UserError(f"Отримано менше, ніж до сплати ({to_pay / 100:.2f} грн)")
+            pay_value = received
+
+        extra, label, details = self._payment(body, payment_type)
 
         # ID генерується один раз: якщо call() повторить запит після 401, чек не задублюється
         receipt_id = new_receipt_id()
@@ -559,6 +569,139 @@ class App:
                 "total_sum": receipt.get("total_sum", total),
                 "round_sum": receipt.get("round_sum"),
                 "rest": receipt.get("rest")}
+
+    # ---- передплата / післяплата ----
+    NOTE_MAX = 120
+
+    def prepay(self, body):
+        """Чек передплати: усі товари кошика, оплачено лише внесок. Створює ланцюжок замовлення."""
+        payment_type = body.get("payment_type")
+        if payment_type not in ("CASH", "CASHLESS"):
+            raise UserError("Невірний тип оплати")
+        if not body.get("items"):
+            raise UserError("Кошик порожній")
+        if not self.call(self.api.current_shift):
+            raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
+        cart, line_ds, receipt_ds, line_totals, total, use_leftovers = self._cart(body)
+        amount = body.get("amount")
+        if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+            raise UserError("Вкажіть суму передплати")
+        if amount >= total:
+            raise UserError(f"Передплата має бути меншою за суму замовлення ({total / 100:.2f} грн) — "
+                            "інакше це звичайний продаж")
+        note = " ".join(str(body.get("note") or "").split())[:self.NOTE_MAX] or None
+        extra, label, details = self._payment(body, payment_type)
+        receipt, relation_id = self.call(
+            self.api.prepayment, new_receipt_id(), build_goods_payload(cart, use_leftovers, line_ds),
+            {"type": payment_type, "value": amount, **extra}, receipt_ds)
+        if not relation_id:
+            log.error("Чек передплати %s створено, але Checkbox не повернув pre_payment_relation_id", receipt["id"])
+            raise UserError("Чек передплати пробито, але Checkbox не повернув номер замовлення. "
+                            "Знайдіть його в кабінеті Checkbox.")
+        items = [{"name": g["name"], "code": g["code"], "qty": q, "price": g["price"], "sum": t}
+                 for (g, q, _), t in zip(cart, line_totals)]
+        self.db.add_prepayment(relation_id, note, total, amount, items, self._chain_entry(receipt, "PREPAYMENT", amount, payment_type))
+        self.db.add_sale(receipt, payment_type, items, label, details, "PREPAYMENT", relation_id, amount)
+        log.info("Передплата: замовлення %s, чек %s, %.2f з %.2f грн, %s", relation_id, receipt["id"],
+                 amount / 100, total / 100, payment_type)
+        return {"id": receipt["id"], "relation_id": relation_id, "fiscal_code": receipt.get("fiscal_code"),
+                "amount": amount, "total": total, "left": total - amount}
+
+    @staticmethod
+    def _chain_entry(receipt, kind, value, payment_type):
+        return {"id": receipt["id"], "kind": kind, "value": value, "payment_type": payment_type,
+                "fiscal_code": receipt.get("fiscal_code"), "at": datetime.now().isoformat(timespec="seconds")}
+
+    def _open_chain(self, relation_id):
+        p = self.db.prepayment(str(relation_id or ""))
+        if not p:
+            raise UserError("Замовлення не знайдено в касі")
+        if p["status"] == "PAID":
+            raise UserError("Замовлення вже повністю сплачено")
+        if p["status"] == "RETURNED":
+            raise UserError("Замовлення повернуто")
+        return p
+
+    def postpay(self, body):
+        """
+        Наступний чек ланцюжка. Сума, менша за залишок, — ще одна передплата;
+        рівна залишку — післяплата, яка закриває замовлення (готівкою — із заокругленням і рештою).
+        """
+        p = self._open_chain(body.get("relation_id"))
+        payment_type = body.get("payment_type")
+        if payment_type not in ("CASH", "CASHLESS"):
+            raise UserError("Невірний тип оплати")
+        if not self.call(self.api.current_shift):
+            raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
+        left = p["left"]
+        amount = body.get("amount", left)
+        if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+            raise UserError("Невірна сума")
+        if amount > left:
+            raise UserError(f"До сплати лишилось {left / 100:.2f} грн")
+        closing = amount == left
+        rounding_mode = self.rounding_mode() if payment_type == "CASH" and closing else None
+        value = round_cash(amount, rounding_mode)
+        received = body.get("received")
+        if payment_type == "CASH" and closing and received is not None:
+            if not isinstance(received, int) or received < value:
+                raise UserError(f"Отримано менше, ніж до сплати ({value / 100:.2f} грн)")
+            value = received
+        extra, label, details = self._payment(body, payment_type)
+        receipt = self.call(self.api.postpayment, p["relation_id"], new_receipt_id(),
+                            {"type": payment_type, "value": value, **extra}, rounding_mode)
+        kind = "POSTPAYMENT" if closing else "PREPAYMENT"
+        self.db.update_prepayment(p["relation_id"], paid=p["paid"] + amount, status="PAID" if closing else None,
+                                  receipt=self._chain_entry(receipt, kind, amount, payment_type))
+        self.db.add_sale(receipt, payment_type, p["items"] if closing else [], label, details, kind,
+                         p["relation_id"], amount)
+        log.info("%s: замовлення %s, чек %s, %.2f грн, %s", "Післяплата" if closing else "Ще передплата",
+                 p["relation_id"], receipt["id"], amount / 100, payment_type)
+        return {"id": receipt["id"], "fiscal_code": receipt.get("fiscal_code"), "closed": closing,
+                "amount": amount, "left": left - amount, "round_sum": receipt.get("round_sum"),
+                "rest": receipt.get("rest") or receipt.get("total_rest")}
+
+    def prepay_return(self, body):
+        """Повернення всього замовлення: Checkbox пробиває чек повернення на кожен чек ланцюжка."""
+        p = self.db.prepayment(str(body.get("relation_id") or ""))
+        if not p:
+            raise UserError("Замовлення не знайдено в касі")
+        if p["status"] == "RETURNED":
+            raise UserError("Замовлення вже повернуто")
+        if not self.call(self.api.current_shift):
+            raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
+        resp = self.call(self.api.prepayment_return, p["relation_id"])
+        self.db.update_prepayment(p["relation_id"], status="RETURNED")
+        # чеки повернення — у журнал (якщо Checkbox повернув їх у відповіді)
+        found = []
+        def walk(x):
+            if isinstance(x, dict):
+                if x.get("id") and x.get("type") and ("goods" in x or "payments" in x):
+                    found.append(x)
+                else:
+                    for v in x.values():
+                        walk(v)
+            elif isinstance(x, list):
+                for v in x:
+                    walk(v)
+        walk(resp)
+        for r in found:
+            self.db.add_checkbox_receipt(r)
+        log.info("Повернення замовлення %s: чеків повернення у відповіді %d", p["relation_id"], len(found))
+        return {"relation_id": p["relation_id"], "receipts": [r["id"] for r in found], "paid": p["paid"]}
+
+    def prepay_state(self, relation_id):
+        p = self.db.prepayment(str(relation_id or ""))
+        if not p:
+            raise UserError("Замовлення не знайдено в касі")
+        state = self.call(self.api.prepayment_state, p["relation_id"])
+        status = str((state or {}).get("status") or "").upper() if isinstance(state, dict) else ""
+        if status in ("CANCELLED", "RETURNED") and p["status"] != "RETURNED":
+            self.db.update_prepayment(p["relation_id"], status="RETURNED")
+        return {"state": state}
+
+    def prepayments(self):
+        return {"prepayments": self.db.prepayments(), "cash_rounding": self.rounding_mode()}
 
     # ---- повернення ----
     def _sale_for_return(self, receipt_id):
@@ -647,24 +790,13 @@ class App:
             raise UserError("Сума повернення має бути більшою за нуль")
         rounding_mode = self.rounding_mode() if payment_type == "CASH" else None
         pay_value = round_cash(total, rounding_mode)
-        card = clean_card_details(body.get("card")) if payment_type == "CASHLESS" else None
-        terminal_raw = body.get("terminal_raw") if payment_type == "CASHLESS" else None
-        if terminal_raw:
-            log.info("POSSrv відповідь (повернення): %s", terminal_for_log(terminal_raw))
-        try:
-            label = clean_payment_label(body.get("label"))
-        except ValueError as e:
-            raise UserError(str(e))
-        extra = dict(card or {})
-        if label:
-            extra["label"] = label
+        extra, label, details = self._payment(body, payment_type)
         receipt = self.call(self.api.sell, new_receipt_id(), goods, payment_type, pay_value,
                             rounding_mode, extra or None, None, orig["id"])
         if use_leftovers:                     # повернутий товар знову на залишку
             for g in goods:
                 if g.get("good_id"):
                     self.db.decrease_count(g["good_id"], -g["quantity"])
-        details = {"card": card, "terminal": terminal_raw} if (card or terminal_raw) else None
         self.db.add_sale(receipt, payment_type, items, label, details, "RETURN", orig["id"], total)
         log.info("Повернення: чек %s до %s, %.2f грн, %s, позицій %d", receipt["id"], orig["id"],
                  total / 100, payment_type, len(items))
@@ -814,6 +946,10 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.report_text, (q.get("id") or [""])[0])
         elif u.path == "/api/receipt":
             self._run(APP.receipt_info, (q.get("id") or [""])[0])
+        elif u.path == "/api/prepayments":
+            self._run(APP.prepayments)
+        elif u.path == "/api/prepay/state":
+            self._run(APP.prepay_state, (q.get("id") or [""])[0])
         else:
             self._send(404, {"error": "not found"})
 
@@ -836,6 +972,12 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.sell, body)
         elif path == "/api/return":
             self._run(APP.return_receipt, body)
+        elif path == "/api/prepay":
+            self._run(APP.prepay, body)
+        elif path == "/api/postpay":
+            self._run(APP.postpay, body)
+        elif path == "/api/prepay/return":
+            self._run(APP.prepay_return, body)
         elif path == "/api/service":
             self._run(APP.service, body)
         elif path == "/api/config":
@@ -1024,6 +1166,11 @@ PAGE = r"""<!DOCTYPE html>
   .kind { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: #f3f4f6; }
   .kind.ret { background: #fee2e2; color: #991b1b; } .kind.in { background: #dcfce7; color: #166534; } .kind.out { background: #fef3c7; color: #92400e; }
   .cashnow { font-size: 15px; margin-top: 8px; color: var(--text); }
+  .kind.pre { background: #ede9fe; color: #5b21b6; }
+  .chain-receipts { margin: 6px 0 0; padding: 0; list-style: none; font-size: 13px; }
+  .chain-receipts li { padding: 2px 0; }
+  .prebar { height: 6px; border-radius: 3px; background: #e5e7eb; overflow: hidden; margin-top: 4px; min-width: 90px; }
+  .prebar i { display: block; height: 100%; background: #7c3aed; }
   .stats b { font-size: 18px; display: block; }
 </style>
 </head>
@@ -1046,6 +1193,7 @@ PAGE = r"""<!DOCTYPE html>
   <button data-tab="goods">Товари</button>
   <button data-tab="shift">Зміна</button>
   <button data-tab="sales">Журнал</button>
+  <button data-tab="prepay">Передплати</button>
 </nav>
 <main>
   <!-- КАСА -->
@@ -1074,7 +1222,10 @@ PAGE = r"""<!DOCTYPE html>
           <button class="btn" id="payCard">Картка</button>
           <button class="btn other" id="payOther">Інше</button>
         </div>
-        <button class="btn sec" id="clearCart" style="width:100%;margin-top:10px">Очистити кошик</button>
+        <div class="pay" style="margin-top:10px">
+          <button class="btn sec" id="payPre" title="Частина суми зараз, решта — пізніше (чеки передплати й післяплати)">⏳ Передплата</button>
+          <button class="btn sec" id="clearCart">Очистити кошик</button>
+        </div>
         <div class="last" id="last"></div>
       </div>
     </div>
@@ -1131,6 +1282,18 @@ PAGE = r"""<!DOCTYPE html>
         <button class="btn ok" id="svcIn">＋ Внесення</button>
         <button class="btn" id="svcOut" style="background:var(--warn)">− Винесення</button>
       </div>
+    </div>
+  </section>
+
+  <!-- ПЕРЕДПЛАТИ -->
+  <section id="prepay" class="tab">
+    <div class="card">
+      <p class="muted" style="margin:0 0 12px">Замовлення з передплатою: доплата (ще одна передплата або післяплата, що закриває замовлення) і повернення всього замовлення.
+        Нове замовлення — кнопкою «⏳ Передплата» на вкладці «Каса».</p>
+      <table>
+        <thead><tr><th>Дата</th><th>Замовлення</th><th class="num">Сума, ₴</th><th class="num">Сплачено</th><th class="num">Залишок</th><th>Статус</th><th></th></tr></thead>
+        <tbody id="prepayTable"></tbody>
+      </table>
     </div>
   </section>
 
@@ -1383,6 +1546,48 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn danger" id="retSubmit">Пробити повернення</button>
   </div>
 </div></div>
+<div class="modal" id="preModal"><div class="card">
+  <div class="row" style="justify-content:space-between">
+    <h3 style="margin:0">Передплата · замовлення на <span id="preTotal"></span></h3>
+    <button class="x" id="preClose">✕</button>
+  </div>
+  <p class="muted" style="margin:4px 0 12px">У чек передплати підуть усі товари кошика, а оплачено буде лише внесок. Решту покупець доплатить пізніше — на вкладці «Передплати».</p>
+  <div class="form">
+    <label>Внесок зараз, ₴<input type="text" id="preAmount" inputmode="decimal" placeholder="напр. 200"></label>
+    <label>Замовлення / покупець (для себе)<input type="text" id="preNote" maxlength="120" placeholder="Напр. Іваненко, тел. 067…"></label>
+  </div>
+  <p style="margin:10px 0 0" id="preLeft" class="muted"></p>
+  <p class="muted" style="margin:12px 0 6px">Чим платить:</p>
+  <div class="seg">
+    <label><input type="radio" name="preType" value="CASH" checked> Готівка</label>
+    <label><input type="radio" name="preType" value="CASHLESS"> Картка / безготівка</label>
+  </div>
+  <div class="pay" style="margin-top:16px">
+    <button class="btn sec" id="preCancel">Скасувати</button>
+    <button class="btn other" id="preSubmit">Пробити передплату</button>
+  </div>
+</div></div>
+<div class="modal" id="postModal"><div class="card">
+  <div class="row" style="justify-content:space-between">
+    <h3 style="margin:0" id="postTitle">Доплата</h3>
+    <button class="x" id="postClose">✕</button>
+  </div>
+  <p class="muted" style="margin:4px 0 12px" id="postInfo"></p>
+  <div class="form">
+    <label>Сума, ₴<input type="text" id="postAmount" inputmode="decimal"></label>
+    <label id="postRecvWrap">Отримано готівкою, ₴<input type="text" id="postReceived" inputmode="decimal" placeholder="без решти"></label>
+  </div>
+  <div id="postCalc" class="status wait"></div>
+  <p class="muted" style="margin:12px 0 6px">Чим платить:</p>
+  <div class="seg">
+    <label><input type="radio" name="postType" value="CASH" checked> Готівка</label>
+    <label><input type="radio" name="postType" value="CASHLESS"> Картка / безготівка</label>
+  </div>
+  <div class="pay" style="margin-top:16px">
+    <button class="btn sec" id="postCancel">Скасувати</button>
+    <button class="btn other" id="postSubmit">Пробити післяплату</button>
+  </div>
+</div></div>
 <div id="toast"></div>
 
 <script>
@@ -1495,6 +1700,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   b.classList.add('active'); $('#' + b.dataset.tab).classList.add('active');
   if (b.dataset.tab === 'sales') loadSales();
   if (b.dataset.tab === 'shift') loadShift();
+  if (b.dataset.tab === 'prepay') loadPrepayments();
   if (b.dataset.tab === 'pos') $('#search').focus();
 });
 
@@ -2016,14 +2222,15 @@ function cardFromTerm(msg) {
   return card;
 }
 
-// term — поточна операція на терміналі: { ws, state, messages, approvedMsg, amount, refund? }
-// refund — повернення на картку: { payload, fiscalize(card, raw) } — команда POSSrv «cancel»
+// term — поточна операція на терміналі: { ws, state, messages, approvedMsg, amount, op? }
+// op — не звичайний продаж з кошика: { cmd: 'purchase'|'cancel', payload, refund, fiscalize(card, raw) → bool, back() }
+//   cancel — команда POSSrv «Відміна транзакції / Повернення коштів»
 let term = null;
 function wsUrl(command) {
   const base = (termCfg.url || 'http://localhost:9020').replace(/^http/i, 'ws').replace(/\/+$/, '');
   return `${base}/api/pos/${encodeURIComponent(termCfg.device_id)}/${command}`;
 }
-const termWords = t => t && t.refund
+const termWords = t => t && t.op && t.op.refund
   ? { title: 'Повернення на картку', op: 'повернення', notDone: 'Повернення не проведено', ok: 'Повернення на терміналі проведено',
       manual: 'Повернення пройшло, пробити чек', again: 'кошти повторно не буде повернено', startShift: 'Відкрити зміну і повернути',
       needShift: 'щоб провести повернення', running: 'Повернення ще триває', doneUnsent: 'Повернення на картку вже проведено' }
@@ -2056,13 +2263,13 @@ function startTermPayment() {
   const live = () => term === t && !t.finished;
   let ws;
   const W = termWords(t);
-  try { ws = new WebSocket(wsUrl(t.refund ? 'cancel' : 'purchase')); } catch (e) { t.finished = true; return termRender('conn', 'Невірна адреса POSSrv: ' + e.message); }
+  try { ws = new WebSocket(wsUrl(t.op ? t.op.cmd : 'purchase')); } catch (e) { t.finished = true; return termRender('conn', 'Невірна адреса POSSrv: ' + e.message); }
   t.ws = ws;
   let opened = false;
   ws.onopen = () => {
     opened = true;
     if (!live()) return;
-    ws.send(JSON.stringify(t.refund ? t.refund.payload : { amount: t.amount }));
+    ws.send(JSON.stringify(t.op ? t.op.payload : { amount: t.amount }));
     termRender('progress', `Очікую ${W.op} на терміналі…`);
   };
   ws.onmessage = ev => {
@@ -2079,7 +2286,7 @@ function startTermPayment() {
   ws.onclose = () => {
     if (!live()) return;
     t.finished = true;
-    if (opened) termRender('unknown', `З'єднання з терміналом завершилося без результату. Подивіться на екран терміналу: якщо ${W.op} пройшл${t.refund ? 'о' : 'а'} — натисніть «${W.manual}».`);
+    if (opened) termRender('unknown', `З'єднання з терміналом завершилося без результату. Подивіться на екран терміналу: якщо ${W.op} пройшл${t.op && t.op.refund ? 'о' : 'а'} — натисніть «${W.manual}».`);
     else noConnection();
   };
 }
@@ -2087,7 +2294,7 @@ async function fiscalizeAfterTerm() {
   const t = term, W = termWords(t);
   termRender('approved', `${W.ok}. Пробиваю чек…`);
   const card = t.approvedMsg ? cardFromTerm(t.approvedMsg) : null;
-  const ok = t.refund ? await t.refund.fiscalize(card, t.messages)
+  const ok = t.op ? await t.op.fiscalize(card, t.messages)
     : await pay('CASHLESS', $('#payCard'), card, null, { marksChecked: true, terminalRaw: t.messages, noShiftPrompt: true });
   if (term !== t) return;
   if (ok) { term = null; $('#termModal').classList.remove('show'); return; }
@@ -2137,9 +2344,9 @@ function closeTermPay() {
     if (!confirm(`${W.running}. Скасування в програмі може не скасувати її на терміналі — перевірте екран терміналу. Закрити?`)) return;
     term.finished = true; try { term.ws && term.ws.close(); } catch (e) {}
   }
-  const wasRefund = !!term.refund;
+  const op = term.op;
   term = null; $('#termModal').classList.remove('show');
-  if (wasRefund && ret) $('#retModal').classList.add('show');   // назад до вікна повернення
+  if (op && op.back) op.back();          // назад до вікна, з якого почали
 }
 $('#termCancel').onclick = closeTermPay;
 $('#termCloseBtn').onclick = closeTermPay;
@@ -2160,8 +2367,9 @@ $('#termOpenShift').onclick = async () => {
 $('#termModal').onkeydown = e => { if (e.key === 'Escape') closeTermPay(); };
 $('#termFiscalRetry').onclick = () => fiscalizeAfterTerm();
 $('#termManual').onclick = () => {
-  if (term && term.refund) {
-    if (!confirm('Повернення на терміналі точно пройшло? Буде пробито чек повернення.')) return;
+  if (term && term.op) {
+    if (!confirm(term.op.refund ? 'Повернення на терміналі точно пройшло? Буде пробито чек повернення.'
+                                : 'Оплата на терміналі точно пройшла? Чек буде пробито без даних картки.')) return;
     term.approvedMsg = null;
     return fiscalizeAfterTerm();
   }
@@ -2281,7 +2489,8 @@ function dayTitle(day) {           // day — «РРРР-ММ-ДД»
 const rtype = s => (s.receipt_type || 'SELL').toUpperCase();
 const isReturn = s => rtype(s).includes('RETURN');
 const isService = s => rtype(s).startsWith('SERVICE');
-const KINDS = { SELL: ['', 'Продаж'], RETURN: ['ret', 'Повернення'], SERVICE_IN: ['in', 'Внесення'], SERVICE_OUT: ['out', 'Винесення'] };
+const KINDS = { SELL: ['', 'Продаж'], RETURN: ['ret', 'Повернення'], SERVICE_IN: ['in', 'Внесення'], SERVICE_OUT: ['out', 'Винесення'],
+                PREPAYMENT: ['pre', 'Передплата'], POSTPAYMENT: ['pre', 'Післяплата'] };
 function payTitle(s) {
   if (isService(s)) return 'Готівка';
   const base = s.payment_type === 'CASH' ? 'Готівка' : s.payment_type ? 'Картка' : '—';
@@ -2461,9 +2670,13 @@ $('#retSubmit').onclick = async e => {
   if (type === 'CASHLESS' && canRefundViaTerminal() && ret.viaTerm !== false) {
     // POSSrv «Відміна транзакції / Повернення коштів»: сума і реквізити транзакції продажу
     if (!confirm(`Повернути ${uah(pay)} ₴ на картку через термінал і пробити чек повернення?`)) return;
-    const payload = { amount: pay, ...(info.terminal || {}) };
-    term = { amount: pay, messages: [], refund: {
-      payload,
+    const tr = info.terminal || {};
+    if (!tr.rrn) return toast('Немає RRN продажу — без нього термінал не поверне кошти. Зніміть позначку «через термінал» і проведіть повернення на терміналі вручну.', true);
+    // головне для повернення — RRN продажу та id пристрою
+    const payload = { amount: pay, id: termCfg.device_id, rrn: tr.rrn, ...(tr.invoicenum ? { invoicenum: tr.invoicenum } : {}),
+                      ...(tr.auth_code ? { auth_code: tr.auth_code } : {}) };
+    term = { amount: pay, messages: [], op: {
+      cmd: 'cancel', refund: true, payload, back: () => { if (ret) $('#retModal').classList.add('show'); },
       fiscalize: async (card, raw) => {
         const b = { ...body, terminal_raw: raw };
         if (card && Object.keys(card).length) b.card = { ...(origCard || {}), ...card };   // дані операції повернення
@@ -2476,6 +2689,167 @@ $('#retSubmit').onclick = async e => {
   }
   if (!confirm(`Пробити чек повернення на ${uah(pay)} ₴?` + (type === 'CASHLESS' ? '\n\nПовернення на терміналі вже проведено?' : ''))) return;
   await busy(e.target, () => sendReturn(body));
+};
+
+// --- передплата / післяплата ---
+const kopOf = v => { const t = String(v || '').trim().replace(',', '.'); return /^\d+(\.\d{1,2})?$/.test(t) ? Math.round(parseFloat(t) * 100) : null; };
+async function withShift(fn, what) {      // виконати; якщо зміна закрита — запропонувати відкрити і повторити
+  try { return await fn(); }
+  catch (e) {
+    if (e.code !== 'SHIFT_CLOSED' || !confirm(`Зміна закрита. Відкрити зміну і ${what}?`)) throw e;
+    if (!(await openShiftNow())) throw e;
+    return await fn();
+  }
+}
+const useTerminal = () => !!(termCfg.enabled && termCfg.device_id);
+// Безготівка через термінал: спершу оплата на терміналі, потім чек (send(card, raw) → bool)
+function payViaTerminal(amount, send, back) {
+  term = { amount, messages: [], op: { cmd: 'purchase', payload: { amount }, back, fiscalize: async (card, raw) => {
+    try { await send(card, raw); return true; } catch (e) { toast(e.message, true); return false; } } } };
+  showTermModal();
+}
+// нове замовлення з кошика
+function openPre() {
+  if (!cart.length) return toast('Кошик порожній', true);
+  const de = discountError(); if (de) return toast('Виправте знижку: ' + de, true);
+  if (!confirmMarks()) return;
+  $('#preTotal').textContent = uah(cartTotal) + ' ₴';
+  $('#preAmount').value = ''; $('#preNote').value = '';
+  renderPre();
+  $('#preModal').classList.add('show'); $('#preAmount').focus();
+}
+function renderPre() {
+  const a = kopOf($('#preAmount').value);
+  $('#preLeft').textContent = a == null ? '' : a >= cartTotal ? '⚠ Внесок має бути меншим за суму замовлення' : `Залишок до сплати: ${uah(cartTotal - a)} ₴`;
+  $('#preLeft').className = a != null && a >= cartTotal ? 'zero' : 'muted';
+}
+const closePre = () => $('#preModal').classList.remove('show');
+$('#payPre').onclick = openPre;
+$('#preAmount').oninput = renderPre;
+$('#preClose').onclick = closePre; $('#preCancel').onclick = closePre;
+$('#preModal').onkeydown = e => { if (e.key === 'Enter') $('#preSubmit').click(); if (e.key === 'Escape') closePre(); };
+$('#preSubmit').onclick = async e => {
+  const amount = kopOf($('#preAmount').value);
+  if (!(amount > 0)) { toast('Вкажіть суму внеску, напр. 200 або 150.50', true); return $('#preAmount').focus(); }
+  if (amount >= cartTotal) { toast('Внесок має бути меншим за суму замовлення — інакше це звичайний продаж', true); return $('#preAmount').focus(); }
+  const type = radioVal('preType');
+  const body = { items: cart, payment_type: type, amount, note: $('#preNote').value.trim() };
+  if (cartDisc) body.discount = cartDisc;
+  const done = r => {
+    cart = []; cartDisc = null; renderCart(); closePre();
+    toast(`Передплату пробито: ${uah(r.amount)} ₴, залишок ${uah(r.left)} ₴ (замовлення ${r.relation_id})`);
+    showReceipt(r.id, { title: `Чек передплати · замовлення ${r.relation_id}` });
+  };
+  if (type === 'CASHLESS' && useTerminal()) {
+    if (!(await shiftIsOpen())) return toast('Спершу відкрийте зміну — інакше гроші спишуться, а чек не проб\'ється', true);
+    closePre();
+    return payViaTerminal(amount, async (card, raw) => done(await api('/api/prepay', { ...body, card, terminal_raw: raw })),
+                          () => $('#preModal').classList.add('show'));
+  }
+  await busy(e.target, async () => done(await withShift(() => api('/api/prepay', body), 'пробити передплату')));
+};
+
+// список замовлень
+let prepayList = [], prepayRounding = null, openChains = new Set();
+const PRE_STATUS = { OPEN: ['pre', 'Очікує доплати'], PAID: ['in', 'Сплачено'], RETURNED: ['ret', 'Повернуто'] };
+async function loadPrepayments() {
+  try {
+    const r = await api('/api/prepayments');
+    prepayList = r.prepayments; prepayRounding = r.cash_rounding;
+    $('#prepayTable').innerHTML = prepayList.map(p => {
+      const st = PRE_STATUS[p.status] || ['', p.status], pct = p.total ? Math.round(p.paid * 100 / p.total) : 0;
+      const goodsTxt = p.items.map(i => i.name).join(', ');
+      const receipts = openChains.has(p.relation_id) ? `<ul class="chain-receipts">${p.receipts.map(c =>
+        `<li><a href="#" data-receipt="${esc(c.id)}">${(KINDS[c.kind] || ['', c.kind])[1]} ${uah(c.value)} ₴</a> <small class="muted">${esc(dm(c.at))} · ${c.payment_type === 'CASH' ? 'готівка' : 'безготівка'} · ФН ${esc(c.fiscal_code || '—')}</small></li>`).join('')}</ul>` : '';
+      return `<tr>
+        <td>${esc(dm(p.created_at))}</td>
+        <td><b>${esc(p.note || 'Замовлення')}</b> <small class="muted">№ ${esc(p.relation_id)}</small><br><small class="muted">${esc(goodsTxt.length > 90 ? goodsTxt.slice(0, 90) + '…' : goodsTxt)}</small>
+          <br><a href="#" data-chain="${esc(p.relation_id)}" style="font-size:12px">Чеки (${p.receipts.length}) ${openChains.has(p.relation_id) ? '▴' : '▾'}</a>${receipts}</td>
+        <td class="num">${uah(p.total)}</td>
+        <td class="num">${uah(p.paid)}<div class="prebar"><i style="width:${pct}%"></i></div></td>
+        <td class="num">${p.status === 'OPEN' ? '<b>' + uah(p.left) + '</b>' : '—'}</td>
+        <td><span class="kind ${st[0]}">${st[1]}</span></td>
+        <td style="white-space:nowrap">${p.status === 'OPEN' ? `<button class="btn small other" data-pay="${esc(p.relation_id)}">Доплатити</button> ` : ''}
+          ${p.status !== 'RETURNED' ? `<button class="btn small sec" data-ret="${esc(p.relation_id)}">Повернути</button> ` : ''}
+          <button class="btn small sec" data-state="${esc(p.relation_id)}" title="Стан замовлення в Checkbox">ⓘ</button></td></tr>`;
+    }).join('') || '<tr><td colspan="7" class="muted">Замовлень із передплатою ще немає.</td></tr>';
+  } catch (e) { toast(e.message, true); }
+}
+$('#prepayTable').onclick = async e => {
+  const a = e.target.closest('[data-chain],[data-receipt],[data-pay],[data-ret],[data-state]'); if (!a) return;
+  e.preventDefault();
+  const d = a.dataset;
+  if (d.chain) { openChains.has(d.chain) ? openChains.delete(d.chain) : openChains.add(d.chain); return loadPrepayments(); }
+  if (d.receipt) return showReceipt(d.receipt, { title: 'Чек замовлення' });
+  if (d.pay) return openPost(d.pay);
+  if (d.state) return busy(a, async () => { const r = await api('/api/prepay/state?id=' + encodeURIComponent(d.state)); showText(JSON.stringify(r.state, null, 2)); $('#modalTitle').textContent = 'Стан замовлення в Checkbox'; loadPrepayments(); });
+  if (d.ret) {
+    const p = prepayList.find(x => x.relation_id === d.ret);
+    const card = p.receipts.some(c => c.payment_type === 'CASHLESS');
+    if (!confirm(`Повернути все замовлення «${p.note || p.relation_id}»?\n\nCheckbox пробиє чек повернення на кожен чек замовлення (${p.receipts.length}), разом ${uah(p.paid)} ₴.` +
+                 (card ? '\nБезготівкові частини поверніть покупцю на терміналі окремо.' : '') + '\nЧастково замовлення не повертається.')) return;
+    return busy(a, async () => {
+      const r = await withShift(() => api('/api/prepay/return', { relation_id: p.relation_id }), 'повернути замовлення');
+      toast(`Замовлення повернуто: ${uah(r.paid)} ₴` + (r.receipts.length ? `, чеків повернення: ${r.receipts.length}` : ' — чеки повернення в журналі після «Завантажити з Checkbox»'));
+      loadPrepayments(); loadShift();
+    });
+  }
+};
+
+// доплата: менше за залишок — ще одна передплата; весь залишок — післяплата, що закриває замовлення
+let post = null;
+function openPost(id) {
+  const p = prepayList.find(x => x.relation_id === id);
+  post = p;
+  $('#postTitle').textContent = `Доплата · ${p.note || 'замовлення ' + p.relation_id}`;
+  $('#postInfo').textContent = `Сума замовлення ${uah(p.total)} ₴ · сплачено ${uah(p.paid)} ₴ · залишок ${uah(p.left)} ₴`;
+  $('#postAmount').value = (p.left / 100).toFixed(2); $('#postReceived').value = '';
+  renderPost();
+  $('#postModal').classList.add('show'); $('#postAmount').focus(); $('#postAmount').select();
+}
+function postCalc() {
+  const amount = kopOf($('#postAmount').value), type = radioVal('postType');
+  const closing = amount === post.left;
+  const value = closing && type === 'CASH' ? roundCash(amount, prepayRounding) : amount;
+  const recv = type === 'CASH' && closing ? kopOf($('#postReceived').value) : null;
+  return { amount, type, closing, value, recv };
+}
+function renderPost() {
+  const c = postCalc(), box = $('#postCalc');
+  $('#postRecvWrap').style.visibility = c.type === 'CASH' && c.closing ? '' : 'hidden';
+  $('#postSubmit').textContent = c.amount != null && c.amount < post.left ? 'Пробити передплату' : 'Пробити післяплату';
+  if (!(c.amount > 0)) { box.className = 'status bad'; box.textContent = 'Вкажіть суму, напр. 300 або 125.50'; return; }
+  if (c.amount > post.left) { box.className = 'status bad'; box.textContent = `Більше залишку (${uah(post.left)} ₴)`; return; }
+  box.className = 'status ' + (c.closing ? 'ok' : 'wait');
+  box.textContent = c.closing
+    ? `Післяплата закриє замовлення. До сплати ${uah(c.value)} ₴` + (c.value !== c.amount ? ` (заокруглення ${uah(c.value - c.amount)})` : '') +
+      (c.recv != null ? (c.recv >= c.value ? ` · решта ${uah(c.recv - c.value)} ₴` : ' · отримано недостатньо') : '')
+    : `Ще одна передплата. Після неї лишиться ${uah(post.left - c.amount)} ₴`;
+}
+const closePost = () => { $('#postModal').classList.remove('show'); };
+['#postAmount', '#postReceived'].forEach(id => $(id).oninput = renderPost);
+document.querySelectorAll('input[name="postType"]').forEach(r => r.onchange = renderPost);
+$('#postClose').onclick = closePost; $('#postCancel').onclick = closePost;
+$('#postModal').onkeydown = e => { if (e.key === 'Enter') $('#postSubmit').click(); if (e.key === 'Escape') closePost(); };
+$('#postSubmit').onclick = async e => {
+  const c = postCalc();
+  if (!(c.amount > 0) || c.amount > post.left) { renderPost(); return $('#postAmount').focus(); }
+  if (c.recv != null && c.recv < c.value) return toast('Отримано менше, ніж до сплати', true);
+  const body = { relation_id: post.relation_id, payment_type: c.type, amount: c.amount };
+  if (c.recv != null) body.received = c.recv;
+  const p = post;
+  const done = r => {
+    closePost(); loadPrepayments(); loadShift();
+    toast(r.closed ? `Післяплату пробито — замовлення сплачено${r.rest ? `, решта ${uah(r.rest)} ₴` : ''}` : `Передплату пробито, залишок ${uah(r.left)} ₴`);
+    showReceipt(r.id, { title: `${r.closed ? 'Чек післяплати' : 'Чек передплати'} · замовлення ${p.relation_id}` });
+  };
+  if (c.type === 'CASHLESS' && useTerminal()) {
+    if (!(await shiftIsOpen())) return toast('Спершу відкрийте зміну — інакше гроші спишуться, а чек не проб\'ється', true);
+    closePost();
+    return payViaTerminal(c.value, async (card, raw) => done(await api('/api/postpay', { ...body, card, terminal_raw: raw })),
+                          () => { post = p; $('#postModal').classList.add('show'); });
+  }
+  await busy(e.target, async () => done(await withShift(() => api('/api/postpay', body), 'пробити чек')));
 };
 
 // --- налаштування ---

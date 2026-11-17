@@ -31,7 +31,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.1.1"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.2.1"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -122,10 +122,11 @@ class net:
         def __init__(self):
             self.headers = {}
 
-        def request(self, method, url, params=None, json=None, timeout=30, data=None, content_type=None):
+        def request(self, method, url, params=None, json=None, timeout=30, data=None, content_type=None,
+                    headers=None):
             if params:
                 url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
-            headers = {"Accept": "application/json", **self.headers}
+            headers = {"Accept": "application/json", **self.headers, **(headers or {})}
             if json is not None:
                 data = _json_dumps(json).encode("utf-8")
                 headers["Content-Type"] = "application/json"
@@ -449,6 +450,65 @@ class CheckboxAPI:
     def get_receipt(self, receipt_id):
         return self._req("GET", f"/receipts/{receipt_id}")
 
+    # --- передплата / післяплата (ланцюжок чеків одного замовлення) ---
+    @staticmethod
+    def relation_id_of(data):
+        """pre_payment_relation_id з відповіді (чек або обгортка з чеком)."""
+        if not isinstance(data, dict):
+            return None
+        for key in ("pre_payment_relation_id", "relation_id", "custom_relation_id"):
+            if data.get(key):
+                return str(data[key])
+        for key in ("receipt", "pre_payment", "data"):
+            rid = CheckboxAPI.relation_id_of(data.get(key))
+            if rid:
+                return rid
+        return None
+
+    def prepayment(self, receipt_id, goods, payment, discounts=None):
+        """
+        Чек передплати: усі товари замовлення, оплата — лише внесок (менше за суму товарів).
+        Повертає (чек, pre_payment_relation_id).
+        """
+        body = {"id": receipt_id, "goods": goods, "payments": [payment]}
+        if discounts:
+            body["discounts"] = discounts
+        resp = self._post_receipt("/prepayment-receipts", body)
+        receipt = self._wait_receipt(receipt_id)
+        return receipt, self.relation_id_of(resp) or self.relation_id_of(receipt)
+
+    def postpayment(self, relation_id, receipt_id, payment, rounding_mode=None):
+        """
+        Наступний чек ланцюжка: оплата, менша за залишок, — ще одна передплата;
+        рівна залишку (або більша, з рештою готівкою) — післяплата, що закриває замовлення.
+        """
+        body = {"id": receipt_id, "payments": [payment]}
+        if payment.get("type") == "CASH" and rounding_mode:
+            body["rounding"] = True
+            body["rounding_mode"] = rounding_mode
+        self._post_receipt(f"/prepayment-receipts/{relation_id}", body, headers={"relation_id": relation_id})
+        return self._wait_receipt(receipt_id)
+
+    def prepayment_state(self, relation_id):
+        return self._req("GET", f"/prepayment-receipts/{relation_id}", headers={"relation_id": relation_id})
+
+    def prepayment_return(self, relation_id):
+        """Повернення всього ланцюжка: Checkbox створює чек повернення на кожен його чек."""
+        return self._req("POST", f"/prepayment-receipts/{relation_id}/return",
+                         json={}, headers={"relation_id": relation_id})
+
+    def _post_receipt(self, path, body, headers=None):
+        """POST чека; якщо зв'язок обірвався — перевіряємо, чи чек усе ж створено."""
+        try:
+            return self._req("POST", path, json=body, headers=headers)
+        except net.RequestException:
+            try:
+                return self._req("GET", f"/receipts/{body['id']}")
+            except (CheckboxError, net.RequestException):
+                raise CheckboxError(
+                    f"Немає зв'язку, і чек {body['id']} не знайдено. "
+                    "Перевірте в кабінеті перед повторною спробою.")
+
     def _wait_receipt(self, receipt_id, timeout=60):
         start = time.time()
         while time.time() - start < timeout:
@@ -543,6 +603,16 @@ class LocalDB:
                 updated_at TEXT
             );
         """)
+        # Ланцюжки передплата → (передплата…) → післяплата одного замовлення
+        self.con.execute("""CREATE TABLE IF NOT EXISTS prepayments (
+            relation_id TEXT PRIMARY KEY,   -- pre_payment_relation_id у Checkbox
+            created_at TEXT, note TEXT,
+            total INTEGER,                  -- сума замовлення після знижок, копійки
+            paid INTEGER,                   -- сплачено, копійки
+            items TEXT,                     -- JSON товарів
+            status TEXT,                    -- OPEN | PAID | RETURNED
+            receipts TEXT,                  -- JSON: [{id, kind, value, payment_type, fiscal_code, at}]
+            updated_at TEXT)""")
         # міграція старої бази: колонка з кодами податків товару
         cols = [r["name"] for r in self.con.execute("PRAGMA table_info(goods)")]
         if "tax_codes" not in cols:
@@ -767,6 +837,42 @@ class LocalDB:
         self.con.commit()
         self.set_receipt_shift(r)        # і для нових, і для вже наявних записів без зміни
         return cur.rowcount == 1
+
+    # --- передплати ---
+    def add_prepayment(self, relation_id, note, total, paid, items, receipt):
+        now = datetime.now().isoformat(timespec="seconds")
+        with self.con:
+            self.con.execute(
+                "INSERT INTO prepayments (relation_id, created_at, note, total, paid, items, status, receipts, updated_at) "
+                "VALUES (?,?,?,?,?,?, 'OPEN', ?, ?)",
+                (relation_id, now, note, total, paid, json.dumps(items, ensure_ascii=False),
+                 json.dumps([receipt], ensure_ascii=False), now))
+
+    def prepayment(self, relation_id):
+        r = self.con.execute("SELECT * FROM prepayments WHERE relation_id=?", (relation_id,)).fetchone()
+        return self._prepayment_dict(r) if r else None
+
+    @staticmethod
+    def _prepayment_dict(r):
+        d = dict(r)
+        d["items"] = json.loads(d["items"] or "[]")
+        d["receipts"] = json.loads(d["receipts"] or "[]")
+        d["left"] = max((d["total"] or 0) - (d["paid"] or 0), 0)
+        return d
+
+    def update_prepayment(self, relation_id, paid=None, status=None, receipt=None):
+        p = self.prepayment(relation_id)
+        receipts = p["receipts"] + ([receipt] if receipt else [])
+        with self.con:
+            self.con.execute(
+                "UPDATE prepayments SET paid=?, status=?, receipts=?, updated_at=? WHERE relation_id=?",
+                (p["paid"] if paid is None else paid, status or p["status"], json.dumps(receipts, ensure_ascii=False),
+                 datetime.now().isoformat(timespec="seconds"), relation_id))
+
+    def prepayments(self, limit=200):
+        return [self._prepayment_dict(r) for r in self.con.execute(
+            "SELECT * FROM prepayments ORDER BY CASE status WHEN 'OPEN' THEN 0 ELSE 1 END, created_at DESC LIMIT ?",
+            (limit,))]
 
     def purge_sales(self, older_than):
         """Видалити записи журналу, старші за older_than (рядок часу ISO). Повертає id видалених чеків."""
