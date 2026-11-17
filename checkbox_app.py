@@ -20,6 +20,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import sqlite3
 import ssl
 import sys
@@ -31,7 +32,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.2.6"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.2.7"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -64,8 +65,53 @@ DB_PATH = DATA_DIR / "checkbox.db"
 LOG_DIR = DATA_DIR / "logs"
 LOG_PATH = LOG_DIR / "kasa.log"
 
-# Журнал роботи — у файл (logs/kasa.log, новий файл щодня, зберігаються 30 днів), а не в консоль
+# Журнал роботи — у файл (logs/kasa.log, новий файл щодня, зберігаються 30 днів), а не в консоль.
+# Формат — JSON-рядки як у loguru (serialize=True): {"text": "...", "record": {...}} — як у журналах Checkbox.
 log = logging.getLogger("kasa")
+_STARTED = time.time()
+_LEVEL_ICONS = {"DEBUG": "🐞", "INFO": "ℹ️", "WARNING": "⚠️", "ERROR": "❌", "CRITICAL": "☠️"}
+
+
+class JsonLogFormatter(logging.Formatter):
+    """
+    Один запис — один рядок JSON. Додаткові дані — через extra={"data": {...}}: вони йдуть у record.extra.
+    text: «2026-11-17 19:51:24.533 | INFO     | модуль:функція:рядок - повідомлення».
+    """
+
+    def format(self, record):
+        message = record.getMessage()
+        dt = datetime.fromtimestamp(record.created).astimezone()
+        name = record.module if record.name == "kasa" else record.name
+        text = (f"{dt.strftime('%Y-%m-%d %H:%M:%S')}.{int(record.msecs):03d} | {record.levelname:<8} | "
+                f"{name}:{record.funcName}:{record.lineno} - {message}\n")
+        exception = None
+        if record.exc_info and record.exc_info[0]:
+            exc_type, exc_value, _ = record.exc_info
+            exception = {"type": exc_type.__name__, "value": str(exc_value), "traceback": True}
+            text += self.formatException(record.exc_info) + "\n"
+        elapsed = record.created - _STARTED
+        h, rest = divmod(elapsed, 3600)
+        m, sec = divmod(rest, 60)
+        try:
+            path = str(Path(record.pathname).relative_to(APP_DIR))
+        except ValueError:
+            path = record.pathname
+        extra = getattr(record, "data", None)
+        return json.dumps({"text": text, "record": {
+            "elapsed": {"repr": f"{int(h)}:{int(m):02d}:{sec:09.6f}", "seconds": round(elapsed, 6)},
+            "exception": exception,
+            "extra": extra if isinstance(extra, dict) else {},
+            "file": {"name": Path(record.pathname).name, "path": path},
+            "function": record.funcName,
+            "level": {"icon": _LEVEL_ICONS.get(record.levelname, ""), "name": record.levelname, "no": record.levelno},
+            "line": record.lineno,
+            "message": message,
+            "module": record.module,
+            "name": name,
+            "process": {"id": record.process, "name": record.processName},
+            "thread": {"id": record.thread, "name": record.threadName},
+            "time": {"repr": dt.isoformat(sep=" "), "timestamp": record.created},
+        }}, default=str)
 
 
 def setup_logging():
@@ -74,7 +120,7 @@ def setup_logging():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     handler = logging.handlers.TimedRotatingFileHandler(
         LOG_PATH, when="midnight", backupCount=30, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
+    handler.setFormatter(JsonLogFormatter())
     log.addHandler(handler)
     log.setLevel(logging.INFO)
     log.propagate = False
@@ -224,13 +270,40 @@ class CheckboxAPI:
             "X-License-Key": cfg.get("license_key") or "",
         })
 
-    def _req(self, method, path, raw=False, **kw):
-        started = time.monotonic()
+    RATE_LIMIT_MAX_WAIT = 20      # с: довше на «занадто часто» (429) не чекаємо
+
+    @staticmethod
+    def _retry_after(r):
+        """Скільки секунд просить зачекати Checkbox у відповіді 429 (заголовок або текст «через 15 секунд»)."""
         try:
-            r = self.s.request(method, self.base + path, timeout=kw.pop("timeout", 30), **kw)
-        except net.RequestException as e:
-            log.error("Checkbox %s %s — %s", method, path, e)
-            raise
+            v = float(r.headers.get("Retry-After") or 0)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+        try:
+            text = json.dumps(r.json(), ensure_ascii=False)     # текст повідомлення без \u-екранування
+        except ValueError:
+            text = r.text or ""
+        found = re.search(r"(\d+)\s*(?:секунд|сек|second|s\b)", text)
+        return float(found.group(1)) if found else 5.0
+
+    def _req(self, method, path, raw=False, **kw):
+        timeout = kw.pop("timeout", 30)
+        for attempt in range(3):
+            started = time.monotonic()
+            try:
+                r = self.s.request(method, self.base + path, timeout=timeout, **kw)
+            except net.RequestException as e:
+                log.error("Checkbox %s %s — %s", method, path, e)
+                raise
+            if r.status_code != 429 or attempt == 2:
+                break
+            # 429 «Занадто часто»: запит не виконано — чекаємо, скільки просить Checkbox, і повторюємо
+            wait = min(self._retry_after(r) + 1, self.RATE_LIMIT_MAX_WAIT)
+            log.warning("Checkbox %s %s → 429, повтор через %.0f с", method, path, wait,
+                        extra={"data": {"method": method, "path": path, "status": 429, "wait": wait}})
+            time.sleep(wait)
         ms = int((time.monotonic() - started) * 1000)
         if r.status_code >= 400:
             try:
@@ -241,10 +314,12 @@ class CheckboxAPI:
                     msg = f"{msg} | {detail}"
             except ValueError:
                 msg = r.text
-            log.warning("Checkbox %s %s → %s за %d мс: %s", method, path, r.status_code, ms, str(msg)[:1000])
+            log.warning("Checkbox %s %s → %s за %d мс: %s", method, path, r.status_code, ms, str(msg)[:1000],
+                        extra={"data": {"method": method, "path": path, "status": r.status_code, "ms": ms}})
             raise CheckboxError(f"HTTP {r.status_code}: {msg}")
         # тіла запитів не пишемо: там можуть бути пароль чи пін-код касира
-        log.info("Checkbox %s %s → %s за %d мс", method, path, r.status_code, ms)
+        log.info("Checkbox %s %s → %s за %d мс", method, path, r.status_code, ms,
+                 extra={"data": {"method": method, "path": path, "status": r.status_code, "ms": ms}})
         if raw:
             return r.content
         if not r.content:

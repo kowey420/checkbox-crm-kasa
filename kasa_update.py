@@ -172,7 +172,11 @@ def _install_exe(data):
     try:
         new.write_bytes(data)
         if old.exists():
-            old.unlink()
+            try:
+                old.unlink()
+            except OSError:
+                # попередня версія ще зайнята (не встигла закритися) — беремо інше ім'я, приберемо пізніше
+                old = exe.with_name(f"{exe.stem}.old-{int(time.time())}.exe")
         os.replace(exe, old)        # запущений exe у Windows не можна перезаписати, але можна перейменувати
         os.replace(new, exe)
     except OSError as e:
@@ -225,9 +229,9 @@ def spawn_restarted():
 def cleanup_after_update():
     """Прибрати Kasa.old.exe, що лишився після попереднього оновлення."""
     if getattr(sys, "frozen", False):
-        old = Path(sys.executable).with_name(Path(sys.executable).stem + ".old.exe")
-        try:
-            if old.exists():
+        exe = Path(sys.executable)
+        for old in exe.parent.glob(exe.stem + ".old*.exe"):
+            try:
                 old.unlink()
-        except OSError:
-            pass
+            except OSError:
+                pass                     # ще зайнятий — спробуємо при наступному запуску

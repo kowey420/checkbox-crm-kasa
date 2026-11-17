@@ -575,7 +575,7 @@ def save_goods_to_checkbox(api, db, goods, on_status=None, auto_supply=False, sy
         api.wait_task(api.goods_import_status, apply_task, ready={"done"})
 
     log.info("Збереження товарів завершено: нових %d, змінених %d", added, changed)
-    out = {"added": added, "changed": changed, "result": result}
+    out = {"added": added, "changed": changed, "result": result, "file": cbfile}   # file — стан після імпорту
     if sync:
         say("Оновлюю локальну базу…")
         synced, _, _, _ = sync_all(api, db)
@@ -589,12 +589,14 @@ STOCK_HEADER = "кількість"
 STOCK_HEADERS = ("кількість", "к-сть", "залишок", "залишки", "кількість товару", "count", "quantity", "amount")
 
 
-def supply_stock(api, stock, on_status=None):
+def supply_stock(api, stock, on_status=None, cbfile=None):
     """
     Довести залишки товарів у Checkbox до бажаних значень поставкою через імпорт.
     stock — {код: (бажаний залишок у тисячних, ваговий)}. Поставка лише додає, тож у файл іде різниця
     між бажаним і поточним залишком Checkbox. Файл містить лише ці товари (решта номенклатури не чіпається).
     Повертає список описів товарів, для яких після імпорту залишок не збігся (порожній — усе вдалося).
+    cbfile — файл номенклатури, щойно завантажений у Checkbox (з save_goods_to_checkbox): тоді повторне
+    вивантаження не потрібне — Checkbox дозволяє його не частіше ніж раз на 15 с.
     """
     say = on_status or (lambda text: None)
     current = {str(g["code"]).strip(): g.get("count") for g in api.get_all_goods()[0]}
@@ -605,10 +607,13 @@ def supply_stock(api, stock, on_status=None):
             todo[code] = (delta, is_weight, target)
     if not todo:
         return []
-    say("Вивантажую номенклатуру з Checkbox…")
-    task = api.goods_export_start("csv")
-    api.wait_task(api.goods_export_status, task, ready={"done"})
-    src = CheckboxFile.from_bytes(api.goods_export_file(task))
+    if cbfile is not None:
+        src = cbfile
+    else:
+        say("Вивантажую номенклатуру з Checkbox…")
+        task = api.goods_export_start("csv")
+        api.wait_task(api.goods_export_status, task, ready={"done"})
+        src = CheckboxFile.from_bytes(api.goods_export_file(task))
     header = list(src.header)
     qcol = next((i for i, h in enumerate(header) if _norm_header(h) in STOCK_HEADERS), None)
     if qcol is None:

@@ -371,7 +371,7 @@ class App:
             return 0
         goods = [dict(p["data"], match_code=None if p["action"] == "new" else p["code"]) for p in pending]
         try:
-            self.call(goods_csv.save_goods_to_checkbox, self.api, self.db, goods, None, False, False)
+            saved = self.call(goods_csv.save_goods_to_checkbox, self.api, self.db, goods, None, False, False)
         except (CheckboxError, net.RequestException) as e:
             self.db.set_pending_error(str(e))
             log.warning("Невідправлені правки товарів (%d): %s", len(pending), e)
@@ -382,7 +382,7 @@ class App:
         if stock:
             # правки товарів уже в Checkbox; поставку не повторюємо автоматично — лише повідомляємо
             try:
-                failed = self.call(goods_csv.supply_stock, self.api, stock)
+                failed = self.call(goods_csv.supply_stock, self.api, stock, None, saved.get("file"))
             except (CheckboxError, net.RequestException) as e:
                 raise CheckboxError(f"товари збережено, але залишки не внесено: {e}")
             if failed:
