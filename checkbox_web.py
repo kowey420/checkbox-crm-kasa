@@ -1766,6 +1766,27 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn other" id="postSubmit">Пробити післяплату</button>
   </div>
 </div></div>
+<div class="modal" id="closeModal"><div class="card">
+  <div class="row" style="justify-content:space-between">
+    <h3 style="margin:0">🧾 Закриття зміни</h3>
+    <button class="x" id="clsX">✕</button>
+  </div>
+  <p style="margin:10px 0 4px">У касі <b id="clsCash"></b> готівки. Винести її перед закриттям зміни (інкасація)?</p>
+  <p class="muted" style="margin:0 0 10px;font-size:13px">Буде пробито службовий чек винесення, потім — Z-звіт.</p>
+  <div class="form one" style="margin-top:0">
+    <label>Сума винесення, ₴<input type="text" id="clsSum" inputmode="decimal"></label>
+  </div>
+  <div class="row" style="gap:6px;margin-top:6px">
+    <button class="chip" id="clsAll">Уся готівка</button>
+    <span class="muted" style="font-size:12px" id="clsLeft"></span>
+  </div>
+  <p class="muted" style="margin:10px 0 0;font-size:13px" id="clsPending"></p>
+  <div class="pay three" style="margin-top:16px">
+    <button class="btn sec" id="clsCancel">Скасувати</button>
+    <button class="btn sec" id="clsNoOut">Закрити без винесення</button>
+    <button class="btn danger" id="clsOut">Винести й закрити</button>
+  </div>
+</div></div>
 <div class="modal" id="askModal" role="dialog" aria-modal="true"><div class="card">
   <div class="row" style="gap:10px"><span class="askicon" id="askIcon">❓</span><h3 style="margin:0" id="askTitle">Підтвердження</h3></div>
   <p id="askText"></p>
@@ -2887,16 +2908,60 @@ async function loadShift() {
   } catch (e) { $('#shiftBadge').textContent = 'Зміна: помилка'; toast(e.message, true); }
 }
 $('#openShift').onclick = e => busy(e.target, async () => { if (!(await openShiftNow())) throw new Error('Зміну не відкрито'); });
-$('#closeShift').onclick = async e => {
-  const extra = pendingCount ? `\n\nПеред закриттям у Checkbox буде відправлено невідправлені зміни товарів: ${pendingCount}.` : '';
-  if (!(await ask('Закрити зміну і сформувати Z-звіт?' + extra, { title: 'Закриття зміни', ok: 'Закрити зміну', danger: true, icon: '🧾' }))) return;
-  busy(e.target, async () => {
+// --- закриття зміни: спершу пропонуємо винести готівку (за замовчуванням — усю) ---
+let clsCashKop = 0, clsBtn = null;
+async function doCloseShift(btn, outKop) {
+  await busy(btn, async () => {
+    if (outKop > 0) {
+      try { await api('/api/service', { value: -outKop }); }
+      catch (e) { throw new Error('Готівку не винесено, зміну не закрито: ' + e.message); }
+      toast(`Винесено ${uah(outKop)} ₴`);
+    }
     const r = await api('/api/shift/close', {});
-    toast('Зміну закрито' + syncSummary(r.sync), !!(r.sync && (r.sync.sync_error || r.sync.push_error)));
+    toast('Зміну закрито' + (outKop > 0 ? ` · винесено ${uah(outKop)} ₴` : '') + syncSummary(r.sync),
+          !!(r.sync && (r.sync.sync_error || r.sync.push_error)));
     await loadShift(); loadGoods().catch(() => {});
     if (r.z_report_id) showReceipt(r.z_report_id, { report: true, title: `Z-звіт · зміна №${r.shift.serial ?? ''}` });
   });
+}
+function renderCls() {
+  const v = kopOf($('#clsSum').value);
+  const bad = v == null || v <= 0 || v > clsCashKop;
+  $('#clsSum').classList.toggle('bad', bad && $('#clsSum').value.trim() !== '');
+  $('#clsLeft').textContent = v != null && v > clsCashKop ? `більше, ніж є в касі (${uah(clsCashKop)} ₴)`
+    : v != null && v > 0 ? `у касі лишиться ${uah(clsCashKop - v)} ₴` : '';
+  $('#clsOut').disabled = bad;
+  $('#clsOut').textContent = bad ? 'Винести й закрити' : `Винести ${uah(v)} ₴ і закрити`;
+}
+const closeCls = () => $('#closeModal').classList.remove('show');
+$('#closeShift').onclick = async e => {
+  clsBtn = e.target;
+  const pend = pendingCount ? `Перед закриттям у Checkbox буде відправлено невідправлені зміни товарів: ${pendingCount}.` : '';
+  let cash = null;
+  try { const { shift } = await api('/api/shift'); cash = shift && shift.balance ? shift.balance.balance : null; }
+  catch (err) { return toast(err.message, true); }
+  if (!(cash > 0)) {      // готівки немає (або Checkbox не повідомив залишок) — звичайне підтвердження
+    if (!(await ask('Закрити зміну і сформувати Z-звіт?' + (pend ? '\n\n' + pend : ''), { title: 'Закриття зміни', ok: 'Закрити зміну', danger: true, icon: '🧾' }))) return;
+    return doCloseShift(clsBtn, 0);
+  }
+  clsCashKop = cash;
+  $('#clsCash').textContent = uah(cash) + ' ₴';
+  $('#clsSum').value = (cash / 100).toFixed(2);
+  $('#clsPending').textContent = pend;
+  renderCls();
+  $('#closeModal').classList.add('show');
+  setTimeout(() => { $('#clsSum').focus(); $('#clsSum').select(); }, 0);
 };
+$('#clsSum').oninput = renderCls;
+$('#clsAll').onclick = () => { $('#clsSum').value = (clsCashKop / 100).toFixed(2); renderCls(); $('#clsSum').focus(); };
+$('#clsX').onclick = closeCls; $('#clsCancel').onclick = closeCls;
+$('#closeModal').onclick = e => { if (e.target.id === 'closeModal') closeCls(); };
+$('#closeModal').onkeydown = e => {
+  if (e.key === 'Escape') closeCls();
+  if (e.key === 'Enter' && e.target.id === 'clsSum' && !$('#clsOut').disabled) $('#clsOut').click();
+};
+$('#clsOut').onclick = () => { const v = kopOf($('#clsSum').value); if (!(v > 0 && v <= clsCashKop)) return renderCls(); closeCls(); doCloseShift(clsBtn, v); };
+$('#clsNoOut').onclick = () => { closeCls(); doCloseShift(clsBtn, 0); };
 $('#xReport').onclick = e => busy(e.target, async () => {
   const r = await api('/api/xreport', {});
   showReceipt(r.report_id, { report: true, title: 'X-звіт' });
