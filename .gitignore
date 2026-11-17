@@ -1,0 +1,29 @@
+# Дані конкретної каси — ніколи не в репозиторій
+config.json
+*.db
+*.db-journal
+port
+logs/
+receipts/
+backup/
+
+# Збірки
+build/
+dist/
+*.spec
+Kasa.exe
+*.new.exe
+*.old.exe
+mac/dist/
+mac/icon-preview.png
+
+# Тимчасове
+__pycache__/
+*.pyc
+*.new
+*.tmp
+*_перевірка.csv
+товари_*.csv
+checkbox_товари_*.csv
+.DS_Store
+Thumbs.db

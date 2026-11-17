@@ -1,0 +1,6 @@
+# .bat у Windows мають бути з CRLF, скрипти для Mac/Linux — з LF
+*.bat       text eol=crlf
+*.sh        text eol=lf
+*.command   text eol=lf
+*.py        text eol=lf
+*.ico       binary

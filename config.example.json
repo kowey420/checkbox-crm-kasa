@@ -1,0 +1,10 @@
+{
+  "license_key": "ВАШ_КЛЮЧ_ЛІЦЕНЗІЇ_КАСИ",
+  "auth_mode": "password",
+  "login": "логін_касира",
+  "password": "пароль_касира",
+  "pin_code": "",
+  "client_name": "Petruk AM",
+  "client_version": "alpha",
+  "cash_rounding": "ROUND_50"
+}
