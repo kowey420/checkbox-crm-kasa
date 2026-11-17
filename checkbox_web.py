@@ -583,10 +583,39 @@ class App:
         p = pays[0] if pays else {}
         card = {k: p.get(k) for k in CARD_TEXT_FIELDS if p.get(k)}
         return {"id": r["id"], "fiscal_code": r.get("fiscal_code"), "total_sum": r.get("total_sum"),
+                "terminal": self._sale_terminal(r["id"], card),
                 "created_at": local_time(r.get("fiscal_date") or r.get("created_at")),
                 "payment_type": p.get("type") or "CASH", "payment_label": p.get("label"),
                 "payments": len(pays), "card": card, "lines": lines,
                 "cash_rounding": self.rounding_mode()}
+
+    def _sale_terminal(self, receipt_id, card):
+        """
+        Реквізити банківської транзакції продажу для команди «Відміна / повернення» POSSrv:
+        з відповіді терміналу, збереженої при продажу, інакше — з даних ЕПЗ у чеку Checkbox.
+        """
+        out = {}
+        row = self.db.con.execute("SELECT payment_details FROM sales WHERE lower(receipt_id)=lower(?)",
+                                  (receipt_id,)).fetchone()
+        try:
+            details = json.loads(row["payment_details"] or "null") if row else None
+        except ValueError:
+            details = None
+        msgs = (details or {}).get("terminal") or []
+        for m in reversed(msgs if isinstance(msgs, list) else [msgs]):
+            res = m.get("result") if isinstance(m, dict) else None
+            if isinstance(res, dict) and (res.get("rrn") or res.get("invoice_num")):
+                for key, src in (("rrn", "rrn"), ("invoicenum", "invoice_num"), ("auth_code", "auth_code")):
+                    if res.get(src) not in (None, "", 0):
+                        out[key] = str(res[src])
+                break
+        if not out.get("rrn") and card.get("rrn"):
+            out["rrn"] = card["rrn"]
+        if not out.get("auth_code") and card.get("auth_code"):
+            out["auth_code"] = card["auth_code"]
+        if not out.get("invoicenum") and card.get("receipt_no"):
+            out["invoicenum"] = card["receipt_no"]
+        return out
 
     def return_receipt(self, body):
         if not self.call(self.api.current_shift):
@@ -619,6 +648,9 @@ class App:
         rounding_mode = self.rounding_mode() if payment_type == "CASH" else None
         pay_value = round_cash(total, rounding_mode)
         card = clean_card_details(body.get("card")) if payment_type == "CASHLESS" else None
+        terminal_raw = body.get("terminal_raw") if payment_type == "CASHLESS" else None
+        if terminal_raw:
+            log.info("POSSrv відповідь (повернення): %s", terminal_for_log(terminal_raw))
         try:
             label = clean_payment_label(body.get("label"))
         except ValueError as e:
@@ -632,8 +664,8 @@ class App:
             for g in goods:
                 if g.get("good_id"):
                     self.db.decrease_count(g["good_id"], -g["quantity"])
-        self.db.add_sale(receipt, payment_type, items, label, {"card": card} if card else None,
-                         "RETURN", orig["id"], total)
+        details = {"card": card, "terminal": terminal_raw} if (card or terminal_raw) else None
+        self.db.add_sale(receipt, payment_type, items, label, details, "RETURN", orig["id"], total)
         log.info("Повернення: чек %s до %s, %.2f грн, %s, позицій %d", receipt["id"], orig["id"],
                  total / 100, payment_type, len(items))
         return {"id": receipt["id"], "fiscal_code": receipt.get("fiscal_code"),
@@ -1232,7 +1264,7 @@ PAGE = r"""<!DOCTYPE html>
 </div></div>
 <div class="modal" id="termModal"><div class="card">
   <div class="row" style="justify-content:space-between">
-    <h3 style="margin:0">Оплата карткою · <span id="termSum"></span></h3>
+    <h3 style="margin:0"><span id="termTitle">Оплата карткою</span> · <span id="termSum"></span></h3>
     <button class="x" id="termX">✕</button>
   </div>
   <p class="muted" style="margin:4px 0 0;font-size:12px">Термінал: <span id="termDevName"></span></p>
@@ -1984,11 +2016,20 @@ function cardFromTerm(msg) {
   return card;
 }
 
-let term = null;   // поточна оплата: { ws, state, messages, approvedMsg, amount }
-function wsUrl() {
+// term — поточна операція на терміналі: { ws, state, messages, approvedMsg, amount, refund? }
+// refund — повернення на картку: { payload, fiscalize(card, raw) } — команда POSSrv «cancel»
+let term = null;
+function wsUrl(command) {
   const base = (termCfg.url || 'http://localhost:9020').replace(/^http/i, 'ws').replace(/\/+$/, '');
-  return `${base}/api/pos/${encodeURIComponent(termCfg.device_id)}/purchase`;
+  return `${base}/api/pos/${encodeURIComponent(termCfg.device_id)}/${command}`;
 }
+const termWords = t => t && t.refund
+  ? { title: 'Повернення на картку', op: 'повернення', notDone: 'Повернення не проведено', ok: 'Повернення на терміналі проведено',
+      manual: 'Повернення пройшло, пробити чек', again: 'кошти повторно не буде повернено', startShift: 'Відкрити зміну і повернути',
+      needShift: 'щоб провести повернення', running: 'Повернення ще триває', doneUnsent: 'Повернення на картку вже проведено' }
+  : { title: 'Оплата карткою', op: 'оплату', notDone: 'Оплату не проведено', ok: 'Оплату на терміналі схвалено',
+      manual: 'Оплата пройшла, ввести дані', again: 'картку повторно не буде списано', startShift: 'Відкрити зміну і оплатити',
+      needShift: 'щоб прийняти оплату', running: 'Оплата ще триває', doneUnsent: 'Оплату карткою вже проведено' };
 function termRender(state, text) {
   term.state = state;
   const icons = { sending: '⏳', progress: '⏳', approved: '✔', fiscal_failed: '⚠', declined: '✖', unknown: '⚠', conn: '✖',
@@ -1998,7 +2039,9 @@ function termRender(state, text) {
   $('#termRaw').textContent = term.messages.map(m => JSON.stringify(m, null, 2)).join('\n\n') || '—';
   const show = (id, on) => { $(id).style.display = on ? '' : 'none'; };
   const openShiftBtn = state === 'shift_closed' || (state === 'fiscal_failed' && term.shiftClosed);
-  $('#termOpenShift').textContent = state === 'shift_closed' ? 'Відкрити зміну і оплатити' : 'Відкрити зміну і пробити чек';
+  const W = termWords(term);
+  $('#termOpenShift').textContent = state === 'shift_closed' ? W.startShift : 'Відкрити зміну і пробити чек';
+  $('#termManual').textContent = W.manual;
   show('#termCancel', state === 'sending' || state === 'progress');
   show('#termRetry', ['declined', 'unknown', 'conn', 'shift_unknown'].includes(state));
   show('#termManual', ['declined', 'unknown', 'conn'].includes(state));
@@ -2012,14 +2055,15 @@ function startTermPayment() {
   termRender('sending', `Надсилаю ${uah(t.amount)} ₴ на термінал…`);
   const live = () => term === t && !t.finished;
   let ws;
-  try { ws = new WebSocket(wsUrl()); } catch (e) { t.finished = true; return termRender('conn', 'Невірна адреса POSSrv: ' + e.message); }
+  const W = termWords(t);
+  try { ws = new WebSocket(wsUrl(t.refund ? 'cancel' : 'purchase')); } catch (e) { t.finished = true; return termRender('conn', 'Невірна адреса POSSrv: ' + e.message); }
   t.ws = ws;
   let opened = false;
   ws.onopen = () => {
     opened = true;
     if (!live()) return;
-    ws.send(JSON.stringify({ amount: t.amount }));
-    termRender('progress', 'Очікую оплату на терміналі…');
+    ws.send(JSON.stringify(t.refund ? t.refund.payload : { amount: t.amount }));
+    termRender('progress', `Очікую ${W.op} на терміналі…`);
   };
   ws.onmessage = ev => {
     if (!live()) return;
@@ -2027,30 +2071,31 @@ function startTermPayment() {
     t.messages.push(msg);
     const kind = classifyTerm(msg);
     if (kind === 'approved') { t.finished = true; t.approvedMsg = msg; try { ws.close(); } catch (e) {} fiscalizeAfterTerm(); }
-    else if (kind === 'declined') { t.finished = true; try { ws.close(); } catch (e) {} termRender('declined', 'Оплату не проведено: ' + (msg.error || `код ${msg.code}`)); }
-    else termRender('progress', msg.error || msg.message || 'Очікую оплату на терміналі…');
+    else if (kind === 'declined') { t.finished = true; try { ws.close(); } catch (e) {} termRender('declined', `${W.notDone}: ` + (msg.error || `код ${msg.code}`)); }
+    else termRender('progress', msg.error || msg.message || `Очікую ${W.op} на терміналі…`);
   };
   const noConnection = () => termRender('conn', `Немає зв'язку з POSSrv (${termCfg.url}). Перевірте, що POSSrv запущено.`);
   ws.onerror = () => { if (!opened && live()) { t.finished = true; noConnection(); } };
   ws.onclose = () => {
     if (!live()) return;
     t.finished = true;
-    if (opened) termRender('unknown', "З'єднання з терміналом завершилося без результату. Подивіться на екран терміналу: якщо оплата пройшла — натисніть «Оплата пройшла, ввести дані».");
+    if (opened) termRender('unknown', `З'єднання з терміналом завершилося без результату. Подивіться на екран терміналу: якщо ${W.op} пройшл${t.refund ? 'о' : 'а'} — натисніть «${W.manual}».`);
     else noConnection();
   };
 }
 async function fiscalizeAfterTerm() {
-  const t = term;
-  termRender('approved', 'Оплату схвалено. Пробиваю чек…');
-  const ok = await pay('CASHLESS', $('#payCard'), cardFromTerm(t.approvedMsg), null,
-                      { marksChecked: true, terminalRaw: t.messages, noShiftPrompt: true });
+  const t = term, W = termWords(t);
+  termRender('approved', `${W.ok}. Пробиваю чек…`);
+  const card = t.approvedMsg ? cardFromTerm(t.approvedMsg) : null;
+  const ok = t.refund ? await t.refund.fiscalize(card, t.messages)
+    : await pay('CASHLESS', $('#payCard'), card, null, { marksChecked: true, terminalRaw: t.messages, noShiftPrompt: true });
   if (term !== t) return;
   if (ok) { term = null; $('#termModal').classList.remove('show'); return; }
   t.shiftClosed = (await shiftIsOpen()) === false;
   if (term !== t) return;
   termRender('fiscal_failed', t.shiftClosed
-    ? 'Оплату на терміналі схвалено, але чек не пробито: зміна закрита. Відкрийте зміну — картку повторно не буде списано.'
-    : 'Оплату на терміналі схвалено, але чек не пробито. Повторіть — картку повторно не буде списано.');
+    ? `${W.ok}, але чек не пробито: зміна закрита. Відкрийте зміну — ${W.again}.`
+    : `${W.ok}, але чек не пробито. Повторіть — ${W.again}.`);
 }
 // Перед списанням з картки перевіряємо зміну: інакше гроші спишуться, а чек не проб'ється
 async function beginTermFlow() {
@@ -2060,7 +2105,7 @@ async function beginTermFlow() {
   const open = await shiftIsOpen();
   if (term !== t) return;
   if (open === true) return startTermPayment();
-  if (open === false) return termRender('shift_closed', 'Зміна закрита. Відкрийте її, щоб прийняти оплату — інакше чек не буде пробито.');
+  if (open === false) return termRender('shift_closed', `Зміна закрита. Відкрийте її, ${termWords(t).needShift} — інакше чек не буде пробито.`);
   termRender('shift_unknown', "Не вдалося перевірити зміну в Checkbox. Перевірте зв'язок і спробуйте ще раз.");
 }
 function discountError() {
@@ -2073,6 +2118,10 @@ function openTermPay() {
   if (de) return toast('Виправте знижку: ' + de, true);   // до списання з картки, а не після
   if (!confirmMarks()) return;
   term = { amount: cartTotal, messages: [] };
+  showTermModal();
+}
+function showTermModal() {
+  $('#termTitle').textContent = termWords(term).title;
   $('#termSum').textContent = uah(term.amount) + ' ₴';
   $('#termDevName').textContent = termSummaryText(termCfg);
   $('#termModal').classList.add('show');
@@ -2080,14 +2129,17 @@ function openTermPay() {
 }
 function closeTermPay() {
   if (!term) return $('#termModal').classList.remove('show');
+  const W = termWords(term);
   if (term.state === 'approved' || term.state === 'opening') return toast('Зачекайте — операція ще триває', true);
   if (term.state === 'fiscal_failed' &&
-      !confirm('Оплату карткою вже проведено, а чек не пробито. Закрити без чека?')) return;
+      !confirm(`${W.doneUnsent}, а чек не пробито. Закрити без чека?`)) return;
   if (['sending', 'progress'].includes(term.state)) {
-    if (!confirm('Оплата ще триває. Скасування в програмі може не скасувати її на терміналі — перевірте екран терміналу. Закрити?')) return;
+    if (!confirm(`${W.running}. Скасування в програмі може не скасувати її на терміналі — перевірте екран терміналу. Закрити?`)) return;
     term.finished = true; try { term.ws && term.ws.close(); } catch (e) {}
   }
+  const wasRefund = !!term.refund;
   term = null; $('#termModal').classList.remove('show');
+  if (wasRefund && ret) $('#retModal').classList.add('show');   // назад до вікна повернення
 }
 $('#termCancel').onclick = closeTermPay;
 $('#termCloseBtn').onclick = closeTermPay;
@@ -2108,6 +2160,11 @@ $('#termOpenShift').onclick = async () => {
 $('#termModal').onkeydown = e => { if (e.key === 'Escape') closeTermPay(); };
 $('#termFiscalRetry').onclick = () => fiscalizeAfterTerm();
 $('#termManual').onclick = () => {
+  if (term && term.refund) {
+    if (!confirm('Повернення на терміналі точно пройшло? Буде пробито чек повернення.')) return;
+    term.approvedMsg = null;
+    return fiscalizeAfterTerm();
+  }
   const prefill = { bank_name: termCfg.bank_name || '' };
   term = null; $('#termModal').classList.remove('show');
   openCardModal(prefill);
@@ -2348,12 +2405,19 @@ function renderReturn() {
   $('#retRound').textContent = pay !== total ? `Заокруглення готівки: ${uah(total)} → ${uah(pay)} ₴` : '';
   const box = $('#retCardBox');
   box.style.display = type === 'CASHLESS' ? '' : 'none';
-  const c = info.card || {};
-  box.innerHTML = info.payment_type === 'CASHLESS'
-    ? `Спершу проведіть повернення ${uah(pay)} ₴ на платіжному терміналі, потім пробийте чек.` +
-      (Object.keys(c).length ? `<br><small>У чек підуть дані ЕПЗ з продажу: ${esc([c.card_mask, c.payment_system, c.rrn && 'RRN ' + c.rrn, c.bank_name].filter(Boolean).join(' · '))}</small>` : '')
-    : 'Продаж був готівкою. Безготівкове повернення — без даних картки.';
+  const c = info.card || {}, viaTerm = canRefundViaTerminal();
+  ret.pay = pay;
+  const cardLine = Object.keys(c).length ? `<br><small>Картка продажу: ${esc([c.card_mask, c.payment_system, c.rrn && 'RRN ' + c.rrn, c.bank_name].filter(Boolean).join(' · '))}</small>` : '';
+  box.innerHTML = info.payment_type !== 'CASHLESS'
+    ? 'Продаж був готівкою. Безготівкове повернення — без даних картки.'
+    : viaTerm
+      ? `<label class="chk"><input type="checkbox" id="retViaTerm" ${ret.viaTerm !== false ? 'checked' : ''}> Повернути ${uah(pay)} ₴ на картку через термінал, потім пробити чек</label>` +
+        `<small>Зніміть позначку, якщо повернення вже проведено на терміналі вручну.</small>` + cardLine
+      : `Спершу проведіть повернення ${uah(pay)} ₴ на платіжному терміналі, потім пробийте чек.` + cardLine;
+  $('#retSubmit').textContent = type === 'CASHLESS' && viaTerm && ret.viaTerm !== false ? 'Повернути через термінал' : 'Пробити повернення';
 }
+const canRefundViaTerminal = () => !!(termCfg.enabled && termCfg.device_id && ret && ret.info.payment_type === 'CASHLESS');
+$('#retCardBox').onchange = e => { if (e.target.id === 'retViaTerm') { ret.viaTerm = e.target.checked; renderReturn(); } };
 $('#retLines').onchange = e => {
   const on = e.target.dataset.ron, rq = e.target.dataset.rq;
   if (on !== undefined) e.target.checked ? ret.on.add(+on) : ret.on.delete(+on);
@@ -2371,28 +2435,47 @@ document.querySelectorAll('input[name="retType"]').forEach(r => r.onchange = ren
 function closeReturn() { $('#retModal').classList.remove('show'); ret = null; }
 $('#retClose').onclick = closeReturn; $('#retCancel').onclick = closeReturn;
 $('#retModal').onkeydown = e => { if (e.key === 'Escape') closeReturn(); };
+async function sendReturn(body, opts = {}) {     // пробиває чек повернення; повертає відповідь сервера
+  let r;
+  try { r = await api('/api/return', body); }
+  catch (err) {
+    if (err.code !== 'SHIFT_CLOSED' || opts.noShiftPrompt || !confirm('Зміна закрита. Відкрити зміну і пробити повернення?')) throw err;
+    if (!(await openShiftNow())) throw err;
+    r = await api('/api/return', body);
+  }
+  closeReturn();
+  toast(`Повернення пробито: ${uah(r.total_sum)} ₴`);
+  loadSales(); loadGoods().catch(() => {}); loadShift();
+  showReceipt(r.id, { title: 'Чек · повернення' });
+  return r;
+}
 $('#retSubmit').onclick = async e => {
   const { info } = ret, type = radioVal('retType');
   const items = info.lines.filter(l => ret.on.has(l.line) && ret.qty[l.line] > 0).map(l => ({ line: l.line, qty: ret.qty[l.line] }));
   if (!items.length) return toast('Оберіть товари для повернення', true);
   const body = { id: info.id, items, payment_type: type };
   if (type === info.payment_type && info.payment_label && !STD_LABELS.includes(info.payment_label)) body.label = info.payment_label;
-  if (type === 'CASHLESS' && info.payment_type === 'CASHLESS' && Object.keys(info.card || {}).length) body.card = info.card;
-  const pay = $('#retTotal').textContent;
-  if (!confirm(`Пробити чек повернення на ${pay}?` + (type === 'CASHLESS' ? '\n\nПовернення на терміналі вже проведено?' : ''))) return;
-  await busy(e.target, async () => {
-    let r;
-    try { r = await api('/api/return', body); }
-    catch (err) {
-      if (err.code !== 'SHIFT_CLOSED' || !confirm('Зміна закрита. Відкрити зміну і пробити повернення?')) throw err;
-      if (!(await openShiftNow())) throw err;
-      r = await api('/api/return', body);
-    }
-    closeReturn();
-    toast(`Повернення пробито: ${uah(r.total_sum)} ₴`);
-    loadSales(); loadGoods().catch(() => {}); loadShift();
-    showReceipt(r.id, { title: 'Чек · повернення' });
-  });
+  const origCard = type === 'CASHLESS' && info.payment_type === 'CASHLESS' && Object.keys(info.card || {}).length ? info.card : null;
+  if (origCard) body.card = origCard;
+  const pay = ret.pay;
+  if (type === 'CASHLESS' && canRefundViaTerminal() && ret.viaTerm !== false) {
+    // POSSrv «Відміна транзакції / Повернення коштів»: сума і реквізити транзакції продажу
+    if (!confirm(`Повернути ${uah(pay)} ₴ на картку через термінал і пробити чек повернення?`)) return;
+    const payload = { amount: pay, ...(info.terminal || {}) };
+    term = { amount: pay, messages: [], refund: {
+      payload,
+      fiscalize: async (card, raw) => {
+        const b = { ...body, terminal_raw: raw };
+        if (card && Object.keys(card).length) b.card = { ...(origCard || {}), ...card };   // дані операції повернення
+        try { await sendReturn(b, { noShiftPrompt: true }); return true; }
+        catch (err) { toast(err.message, true); return false; }
+      } } };
+    $('#retModal').classList.remove('show');
+    showTermModal();
+    return;
+  }
+  if (!confirm(`Пробити чек повернення на ${uah(pay)} ₴?` + (type === 'CASHLESS' ? '\n\nПовернення на терміналі вже проведено?' : ''))) return;
+  await busy(e.target, () => sendReturn(body));
 };
 
 // --- налаштування ---
