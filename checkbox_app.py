@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.3.3"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.3.4"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -125,6 +125,45 @@ def setup_logging():
     log.setLevel(logging.INFO)
     log.propagate = False
     return LOG_PATH
+
+
+# ───────── Що пишемо в журнал із запитів: без паролів, пін-кодів і токенів ─────────
+_SECRET_KEYS = {"password", "pin_code", "pin", "access_token", "refresh_token", "token", "license_key",
+                "secret", "authorization", "x-license-key"}
+LOG_BODY_TEXT_MAX = 4000        # скільки символів тіла показувати в тексті рядка журналу
+
+
+def redact(obj):
+    """Копія даних для журналу: секрети → «***», телефон покупця — з маскою."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            key = str(k).lower()
+            if key in _SECRET_KEYS:
+                out[k] = "***" if v else v
+            elif key == "phone" and isinstance(v, str):
+                out[k] = mask_phone(v)
+            else:
+                out[k] = redact(v)
+        return out
+    if isinstance(obj, list):
+        return [redact(v) for v in obj]
+    return obj
+
+
+def log_body(kw):
+    """Тіло запиту для журналу: JSON (без секретів) або короткий опис файлу; None — тіла немає."""
+    if kw.get("json") is not None:
+        return redact(kw["json"])
+    data = kw.get("data")
+    if data:
+        return f"<{(kw.get('content_type') or 'дані').split(';')[0]}, {len(data)} байт>"
+    return None
+
+
+def log_json(obj, limit=LOG_BODY_TEXT_MAX):
+    text = json.dumps(obj, ensure_ascii=False, default=str) if not isinstance(obj, str) else obj
+    return text if len(text) <= limit else text[:limit] + f"… (+{len(text) - limit} символів)"
 
 
 # ───────────────────────── HTTP без сторонніх бібліотек ─────────────────────────
@@ -300,19 +339,26 @@ class CheckboxAPI:
 
     def _req(self, method, path, raw=False, **kw):
         timeout = kw.pop("timeout", 30)
+        sent = log_body(kw)
+        info = {"method": method, "path": path}
+        if kw.get("params"):
+            info["params"] = redact(kw["params"])
+        if sent is not None:
+            info["request"] = sent
+        tail = f" | запит: {log_json(sent)}" if sent is not None else ""
         for attempt in range(3):
             started = time.monotonic()
             try:
                 r = self.s.request(method, self.base + path, timeout=timeout, **kw)
             except net.RequestException as e:
-                log.error("Checkbox %s %s — %s", method, path, e)
+                log.error("Checkbox %s %s — %s%s", method, path, e, tail, extra={"data": dict(info, error=str(e))})
                 raise
             if r.status_code != 429 or attempt == 2:
                 break
             # 429 «Занадто часто»: запит не виконано — чекаємо, скільки просить Checkbox, і повторюємо
             wait = min(self._retry_after(r) + 1, self.RATE_LIMIT_MAX_WAIT)
             log.warning("Checkbox %s %s → 429, повтор через %.0f с", method, path, wait,
-                        extra={"data": {"method": method, "path": path, "status": 429, "wait": wait}})
+                        extra={"data": dict(info, status=429, wait=wait)})
             time.sleep(wait)
         ms = int((time.monotonic() - started) * 1000)
         if r.status_code >= 400:
@@ -324,12 +370,21 @@ class CheckboxAPI:
                     msg = f"{msg} | {detail}"
             except ValueError:
                 msg = r.text
-            log.warning("Checkbox %s %s → %s за %d мс: %s", method, path, r.status_code, ms, str(msg)[:1000],
-                        extra={"data": {"method": method, "path": path, "status": r.status_code, "ms": ms}})
+            try:
+                answer = redact(r.json())
+            except ValueError:
+                answer = (r.text or "")[:4000]
+            log.warning("Checkbox %s %s → %s за %d мс: %s%s", method, path, r.status_code, ms, str(msg)[:1000], tail,
+                        extra={"data": dict(info, status=r.status_code, ms=ms, response=answer)})
             raise CheckboxError(f"HTTP {r.status_code}: {msg}")
-        # тіла запитів не пишемо: там можуть бути пароль чи пін-код касира
-        log.info("Checkbox %s %s → %s за %d мс", method, path, r.status_code, ms,
-                 extra={"data": {"method": method, "path": path, "status": r.status_code, "ms": ms}})
+        # тіло запиту — без паролів, пін-кодів і токенів; відповідь на зміни (POST тощо) — у extra
+        done = dict(info, status=r.status_code, ms=ms)
+        if method != "GET" and not raw and r.content and "json" in r.headers.get("Content-Type", ""):
+            try:
+                done["response"] = redact(r.json())
+            except ValueError:
+                pass
+        log.info("Checkbox %s %s → %s за %d мс%s", method, path, r.status_code, ms, tail, extra={"data": done})
         if raw:
             return r.content
         if not r.content:

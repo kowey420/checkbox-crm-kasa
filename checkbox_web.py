@@ -31,7 +31,7 @@ from checkbox_app import (APP_VERSION, AUTH_MODES, DATA_DIR, LOG_PATH, log, setu
                           CheckboxError, LocalDB, auth_mode, load_config, save_config,
                           build_goods_payload, clean_payment_label, good_tax_codes, new_receipt_id,
                           no_tax_goods, round_cash, sync_all, apply_discounts, return_lines,
-                          return_good_payload, local_time, line_sum, clean_phone, mask_phone)
+                          return_good_payload, local_time, line_sum, clean_phone, mask_phone, redact, log_json)
 
 # Порти, які пробує каса: спершу той, що був минулого разу, далі по черзі від 8000
 PORT_RANGE = range(8000, 8020)
@@ -112,10 +112,15 @@ class PosSrv:
         self.s = net.Session()
 
     def _req(self, method, path, body=None, timeout=10):
+        tail = f" | запит: {log_json(redact(body))}" if body is not None else ""
+        info = {"method": method, "url": f"{self.url}/{path}", "request": redact(body)}
         try:
             r = self.s.request(method, f"{self.url}/{path}", json=body, timeout=timeout)
-        except net.RequestException:
+        except net.RequestException as e:
+            log.warning("POSSrv %s %s — немає зв'язку%s", method, path, tail, extra={"data": dict(info, error=str(e))})
             raise UserError(f"POSSrv не відповідає за адресою {self.url}. Перевірте, що POSSrv запущено.")
+        log.info("POSSrv %s %s → %s%s", method, path, r.status_code, tail,
+                 extra={"data": dict(info, status=r.status_code, response=(r.text or "")[:4000])})
         if r.status_code >= 400:
             raise UserError(f"POSSrv: HTTP {r.status_code} {r.text[:300]}")
         if not r.content:
@@ -979,6 +984,21 @@ class App:
 APP: App = None
 
 
+def termlog(body):
+    """
+    Обмін браузера з POSSrv через WebSocket (оплата, повернення) — у журнал: що надіслано на термінал
+    і що він відповів. Самі запити йдуть з браузера напряму, тож сервер каси їх інакше не бачить.
+    """
+    if not isinstance(body, dict):
+        raise UserError("Невірні дані")
+    event, cmd = str(body.get("event") or "")[:20], str(body.get("cmd") or "")[:20]
+    data = redact(body.get("data"))
+    titles = {"send": "→ термінал", "message": "← термінал", "close": "з'єднання закрито", "error": "помилка з'єднання"}
+    log.info("POSSrv WS %s %s%s", cmd, titles.get(event, event), f": {log_json(data)}" if data is not None else "",
+             extra={"data": {"ws": cmd, "event": event, "payload": data, "url": body.get("url")}})
+    return {"ok": True}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # тиша в консолі
@@ -1078,6 +1098,8 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.sell, body)
         elif path == "/api/return":
             self._run(APP.return_receipt, body)
+        elif path == "/api/termlog":
+            self._run(termlog, body, locked=False)
         elif path == "/api/prepay":
             self._run(APP.prepay, body)
         elif path == "/api/postpay":
@@ -2779,6 +2801,11 @@ function termRender(state, text) {
   show('#termFiscalRetry', state === 'fiscal_failed' && !term.shiftClosed);
   show('#termCloseBtn', ['declined', 'unknown', 'conn', 'shift_closed', 'shift_unknown'].includes(state));
 }
+// обмін з терміналом — у журнал каси (запити йдуть з браузера, сервер їх інакше не бачить)
+function termLog(event, t, data) {
+  fetch('/api/termlog', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ event, cmd: t.op ? t.op.cmd : 'purchase', data, url: wsUrl(t.op ? t.op.cmd : 'purchase') }) }).catch(() => {});
+}
 function startTermPayment() {
   const t = term;                    // ця спроба; після закриття вікна її події ігноруються
   t.messages = []; t.approvedMsg = null; t.finished = false;
@@ -2792,21 +2819,25 @@ function startTermPayment() {
   ws.onopen = () => {
     opened = true;
     if (!live()) return;
-    ws.send(JSON.stringify(t.op ? t.op.payload : { amount: t.amount }));
+    const payload = t.op ? t.op.payload : { amount: t.amount };
+    ws.send(JSON.stringify(payload));
+    termLog('send', t, payload);
     termRender('progress', `Очікую ${W.op} на терміналі…`);
   };
   ws.onmessage = ev => {
     if (!live()) return;
     let msg; try { msg = JSON.parse(ev.data); } catch (e) { msg = { raw: String(ev.data) }; }
     t.messages.push(msg);
+    termLog('message', t, msg);
     const kind = classifyTerm(msg);
     if (kind === 'approved') { t.finished = true; t.approvedMsg = msg; try { ws.close(); } catch (e) {} fiscalizeAfterTerm(); }
     else if (kind === 'declined') { t.finished = true; try { ws.close(); } catch (e) {} termRender('declined', `${W.notDone}: ` + (msg.error || `код ${msg.code}`)); }
     else termRender('progress', msg.error || msg.message || `Очікую ${W.op} на терміналі…`);
   };
   const noConnection = () => termRender('conn', `Немає зв'язку з POSSrv (${termCfg.url}). Перевірте, що POSSrv запущено.`);
-  ws.onerror = () => { if (!opened && live()) { t.finished = true; noConnection(); } };
+  ws.onerror = () => { termLog('error', t, null); if (!opened && live()) { t.finished = true; noConnection(); } };
   ws.onclose = () => {
+    if (!t.finished) termLog('close', t, null);
     if (!live()) return;
     t.finished = true;
     if (opened) termRender('unknown', `З'єднання з терміналом завершилося без результату. Подивіться на екран терміналу: якщо ${W.op} пройшл${t.op && t.op.refund ? 'о' : 'а'} — натисніть «${W.manual}».`);
