@@ -31,7 +31,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.2.5"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.2.6"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -657,15 +657,16 @@ class LocalDB:
     def _overlay_one(self, code, action, data):
         fields = (data["name"], data["code"], data.get("barcode"), data["price"],
                   int(bool(data.get("is_weight"))), data.get("uktzed"), json.dumps(data.get("tax_codes") or []))
+        stock = data.get("stock")          # бажаний залишок (тисячні) — піде в Checkbox поставкою
         if action == "new":
             self.con.execute("DELETE FROM goods WHERE id=?", (self.LOCAL_ID_PREFIX + code,))
             self.con.execute(
                 "INSERT INTO goods (id, name, code, barcode, price, is_weight, uktzed, tax_codes, count, pending) "
-                "VALUES (?,?,?,?,?,?,?,?,NULL,'new')", (self.LOCAL_ID_PREFIX + code,) + fields)
+                "VALUES (?,?,?,?,?,?,?,?,?,'new')", (self.LOCAL_ID_PREFIX + code,) + fields + (stock,))
         else:
             self.con.execute(
                 "UPDATE goods SET name=?, code=?, barcode=?, price=?, is_weight=?, uktzed=?, tax_codes=?, "
-                "pending='change' WHERE TRIM(code)=?", fields + (code,))
+                "count=COALESCE(?, count), pending='change' WHERE TRIM(code)=?", fields + (stock, code))
 
     def _overlay_pending(self):
         for p in self.con.execute("SELECT * FROM goods_pending").fetchall():
@@ -676,7 +677,7 @@ class LocalDB:
         Зберегти правку локально. existing — поточний рядок goods (None для нового товару).
         Повторні правки одного товару зливаються; оригінал зберігається з першої правки.
         """
-        data = {k: good.get(k) for k in ("name", "code", "price", "barcode", "uktzed", "is_weight", "tax_codes")}
+        data = {k: good.get(k) for k in ("name", "code", "price", "barcode", "uktzed", "is_weight", "tax_codes", "stock")}
         now = datetime.now().isoformat(timespec="seconds")
         with self.con:
             if existing is not None and existing["pending"] == "new":
@@ -702,6 +703,15 @@ class LocalDB:
 
     def pending_count(self):
         return self.con.execute("SELECT COUNT(*) FROM goods_pending").fetchone()[0]
+
+    def checkbox_count(self, row):
+        """Залишок товару в Checkbox (до локальної правки залишку); None — залишок не ведеться."""
+        if row["pending"] == "new":
+            return None
+        p = self.con.execute("SELECT original FROM goods_pending WHERE code=?", ((row["code"] or "").strip(),)).fetchone()
+        if p and p["original"]:
+            return json.loads(p["original"]).get("count")
+        return row["count"]
 
     def clear_pending(self, codes):
         with self.con:

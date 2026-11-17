@@ -583,6 +583,73 @@ def save_goods_to_checkbox(api, db, goods, on_status=None, auto_supply=False, sy
     return out
 
 
+# Колонка кількості у файлі імпорту для автоматичної поставки (auto_supply).
+# Якщо у вивантаженні Checkbox уже є така колонка — беремо її назву, інакше додаємо «кількість».
+STOCK_HEADER = "кількість"
+STOCK_HEADERS = ("кількість", "к-сть", "залишок", "залишки", "кількість товару", "count", "quantity", "amount")
+
+
+def supply_stock(api, stock, on_status=None):
+    """
+    Довести залишки товарів у Checkbox до бажаних значень поставкою через імпорт.
+    stock — {код: (бажаний залишок у тисячних, ваговий)}. Поставка лише додає, тож у файл іде різниця
+    між бажаним і поточним залишком Checkbox. Файл містить лише ці товари (решта номенклатури не чіпається).
+    Повертає список описів товарів, для яких після імпорту залишок не збігся (порожній — усе вдалося).
+    """
+    say = on_status or (lambda text: None)
+    current = {str(g["code"]).strip(): g.get("count") for g in api.get_all_goods()[0]}
+    todo = {}
+    for code, (target, is_weight) in stock.items():
+        delta = target - (current.get(code) or 0)
+        if delta > 0:
+            todo[code] = (delta, is_weight, target)
+    if not todo:
+        return []
+    say("Вивантажую номенклатуру з Checkbox…")
+    task = api.goods_export_start("csv")
+    api.wait_task(api.goods_export_status, task, ready={"done"})
+    src = CheckboxFile.from_bytes(api.goods_export_file(task))
+    header = list(src.header)
+    qcol = next((i for i, h in enumerate(header) if _norm_header(h) in STOCK_HEADERS), None)
+    if qcol is None:
+        header.append(STOCK_HEADER)
+        qcol = len(header) - 1
+    rows, missing = [], []
+    for code, (delta, is_weight, _) in todo.items():
+        row = src.find(code)
+        if row is None:
+            missing.append(code)
+            continue
+        row = list(row) + [""] * (len(header) - len(row))
+        row[qcol] = fmt_count(delta, is_weight)
+        rows.append(row)
+    if missing:
+        raise CheckboxError(f"товарів з кодами {', '.join(missing)} немає у вивантаженні Checkbox")
+    out = CheckboxFile(header, rows, src.encoding, src.delimiter)
+    say("Вношу залишки поставкою…")
+    task = api.goods_import_upload("kasa_stock.csv", out.to_bytes(), True, True)
+    log.info("Поставка залишків через імпорт (колонка «%s»): %s, завдання %s", header[qcol],
+             {c: fmt_count(d, w) for c, (d, w, _) in todo.items()}, task)
+    result = api.wait_task(api.goods_import_status, task, ready={"completed", "done"})
+    log.info("Поставка залишків: перевірка %s", json.dumps(result, ensure_ascii=False)[:4000])
+    errors = result_errors(result)
+    if errors:
+        raise CheckboxError("Checkbox знайшов помилки у файлі: " + "; ".join(errors))
+    if str(result.get("status", "")).lower() != "done":
+        apply_task = api.goods_import_apply(task)
+        api.wait_task(api.goods_import_status, apply_task, ready={"done"})
+    # звірка: чи справді залишки стали такими, як треба
+    after = {str(g["code"]).strip(): g.get("count") for g in api.get_all_goods()[0]}
+    failed = []
+    for code, (delta, is_weight, target) in todo.items():
+        got = after.get(code)
+        if got != target:
+            failed.append(f"{code}: очікувався залишок {fmt_count(target, is_weight)}, у Checkbox "
+                          f"{'—' if got is None else fmt_count(got, is_weight)}")
+    log.log(30 if failed else 20, "Поставка залишків: %s", "; ".join(failed) or "усі залишки збіглися")
+    return failed
+
+
 # ───────────────────────── Checkbox: pull / push ─────────────────────────
 
 def connect():

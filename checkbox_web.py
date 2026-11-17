@@ -319,10 +319,29 @@ class App:
             dup = self.db.con.execute("SELECT * FROM goods WHERE TRIM(code)=?", (good["code"],)).fetchone()
             if dup:
                 errors.append(f"код {good['code']} уже має товар «{dup['name']}»")
+        # залишок: бажане значення в тисячних; у Checkbox іде поставкою, тож лише збільшення.
+        # stock = None — залишок у Checkbox не змінювати.
+        stock = body.get("stock")
+        cb_count = self.db.checkbox_count(existing) if existing is not None else None
+        if stock is not None:
+            if not isinstance(stock, int) or isinstance(stock, bool) or stock < 0 or stock > 10 ** 12:
+                errors.append("невірний залишок")
+            elif not good.get("is_weight") and stock % 1000:
+                errors.append("залишок штучного товару — ціле число")
+            elif cb_count is not None and stock < cb_count:
+                errors.append(f"зменшити залишок (у Checkbox {cb_count / 1000:g}) можна лише списанням у кабінеті Checkbox")
+            elif stock == (cb_count or 0):
+                stock = None
         if errors:
             raise UserError("; ".join(errors))
+        good["stock"] = stock
+        prev = next((p for p in self.db.pending()
+                     if existing is not None and p["code"] == (existing["code"] or "").strip()), None)
+        prev_stock = prev["data"].get("stock") if prev else None
         if existing:
             changes = goods_csv.diff(existing, good)
+            if stock != prev_stock:
+                changes.append(f"залишок → {stock / 1000:g}" if stock is not None else "залишок — як у Checkbox")
             if not changes:
                 return {"unchanged": True, "pending": self.db.pending_count()}
             log.info("Локальна правка товару %s: %s", good["code"], "; ".join(changes))
@@ -330,6 +349,9 @@ class App:
             log.info("Новий товар (локально) %s «%s»", good["code"], good["name"])
         # лише локально: у Checkbox піде під час синхронізації (кнопка, відкриття/закриття зміни)
         self.db.put_pending(good, existing)
+        if existing is not None and stock is None and prev_stock is not None:
+            with self.db.con:                        # правку залишку знято — показуємо залишок Checkbox
+                self.db.con.execute("UPDATE goods SET count=? WHERE TRIM(code)=?", (cb_count, good["code"]))
         return {"saved": True, "pending": self.db.pending_count()}
 
     def discard_good(self, body):
@@ -340,7 +362,10 @@ class App:
         return {"pending": self.db.pending_count()}
 
     def push_pending(self):
-        """Відправити всі локальні правки в Checkbox одним імпортом. Повертає кількість."""
+        """
+        Відправити всі локальні правки в Checkbox одним імпортом, потім залишки — окремим імпортом
+        з автоматичною поставкою (auto_supply). Повертає кількість відправлених правок.
+        """
         pending = self.db.pending()
         if not pending:
             return 0
@@ -352,6 +377,16 @@ class App:
             log.warning("Невідправлені правки товарів (%d): %s", len(pending), e)
             raise
         self.db.clear_pending([p["code"] for p in pending])
+        stock = {p["data"]["code"]: (p["data"]["stock"], bool(p["data"].get("is_weight")))
+                 for p in pending if p["data"].get("stock") is not None}
+        if stock:
+            # правки товарів уже в Checkbox; поставку не повторюємо автоматично — лише повідомляємо
+            try:
+                failed = self.call(goods_csv.supply_stock, self.api, stock)
+            except (CheckboxError, net.RequestException) as e:
+                raise CheckboxError(f"товари збережено, але залишки не внесено: {e}")
+            if failed:
+                raise CheckboxError("товари збережено, але Checkbox не прийняв залишки: " + "; ".join(failed))
         return len(pending)
 
     def full_sync(self):
@@ -375,6 +410,7 @@ class App:
             g["tax_codes"] = good_tax_codes(r)
             if g.get("pending"):
                 g["pending_error"] = errors.get((g["code"] or "").strip())
+                g["cb_count"] = self.db.checkbox_count(r)
             goods.append(g)
         return {
             "goods": goods,
@@ -1227,6 +1263,7 @@ PAGE = r"""<!DOCTYPE html>
   .kind.ret { background: #fee2e2; color: #991b1b; } .kind.in { background: #dcfce7; color: #166534; } .kind.out { background: #fef3c7; color: #92400e; }
   .cashnow { font-size: 15px; margin-top: 8px; color: var(--text); }
   .kind.pre { background: #ede9fe; color: #5b21b6; }
+  .stockbox { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
   #askModal { z-index: 60; }
   #scanModal .card { max-width: 620px; }
   #scanInput { font-size: 20px; padding: 14px 16px; letter-spacing: .02em; }
@@ -1565,6 +1602,16 @@ PAGE = r"""<!DOCTYPE html>
   </div>
   <p class="muted" style="margin:12px 0 6px">Податкові ставки:</p>
   <div id="gTaxes" class="taxpick"></div>
+  <div class="stockbox">
+    <label class="chk"><input type="checkbox" id="gTrack"> <b>Залишковий товар</b> — вести залишок</label>
+    <div class="row" id="gStockRow" style="margin-top:8px;align-items:flex-end">
+      <label style="display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted);max-width:200px">
+        Залишок, <span id="gStockUnit">шт</span><input type="text" id="gStock" inputmode="decimal" placeholder="0"></label>
+      <span class="muted" style="font-size:12px;padding-bottom:10px" id="gStockNow"></span>
+    </div>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">Збільшення залишку піде в Checkbox поставкою (імпорт з автопоставкою) під час синхронізації; у касі діє одразу.
+      Зменшити залишок можна лише списанням у кабінеті Checkbox.</p>
+  </div>
   <p class="muted" style="font-size:12px;margin:10px 0 0" id="gNote"></p>
   <div id="goodStatus" class="status" style="display:none"></div>
   <button class="btn sec small" id="goodDiscard" style="margin-top:12px;display:none">↶ Скасувати невідправлені зміни</button>
@@ -1941,13 +1988,39 @@ function openGood(g) {
       <span class="tax">${esc(t.symbol || t.code)}</span> ${esc(t.label)}</label>`).join('')
     : '<span class="muted">Довідник ставок порожній — синхронізуйте касу</span>';
   $('#gNote').textContent = (g && g.pending !== 'new')
-    ? `Код змінити не можна: Checkbox розпізнає товари за кодом. Залишок (${qtyStr(g.count, g.is_weight)}) змінюється поставками, а не тут.`
-    : 'Товар одразу можна продавати; у Checkbox він з\'явиться під час синхронізації. Залишок змінюється поставками в Checkbox.';
+    ? 'Код змінити не можна: Checkbox розпізнає товари за кодом.'
+    : 'Товар одразу можна продавати; у Checkbox він з\'явиться під час синхронізації.';
+  // залишок: cb — залишок у Checkbox (без локальної правки), g.count — у касі (з правкою)
+  const cb = g ? (g.pending ? g.cb_count : g.count) : null;
+  stockCb = cb;
+  $('#gTrack').checked = !!g && g.count != null;
+  $('#gTrack').disabled = cb != null;                  // уже залишковий у Checkbox
+  $('#gStock').value = g && g.count != null ? String(g.count / 1000) : '';
+  $('#gStockNow').textContent = cb != null ? `у Checkbox зараз: ${qtyStr(cb, g.is_weight)}` : 'у Checkbox залишок не ведеться';
+  renderStock();
   goodStatus(g && g.pending_error ? '⚠ Не вдалося відправити в Checkbox: ' + g.pending_error : '', 'bad');
   $('#goodDiscard').style.display = g && g.pending ? '' : 'none';
   $('#goodDiscard').textContent = g && g.pending === 'new' ? '🗑 Видалити новий товар (ще не в Checkbox)' : '↶ Скасувати невідправлені зміни';
   $('#goodModal').classList.add('show');
   (g ? $('#gName') : $('#gName')).focus();
+}
+let stockCb = null;
+function renderStock() {
+  $('#gStockRow').style.display = $('#gTrack').checked ? '' : 'none';
+  $('#gStockUnit').textContent = $('#gWeight').checked ? 'кг' : 'шт';
+}
+$('#gTrack').onchange = () => { renderStock(); if ($('#gTrack').checked) $('#gStock').focus(); };
+$('#gWeight').addEventListener('change', renderStock);
+function readStock() {         // тисячні або null; виняток — невірне значення
+  if (!$('#gTrack').checked) return null;
+  const raw = $('#gStock').value.trim().replace(',', '.');
+  if (!raw) return stockCb != null ? stockCb : null;
+  const v = Number(raw);
+  if (!(v >= 0) || !/^\d+(\.\d{1,3})?$/.test(raw)) throw new Error('Невірний залишок — напр. 12 або 3.250');
+  if (!$('#gWeight').checked && !Number.isInteger(v)) throw new Error('Залишок штучного товару — ціле число');
+  const t = Math.round(v * 1000);
+  if (stockCb != null && t < stockCb) throw new Error(`Зменшити залишок (у Checkbox ${qtyStr(stockCb, $('#gWeight').checked)}) можна лише списанням у кабінеті Checkbox`);
+  return t;
 }
 function closeGood() {
   if ($('#goodSave').disabled) return toast('Зачекайте — зберігається в Checkbox', true);
@@ -1975,6 +2048,7 @@ $('#goodSave').onclick = async e => {
     barcode: $('#gBarcode').value, uktzed: $('#gUktzed').value, is_weight: $('#gWeight').checked,
     tax_codes: [...document.querySelectorAll('#gTaxes input:checked')].map(i => +i.value),
   };
+  try { body.stock = readStock(); } catch (err) { goodStatus('✖ ' + err.message, 'bad'); return $('#gStock').focus(); }
   if (!body.tax_codes.length && taxes.length && !(await ask('Товар без податкової ставки — чек з ним буде без податку. Зберегти так?', { title: 'Без податку', ok: 'Зберегти', icon: '⚠️' }))) return;
   btn.disabled = true; $('#goodCancel').disabled = true;
   try {
@@ -1983,7 +2057,8 @@ $('#goodSave').onclick = async e => {
     if (r.unchanged) { goodStatus('Змін немає.', 'ok'); return; }
     $('#goodModal').classList.remove('show');
     toast((editing ? 'Зміни збережено' : 'Товар додано') +
-      ' в касі. У Checkbox вони підуть під час синхронізації (⟳, відкриття або закриття зміни).');
+      ' в касі. У Checkbox вони підуть під час синхронізації (⟳, відкриття або закриття зміни)' +
+      (body.stock != null && body.stock !== stockCb ? ', залишок — поставкою.' : '.'));
     editing = null;
     await loadGoods();
   } catch (err) {
