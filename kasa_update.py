@@ -57,18 +57,89 @@ def install_kind():
     return "py"
 
 
+_ORIGINAL = {}
+
+
+def original_app_dir():
+    """
+    Справжня папка каси. macOS запускає завантажену програму з позначкою «з інтернету» з тимчасової
+    копії /AppTranslocation/… — це дзеркало (nullfs) справжньої папки лише для читання. Звідки воно
+    змонтоване, видно в `mount`: «<справжня папка> on <дзеркало> (nullfs, …)». Файли, записані у
+    справжню папку, одразу видно й у дзеркалі.
+    """
+    d = str(APP_DIR)
+    if "/AppTranslocation/" not in d:
+        return APP_DIR
+    if "dir" in _ORIGINAL:
+        return _ORIGINAL["dir"]
+    found = None
+    try:
+        out = subprocess.run(["/sbin/mount"], capture_output=True, timeout=10).stdout.decode("utf-8", "replace")
+        best = ""
+        for line in out.splitlines():
+            m = re.match(r"^(.+?) on (.+?) \((.*)\)$", line)
+            if not m or "nullfs" not in m.group(3):
+                continue
+            src, dst = m.group(1), m.group(2).rstrip("/")
+            if (d == dst or d.startswith(dst + "/")) and len(dst) > len(best):
+                best, found = dst, Path(src + d[len(dst):])
+        if found is not None and not found.is_dir():
+            found = None
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("Не вдалося визначити справжню папку каси (mount): %s", e)
+    _ORIGINAL["dir"] = found
+    if found:
+        log.info("Каса запущена з тимчасової копії macOS; справжня папка — %s", found)
+    return found
+
+
+def _bundle_of(p):
+    """…/Каса.app/Contents/Resources/app → …/Каса.app"""
+    for parent in [Path(p)] + list(Path(p).parents):
+        if parent.suffix == ".app":
+            return parent
+    return None
+
+
+def unquarantine():
+    """
+    Зняти з «Каса.app» позначку «завантажено з інтернету» (com.apple.quarantine): через неї macOS
+    щоразу запускає касу з тимчасової копії лише для читання (App Translocation), навіть із «Програм».
+    Наступний запуск піде вже зі справжньої папки.
+    """
+    if sys.platform != "darwin" or install_kind() != "py":
+        return
+    orig = original_app_dir()
+    bundle = _bundle_of(orig) if orig else None
+    if not bundle or not os.access(bundle, os.W_OK):
+        return
+    try:
+        r = subprocess.run(["/usr/bin/xattr", "-dr", "com.apple.quarantine", str(bundle)],
+                           capture_output=True, timeout=30)
+        if "/AppTranslocation/" in str(APP_DIR):
+            log.info("Знято позначку «з інтернету» з %s (%s) — наступний запуск піде без тимчасової копії",
+                     bundle, "успішно" if r.returncode == 0 else r.stderr.decode("utf-8", "replace").strip()[:200])
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("Не вдалося зняти позначку «з інтернету» з %s: %s", bundle, e)
+
+
+def install_dir():
+    """Куди записувати оновлення .py: справжня папка каси (а не тимчасова копія macOS)."""
+    return original_app_dir() or APP_DIR
+
+
 def install_problem():
     """Чому оновлення файлів .py неможливе на цьому місці (None — можна)."""
     if install_kind() != "py":
         return None
-    d = str(APP_DIR)
-    if "/AppTranslocation/" in d:
-        # macOS запускає завантажену й не переміщену програму з тимчасової копії «лише для читання»
+    target = original_app_dir()
+    if target is None:
+        # тимчасова копія, а справжню папку визначити не вдалося (напр. образ диска)
         return ("macOS запустила касу з тимчасової копії, у яку не можна записати оновлення. "
                 "Закрийте касу, у Finder перетягніть «Каса» в папку «Програми» (Applications) "
                 "і запускайте звідти — тоді оновлення встановиться")
-    if not os.access(APP_DIR, os.W_OK):
-        return f"Немає прав на запис у папку каси ({APP_DIR}) — перемістіть касу в папку, де у вас є права, напр. «Програми»"
+    if not os.access(target, os.W_OK):
+        return f"Немає прав на запис у папку каси ({target}) — перемістіть касу в папку, де у вас є права, напр. «Програми»"
     return None
 
 
@@ -219,27 +290,28 @@ def _install_py(data):
         except (SyntaxError, UnicodeDecodeError) as e:
             raise UpdateError(f"{f} у новій версії пошкоджений: {e}")
 
+    target = install_dir()
     backup = DATA_DIR / "backup" / f"{APP_VERSION}-{datetime.now():%Y%m%d-%H%M%S}"
     written = []
     try:
         backup.mkdir(parents=True, exist_ok=True)
         for f in files:
-            if (APP_DIR / f).exists():
-                (backup / f).write_bytes((APP_DIR / f).read_bytes())
+            if (target / f).exists():
+                (backup / f).write_bytes((target / f).read_bytes())
         for f, content in files.items():
-            tmp = APP_DIR / (f + ".new")
+            tmp = target / (f + ".new")
             tmp.write_bytes(content)
-            os.replace(tmp, APP_DIR / f)
+            os.replace(tmp, target / f)
             written.append(f)
     except OSError as e:
         # повертаємо вже замінені файли з резервної копії
         for f in written:
             try:
                 if (backup / f).exists():
-                    os.replace(backup / f, APP_DIR / f)
+                    os.replace(backup / f, target / f)
             except OSError:
                 pass
-        raise UpdateError(install_problem() or f"Немає прав на запис у папку каси ({APP_DIR}): {e}")
+        raise UpdateError(install_problem() or f"Немає прав на запис у папку каси ({target}): {e}")
     log.info("Оновлено файли %s; резервна копія — %s", ", ".join(files), backup)
     return backup
 

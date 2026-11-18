@@ -300,6 +300,16 @@ class App:
         return result
 
     # ---- товари: додавання й редагування (через імпорт номенклатури Checkbox) ----
+    def next_code(self):
+        """Наступний вільний код товару: найбільший «короткий» числовий код + 1 (довгі коди-штрихкоди
+        й мітки часу на кшталт 1794467826139 не враховуємо, щоб нумерація лишалась зручною)."""
+        codes = {(r[0] or "").strip() for r in self.db.con.execute("SELECT code FROM goods")}
+        nums = [int(c) for c in codes if c.isdigit() and len(c) <= 7]
+        n = max(nums, default=0) + 1
+        while str(n) in codes:
+            n += 1
+        return {"code": str(n)}
+
     def save_good(self, body):
         good_id = body.get("id")
         existing = None
@@ -308,8 +318,11 @@ class App:
             if not existing:
                 raise UserError("Товар не знайдено в локальній базі — оновіть сторінку")
         pending_new = existing is not None and existing["pending"] == "new"
+        code_in = str(body.get("code") or "")
+        if existing is None and not code_in.strip():       # новий товар без коду — код генеруємо
+            code_in = self.next_code()["code"]
         rec = {
-            "code": str(body.get("code") or ""), "name": str(body.get("name") or ""),
+            "code": code_in, "name": str(body.get("name") or ""),
             "price": str(body.get("price") or ""), "barcode": str(body.get("barcode") or ""),
             "uktzed": str(body.get("uktzed") or ""),
             "is_weight": "1" if body.get("is_weight") else "0",
@@ -1313,6 +1326,8 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.report_text, (q.get("id") or [""])[0])
         elif u.path == "/api/receipt":
             self._run(APP.receipt_info, (q.get("id") or [""])[0])
+        elif u.path == "/api/goods/next-code":
+            self._run(APP.next_code)
         elif u.path == "/api/excise/check":
             self._run(APP.excise_check, (q.get("mark") or [""])[0])
         elif u.path == "/api/excise":
@@ -1584,6 +1599,7 @@ PAGE = r"""<!DOCTYPE html>
   .seg label { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 9px; cursor: pointer; font-weight: 600; }
   .seg input { display: none; }
   .seg label:has(input:checked) { background: var(--accent-btn); color: #fff; }
+  .codebox { display: flex; gap: 6px; } .codebox input { flex: 1; min-width: 0; }
   .optlist { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; max-height: 260px; overflow-y: auto; }
   .optlist .opt { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border: 0; border-bottom: 1px solid var(--line);
                   background: var(--surface); color: var(--text); font: inherit; font-size: 14px; text-align: left; cursor: pointer; }
@@ -2064,7 +2080,8 @@ PAGE = r"""<!DOCTYPE html>
   </div>
   <div class="form" style="margin-top:12px">
     <label class="wide">Назва<input type="text" id="gName" maxlength="255"></label>
-    <label>Код<input type="text" id="gCode" maxlength="64" spellcheck="false"></label>
+    <label>Код<span class="codebox"><input type="text" id="gCode" maxlength="64" spellcheck="false">
+      <button type="button" class="btn sec small" id="gCodeGen" title="Згенерувати новий унікальний код">↻</button></span></label>
     <label>Ціна, ₴<input type="text" id="gPrice" inputmode="decimal" placeholder="0.00"></label>
     <label>Штрихкод<input type="text" id="gBarcode" inputmode="numeric" spellcheck="false"></label>
     <label>УКТЗЕД<input type="text" id="gUktzed" placeholder="2202 10 00 00" spellcheck="false"></label>
@@ -2909,12 +2926,19 @@ function goodStatus(text, kind) {
   const st = $('#goodStatus'); st.style.display = text ? 'block' : 'none';
   st.className = 'status ' + (kind || 'ok'); st.textContent = text || '';
 }
+async function genGoodCode() {
+  try { const r = await api('/api/goods/next-code'); if (!editing || editing.pending === 'new') $('#gCode').value = r.code; }
+  catch (e) { /* код можна ввести вручну; без коду сервер згенерує його сам */ }
+}
+$('#gCodeGen').onclick = () => genGoodCode();
 function openGood(g) {
   editing = g || null;
   $('#goodTitle').textContent = g ? 'Редагування товару' : 'Новий товар';
   $('#gName').value = g ? g.name : '';
   $('#gCode').value = g ? g.code.trim() : '';
   $('#gCode').readOnly = !!g && g.pending !== 'new';   // новий, ще не відправлений товар — код ще можна змінити
+  $('#gCodeGen').style.display = $('#gCode').readOnly ? 'none' : '';
+  if (!g) genGoodCode();
   $('#gPrice').value = g ? (g.price / 100).toFixed(2) : '';
   $('#gBarcode').value = g ? (g.barcode || '') : '';
   $('#gUktzed').value = g ? (g.uktzed || '') : '';
@@ -4855,6 +4879,7 @@ def main():
     log_path = setup_logging()
     log.info("──── Запуск каси %s, дані: %s", APP_VERSION, CONFIG_PATH.parent)
     kasa_update.log_temp_state()
+    kasa_update.unquarantine()          # Mac: щоб наступні запуски йшли не з тимчасової копії
     threading.Timer(20, kasa_update.cleanup_old_temp).start()   # залишки _MEI… попередніх копій
     if busy:
         log.info("Зайняті іншими програмами порти: %s — каса працює на порту %d", ", ".join(map(str, busy)), PORT)
