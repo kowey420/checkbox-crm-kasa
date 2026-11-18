@@ -2060,6 +2060,12 @@ PAGE = r"""<!DOCTYPE html>
   .sumgrid small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
   #psModal h4 { margin: 16px 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted); }
   .stats b { font-size: 18px; display: block; }
+  .stats .statq { border-radius: 8px; padding: 2px 8px; margin: -2px -8px; border: 1px solid transparent; }
+  .stats .statq.can { cursor: pointer; }
+  .stats .statq.can:hover { background: var(--hover); border-color: var(--line); }
+  .stats .statq.can b { color: var(--bad); text-decoration: underline dotted; text-underline-offset: 3px; }
+  .stats .statq.on { background: var(--hover); border-color: var(--accent); }
+  .qfilter { display: inline-flex; align-items: center; gap: 8px; }
 </style>
 </head>
 <body>
@@ -2146,9 +2152,9 @@ PAGE = r"""<!DOCTYPE html>
     <div class="card subpane" id="gpGoods">
       <div class="stats">
         <div><span class="muted">Товарів</span><b id="stCount">0</b></div>
-        <div><span class="muted">Нульовий залишок</span><b id="stZero">0</b></div>
+        <div class="statq" id="stZeroBox" data-q="zero" title="Показати товари з нульовим залишком"><span class="muted">Нульовий залишок</span><b id="stZero">0</b></div>
         <div><span class="muted">Облік залишків</span><b id="stLeft">—</b></div>
-        <div><span class="muted">Без податку</span><b id="stNoTax">0</b></div>
+        <div class="statq" id="stNoTaxBox" data-q="notax" title="Показати товари без податкової ставки"><span class="muted">Без податку</span><b id="stNoTax">0</b></div>
       </div>
       <div class="row">
         <input type="text" id="goodsFilter" placeholder="Фільтр…">
@@ -2976,7 +2982,15 @@ function pendingBadge(g) {
     ? ' <span class="pend" title="Новий товар; у Checkbox з\'явиться під час синхронізації">● новий, не в Checkbox</span>'
     : ' <span class="pend" title="Зміни ще не відправлені в Checkbox">● змінено локально</span>';
 }
+// швидкі фільтри за кліком на показник: нульовий залишок, без податку
+const GOODS_QUICK = {
+  zero: { test: g => g.count === 0, label: '📉 Нульовий залишок' },
+  notax: { test: g => !(g.tax_codes || []).length, label: '⚠ Без податкової ставки' },
+};
+let goodsQuick = null;
 function renderGoodsTable() {
+  if (goodsQuick && !goods.some(GOODS_QUICK[goodsQuick].test)) goodsQuick = null;   // таких товарів більше немає
+  const quick = goodsQuick ? GOODS_QUICK[goodsQuick] : null;
   const tiles = gdViewMode === 'tiles' && groupList.length;
   setViewButtons($('#gdView'), tiles ? 'tiles' : 'list');
   $('#gdView').style.display = groupList.length ? '' : 'none';
@@ -2986,17 +3000,27 @@ function renderGoodsTable() {
   if (tiles) {
     if (gdFolder && gdFolder !== NO_GROUP && !groupById[gdFolder]) gdFolder = null;
     const q = $('#goodsFilter').value;
-    $('#gdCrumbs').innerHTML = q.trim() ? '<span>🔎 Фільтр по всіх групах</span>' : crumbsHtml(gdFolder, 'Усі товари');
-    $('#gdTiles').innerHTML = tilesHtml(gdFolder, q, { showEmpty: true }) || '<p class="muted">Нічого не знайдено</p>';
+    $('#gdCrumbs').innerHTML = quick ? '' : q.trim() ? '<span>🔎 Фільтр по всіх групах</span>' : crumbsHtml(gdFolder, 'Усі товари');
+    $('#gdTiles').innerHTML = tilesHtml(gdFolder, q, { showEmpty: true, only: quick && quick.test }) || '<p class="muted">Нічого не знайдено</p>';
   } else $('#gdCrumbs').innerHTML = '';
+  if (quick) {
+    const n = goods.filter(g => quick.test(g) && match(g, $('#goodsFilter').value)).length;
+    $('#gdCrumbs').innerHTML = `<span class="qfilter"><b>${quick.label}: ${n}</b>
+      <button type="button" class="btn sec small" id="gdQuickOff">✕ Показати всі</button></span>`;
+    $('#gdQuickOff').onclick = () => { goodsQuick = null; renderGoodsTable(); };
+  }
   const gsel = $('#goodsGroup').value;
-  const list = sortByGroup(goods.filter(g => match(g, $('#goodsFilter').value) && inGroup(g, gsel || null)));
+  const list = sortByGroup(goods.filter(g => match(g, $('#goodsFilter').value) && (quick ? quick.test(g) : inGroup(g, gsel || null))));
   $('#stCount').textContent = goods.length;
-  $('#stZero').textContent = goods.filter(g => g.count === 0).length;
+  const zero = goods.filter(GOODS_QUICK.zero.test).length;
+  $('#stZero').textContent = zero;
   $('#stLeft').textContent = useLeftovers ? 'увімкнено' : 'вимкнено';
   const noTax = goods.filter(g => !(g.tax_codes || []).length).length;
   $('#stNoTax').textContent = noTax; $('#stNoTax').className = noTax ? 'zero' : '';
-  const filtering = !!$('#goodsFilter').value.trim();
+  [['#stZeroBox', zero, 'zero'], ['#stNoTaxBox', noTax, 'notax']].forEach(([sel, n, k]) => {
+    $(sel).classList.toggle('can', n > 0); $(sel).classList.toggle('on', goodsQuick === k);
+  });
+  const filtering = !!$('#goodsFilter').value.trim() || !!quick;
   const ind = d => d ? ` style="padding-left:${12 + d * 18}px"` : '';
   const head = (id, name, depth, n, shut) => `<tr class="grouprow${depth ? ' grow-sub' : ''}" data-gkey="${esc(id)}"><td colspan="7"${ind(depth)}>` +
     `<span class="tw">${shut ? '▸' : '▾'}</span>${esc(name)} <small>· ${n}</small></td></tr>`;
@@ -3010,6 +3034,11 @@ function renderGoodsTable() {
     || '<tr><td colspan="7" class="muted">Нічого не знайдено</td></tr>';
 }
 $('#goodsGroup').onchange = renderGoodsTable;
+document.querySelectorAll('#goods .statq').forEach(el => el.onclick = () => {
+  if (!el.classList.contains('can')) return;
+  goodsQuick = goodsQuick === el.dataset.q ? null : el.dataset.q;
+  renderGoodsTable();
+});
 $('#search').oninput = renderSearch;
 $('#goodsFilter').oninput = renderGoodsTable;
 
@@ -3094,7 +3123,7 @@ function crumbsHtml(cur, rootLabel) {
 }
 // Плитки поточної папки cur (null — верхній рівень): «вгору», підгрупи, товари; при пошуку — знайдені товари
 function tilesHtml(cur, q, opts) {
-  const searching = !!q.trim();
+  const searching = !!q.trim() || !!opts.only;
   const tileGood = g => {
     const inCart = opts.cartQty ? opts.cartQty(g) : 0, dot = g.pending ? `<span class="dot${g.pending_error ? ' err' : ''}" title="${g.pending_error ? 'Не відправлено в Checkbox' : 'Змінено локально'}"></span>` : '';
     return `<div class="tile${g.count === 0 && useLeftovers ? ' off' : ''}" data-good="${esc(g.id)}" title="${esc(g.name)}\n${esc(g.barcode || g.code)}">
@@ -3103,7 +3132,8 @@ function tilesHtml(cur, q, opts) {
       ${searching && g.group_path && g.group_path.length ? `<span class="tg">📁 ${esc(g.group_path.join(' / '))}</span>` : ''}
       <span class="tp">${uah(g.price)} ₴</span><span class="ts ${g.count === 0 ? 'zero' : ''}">${g.count != null ? qtyStr(g.count, g.is_weight) : (g.is_weight ? 'кг' : 'шт')}</span></div>`;
   };
-  if (searching) return goods.filter(g => match(g, q)).sort(byName).slice(0, 200).map(tileGood).join('');
+  if (searching) return goods.filter(g => (!q.trim() || match(g, q)) && (!opts.only || opts.only(g)))
+    .sort(byName).slice(0, 500).map(tileGood).join('');
   let html = '';
   if (cur) {
     const up = cur === NO_GROUP ? '' : (groupById[cur] && groupById[cur].parent_id) || '';
