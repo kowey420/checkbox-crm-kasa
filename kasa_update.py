@@ -204,35 +204,74 @@ def restart_command():
     return [sys.executable, str(APP_DIR / "checkbox_web.py")]
 
 
-def spawn_restarted():
-    """Запустити нову копію каси (після того, як стара звільнила порт)."""
-    env = dict(os.environ, CHECKBOX_NO_BROWSER="1", CHECKBOX_RESTARTED="1", CHECKBOX_CLEAN_SPAWN="1")
+def _clean_env():
+    env = dict(os.environ, CHECKBOX_NO_BROWSER="1", CHECKBOX_RESTARTED="1")
+    env.pop("CHECKBOX_RELAUNCHED", None)
     if getattr(sys, "frozen", False):
         # Без цього нова копія Kasa.exe (onefile) підхоплює тимчасову папку _MEI… старої,
         # і стара при виході не може її видалити: «Failed to remove temporary directory».
         # PyInstaller ≥ 6.9: нова копія розпакується у власну папку, як при звичайному запуску.
         env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
         for key in list(env):
-            if key.startswith("_PYI_") or key.startswith("_MEIPASS"):
+            if key.upper().startswith(("_PYI_", "_MEIPASS", "PYI_")) and key.upper() != "PYINSTALLER_RESET_ENVIRONMENT":
                 env.pop(key)
         mei = getattr(sys, "_MEIPASS", None)
         if mei and env.get("PATH"):     # шляхи в стару тимчасову папку нова копія не має бачити
             env["PATH"] = os.pathsep.join(p for p in env["PATH"].split(os.pathsep)
                                           if p and not os.path.normcase(p).startswith(os.path.normcase(mei)))
-        if os.name == "nt":
-            # Завантажувач Kasa.exe робить SetDllDirectory(_MEI… старої копії), і дочірні процеси це
-            # успадковують: нова Kasa.exe брала б DLL зі старої папки й тримала їх відкритими, тож стара
-            # при виході не могла її видалити — «Failed to remove temporary directory».
-            try:
-                import ctypes
-                ok = ctypes.windll.kernel32.SetDllDirectoryW(None)
-                log.info("Перезапуск: SetDllDirectory скинуто (%s), PYINSTALLER_RESET_ENVIRONMENT=1", "так" if ok else "ні")
-            except Exception as e:  # noqa
-                log.warning("Перезапуск: не вдалося скинути SetDllDirectory: %s", e)
+    return env
+
+
+def _ps_quote(s):
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def spawn_restarted(relaunch=False):
+    """
+    Запустити нову копію каси (після того, як стара звільнила порт).
+
+    Kasa.exe на Windows: нову копію запускає не сама каса, а окремий прихований PowerShell, який
+    спершу чекає, поки стара копія (і її завантажувач) повністю завершиться й прибере свою
+    тимчасову папку _MEI…. Тоді нова не може ні зачепити, ні заблокувати старі файли — і вікна
+    «Failed to remove temporary directory» немає. Немає PowerShell — запускаємо напряму, як раніше.
+    """
+    env = _clean_env()
+    if relaunch:
+        env["CHECKBOX_RELAUNCHED"] = "1"
+    frozen = getattr(sys, "frozen", False)
+    if os.name == "nt" and frozen:
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetDllDirectoryW(None)
+        except Exception:  # noqa
+            pass
+        pids = [os.getpid()]
+        try:
+            ppid = os.getppid()          # завантажувач onefile — саме він видаляє _MEI…
+            if ppid and ppid != os.getpid():
+                pids.append(ppid)
+        except (AttributeError, OSError):
+            pass
+        exe = sys.executable
+        script = (f"Wait-Process -Id {','.join(map(str, pids))} -Timeout 40 -ErrorAction SilentlyContinue; "
+                  "Start-Sleep -Milliseconds 300; "
+                  f"Start-Process -FilePath {_ps_quote(exe)} -WorkingDirectory {_ps_quote(APP_DIR)}")
+        root = os.environ.get("SystemRoot", r"C:\Windows")
+        ps = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        try:
+            subprocess.Popen([ps if os.path.isfile(ps) else "powershell.exe", "-NoProfile", "-NonInteractive",
+                              "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", script],
+                             env=env, cwd=str(APP_DIR), close_fds=True,
+                             creationflags=0x08000000 | 0x00000200)     # CREATE_NO_WINDOW | NEW_PROCESS_GROUP
+            log.info("Каса перезапускається після оновлення (нова копія стартує після виходу цієї; чекаю PID %s)",
+                     ", ".join(map(str, pids)))
+            return
+        except OSError as e:
+            log.warning("PowerShell недоступний (%s) — запускаю нову копію напряму", e)
     kw = {"env": env, "cwd": str(APP_DIR), "close_fds": True}
     if os.name == "nt":
         flags = 0x00000200                                  # CREATE_NEW_PROCESS_GROUP
-        flags |= 0x00000008 if getattr(sys, "frozen", False) else 0x00000010   # DETACHED / NEW_CONSOLE
+        flags |= 0x00000008 if frozen else 0x00000010       # DETACHED / NEW_CONSOLE
         kw["creationflags"] = flags
     else:
         kw["start_new_session"] = True
@@ -240,25 +279,36 @@ def spawn_restarted():
     log.info("Каса перезапускається після оновлення")
 
 
+def _mei_age():
+    mei = getattr(sys, "_MEIPASS", None)
+    if not mei:
+        return None, None
+    try:
+        st = os.stat(mei)
+        return mei, time.time() - getattr(st, "st_birthtime", st.st_ctime)
+    except OSError:
+        return mei, None
+
+
 def relaunch_if_inherited():
     """
     Каси до 1.2.5 після оновлення запускали нову Kasa.exe зі своїми змінними PyInstaller, і вона
     працювала з тимчасової папки _MEI… старої копії. Стара закривалась, папка зникала — і разом
     з нею сертифікати: «Немає зв'язку … [Errno 2] No such file or directory» на кожному запиті.
-    Таку копію одразу перезапускаємо «начисто» (власна тимчасова папка), а самі виходимо.
+    Таку копію (папка створена давно, а не щойно нами) перезапускаємо «начисто» — один раз.
     """
-    clean = os.environ.pop("CHECKBOX_CLEAN_SPAWN", None) == "1"
-    if not getattr(sys, "frozen", False) or os.environ.get("CHECKBOX_RESTARTED") != "1" or clean:
+    os.environ.pop("CHECKBOX_CLEAN_SPAWN", None)
+    if not getattr(sys, "frozen", False):
         return
-    # 1.2.5–1.4.1 маркера не ставлять, але запускають правильно: своя папка _MEI… щойно створена.
-    # Спільна зі старою копією — створена тоді, коли запускалась стара (хвилини чи години тому).
-    try:
-        shared = time.time() - os.stat(sys._MEIPASS).st_ctime > 90
-    except (AttributeError, OSError):
-        shared = True
-    if shared:
-        log.warning("Каса запущена старим оновлювачем зі спільною тимчасовою папкою — перезапускаю начисто")
-        spawn_restarted()
+    mei, age = _mei_age()
+    pyi = sorted(k for k in os.environ if k.upper().startswith(("_PYI_", "_MEIPASS", "PYINSTALLER")))
+    log.info("Тимчасова папка: %s (створена %s тому); змінні PyInstaller: %s", mei,
+             f"{age:.0f} с" if age is not None else "?", ", ".join(pyi) or "—")
+    if os.environ.get("CHECKBOX_RESTARTED") != "1" or os.environ.get("CHECKBOX_RELAUNCHED") == "1":
+        return
+    if age is None or age > 90:
+        log.warning("Каса працює зі спільною тимчасовою папкою старої копії — перезапускаю начисто")
+        spawn_restarted(relaunch=True)
         sys.exit(0)
 
 
