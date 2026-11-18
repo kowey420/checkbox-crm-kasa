@@ -596,6 +596,10 @@ class App:
             marks = [m.strip() for m in marks if m.strip()]
             bad = [m for m in marks if len(m) != EXCISE_MARK_LEN]
             if bad:
+                raise UserError(f"Акцизна марка має містити {EXCISE_MARK_LEN} символів: «{bad[0]}» — {len(bad[0])} ({row['name']})",
+                                code="EXCISE_FORMAT")
+            bad = [m for m in marks if len(m) != EXCISE_MARK_LEN]
+            if bad:
                 raise UserError(f"Акцизна марка має містити {EXCISE_MARK_LEN} символів: «{bad[0]}» — {len(bad[0])} "
                                 f"({row['name']})", code="EXCISE_FORMAT")
             if marks and not row["is_weight"] and len(marks) > qty // 1000:
@@ -1135,6 +1139,7 @@ class App:
 
 
 APP: App = None
+EXCISE_MARK_LEN = 10        # акцизна марка: серія й номер — рівно 10 символів
 EXCISE_MARK_LEN = 10          # серія й номер акцизної марки — рівно 10 символів
 
 # --- власні зображення плиток (лише локально, у папці даних) ---
@@ -2104,9 +2109,13 @@ PAGE = r"""<!DOCTYPE html>
     <button class="x" id="exciseClose">✕</button>
   </div>
   <p style="margin:6px 0 2px"><b id="exciseName"></b></p>
-  <p class="muted" style="margin:0 0 12px">Відскануйте або введіть марку і натисніть Enter — по одній на кожну одиницю.
+  <p class="muted" style="margin:0 0 12px">Відскануйте або введіть марку (10 символів) і натисніть «+» або Enter — по одній на кожну одиницю.
     Додано: <b id="exciseCount"></b></p>
-  <input type="text" id="exciseInput" placeholder="Акцизна марка — 10 символів" autocomplete="off" maxlength="64">
+  <div class="row" style="flex-wrap:nowrap">
+    <input type="text" id="exciseInput" placeholder="Акцизна марка — 10 символів" autocomplete="off" maxlength="64" style="flex:1">
+    <button class="btn" id="exciseAdd" title="Додати марку" style="min-width:52px;font-size:20px;line-height:1">+</button>
+  </div>
+  <div class="muted" id="exciseLen" style="font-size:12px;margin-top:4px;min-height:16px"></div>
   <ul class="marks" id="exciseList"></ul>
   <div class="pay" style="margin-top:14px">
     <button class="btn sec" id="exciseNone">Без марок</button>
@@ -3136,11 +3145,17 @@ function askMarkIfNeeded(i) {
     scanHint(`Тепер відскануйте акцизну марку: ${g.name} (бракує ${needMarks(i)}). Без марки — Esc`, 'warn');
   } else scan.markFor = null;
 }
-function scanCode(q) {
+async function scanCode(q) {
   // очікуємо акцизну марку — але штрихкод товару з бази теж приймаємо як новий товар
   if (scan.markFor != null && !findByCode(q)) {
     const i = scan.markFor, c = cart[i];
     if (allMarks(-1).includes(q)) { beep(false); return scanHint('Ця акцизна марка вже додана', 'bad'); }
+    const p = markProblem(q);
+    if (p) { beep(false); return scanHint(p, 'bad'); }
+    const sold = await soldMarkInfo(q);
+    if (!scan || scan.markFor !== i) return;
+    if (sold) { beep(false); return scanHint(soldText(q, sold), 'bad'); }
+    if (allMarks(-1).includes(q)) return;
     c.marks.push(q); scan.history.push({ idx: i, mark: q }); beep(true);
     scanHint(`Марку додано: ${goods.find(x => x.id === c.id).name}`, 'ok');
     askMarkIfNeeded(i);
@@ -3274,7 +3289,7 @@ function openExcise(i) {
   $('#exciseName').textContent = g.name;
   renderExcise();
   $('#exciseModal').classList.add('show');
-  $('#exciseInput').value = ''; $('#exciseInput').focus();
+  $('#exciseInput').value = ''; renderExciseLen(); $('#exciseInput').focus();
 }
 function renderExcise() {
   const c = cart[exciseIdx]; const need = Math.round(c.qty / 1000);
@@ -3284,27 +3299,42 @@ function renderExcise() {
     `<li>${esc(m)} <button class="x" data-k="${k}" title="Видалити">✕</button></li>`).join('');
 }
 function closeExcise() { $('#exciseModal').classList.remove('show'); exciseIdx = null; renderCart(); $('#search').focus(); }
-$('#exciseInput').onkeydown = async e => {
+const EXCISE_LEN = 10;
+const markProblem = v => v.length !== EXCISE_LEN ? `Акцизна марка має містити ${EXCISE_LEN} символів — введено ${v.length}` : null;
+async function soldMarkInfo(v) {       // марка вже продана? (сервер усе одно перевірить при пробитті чека)
+  try { const r = await api('/api/excise/check?mark=' + encodeURIComponent(v)); return r.sold ? (r.info || {}) : null; }
+  catch (err) { return null; }
+}
+const soldText = (v, i) => `Марка ${v} вже продана: ${i.good_name || 'товар'}, чек ${i.fiscal_code || i.receipt_id || '—'} від ${(i.sold_at || '').replace('T', ' ').slice(0, 16)}`;
+function renderExciseLen() {
+  const v = $('#exciseInput').value.trim(), el = $('#exciseLen');
+  el.textContent = v ? `${v.length} з ${EXCISE_LEN} символів` : '';
+  el.style.color = v && v.length !== EXCISE_LEN ? 'var(--bad)' : '';
+}
+$('#exciseInput').oninput = renderExciseLen;
+$('#exciseAdd').onclick = () => { addExciseMark(); $('#exciseInput').focus(); };
+$('#exciseInput').onkeydown = e => {
   if (e.key === 'Escape') return closeExcise();
   if (e.key !== 'Enter') return;
   e.stopPropagation();
-  const v = $('#exciseInput').value.trim(); $('#exciseInput').value = '';
-  if (!v) return;
+  addExciseMark();
+};
+async function addExciseMark() {
+  const v = $('#exciseInput').value.trim();
+  if (!v || exciseIdx == null) return;
+  const p = markProblem(v);
+  if (p) { toast(p, true); return $('#exciseInput').select(); }
+  $('#exciseInput').value = ''; renderExciseLen();
   const idx = exciseIdx, c = cart[idx]; const need = Math.round(c.qty / 1000);
   if (v.length !== EXCISE_MARK_LEN) return toast(`Акцизна марка має містити ${EXCISE_MARK_LEN} символів, а «${v}» — ${v.length}`, true);
   if (c.marks.includes(v) || allMarks(idx).includes(v)) return toast('Ця марка вже додана', true);
   if (c.marks.length >= need) return toast(`Вже додано ${need} марок — збільште кількість товару`, true);
-  try {
-    const r = await api('/api/excise/check?mark=' + encodeURIComponent(v));
-    if (r.sold) {
-      const i = r.info || {};
-      return toast(`Марка ${v} вже продана: ${i.good_name || 'товар'}, чек ${i.fiscal_code || i.receipt_id || '—'} від ${(i.sold_at || '').replace('T', ' ').slice(0, 16)}`, true);
-    }
-  } catch (err) { /* перевірка недоступна — сервер усе одно не дасть продати повторно */ }
+  const sold = await soldMarkInfo(v);
+  if (sold) return toast(soldText(v, sold), true);
   if (exciseIdx !== idx || c.marks.includes(v)) return;
   c.marks.push(v); renderExcise();
   if (c.marks.length === need) toast('Усі марки додано');
-};
+}
 $('#exciseList').onclick = e => { const k = e.target.dataset.k; if (k !== undefined) { cart[exciseIdx].marks.splice(k, 1); renderExcise(); $('#exciseInput').focus(); } };
 $('#exciseDone').onclick = closeExcise;
 $('#exciseClose').onclick = closeExcise;
