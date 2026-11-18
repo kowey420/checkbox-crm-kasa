@@ -594,6 +594,10 @@ class App:
             if not isinstance(marks, list) or not all(isinstance(m, str) for m in marks):
                 raise UserError(f"Невірні акцизні марки: {row['name']}")
             marks = [m.strip() for m in marks if m.strip()]
+            bad = [m for m in marks if len(m) != EXCISE_MARK_LEN]
+            if bad:
+                raise UserError(f"Акцизна марка має містити {EXCISE_MARK_LEN} символів: «{bad[0]}» — {len(bad[0])} "
+                                f"({row['name']})", code="EXCISE_FORMAT")
             if marks and not row["is_weight"] and len(marks) > qty // 1000:
                 raise UserError(f"Марок більше, ніж одиниць товару: {row['name']}")
             dup = all_marks.intersection(marks) or (len(set(marks)) != len(marks))
@@ -1131,6 +1135,7 @@ class App:
 
 
 APP: App = None
+EXCISE_MARK_LEN = 10          # серія й номер акцизної марки — рівно 10 символів
 
 # --- власні зображення плиток (лише локально, у папці даних) ---
 IMG_DIR = DATA_DIR / "images"
@@ -2101,7 +2106,7 @@ PAGE = r"""<!DOCTYPE html>
   <p style="margin:6px 0 2px"><b id="exciseName"></b></p>
   <p class="muted" style="margin:0 0 12px">Відскануйте або введіть марку і натисніть Enter — по одній на кожну одиницю.
     Додано: <b id="exciseCount"></b></p>
-  <input type="text" id="exciseInput" placeholder="Штрихкод акцизної марки" autocomplete="off">
+  <input type="text" id="exciseInput" placeholder="Акцизна марка — 10 символів" autocomplete="off" maxlength="64">
   <ul class="marks" id="exciseList"></ul>
   <div class="pay" style="margin-top:14px">
     <button class="btn sec" id="exciseNone">Без марок</button>
@@ -3259,6 +3264,7 @@ $('#otherLabel').onkeydown = e => { if (e.key === 'Enter') $('#otherSubmit').cli
 
 // --- акцизні марки ---
 let exciseIdx = null;
+const EXCISE_MARK_LEN = 10;   // серія й номер акцизної марки
 function allMarks(exceptIdx) {
   return cart.flatMap((c, i) => i === exceptIdx ? [] : (c.marks || []));
 }
@@ -3285,6 +3291,7 @@ $('#exciseInput').onkeydown = async e => {
   const v = $('#exciseInput').value.trim(); $('#exciseInput').value = '';
   if (!v) return;
   const idx = exciseIdx, c = cart[idx]; const need = Math.round(c.qty / 1000);
+  if (v.length !== EXCISE_MARK_LEN) return toast(`Акцизна марка має містити ${EXCISE_MARK_LEN} символів, а «${v}» — ${v.length}`, true);
   if (c.marks.includes(v) || allMarks(idx).includes(v)) return toast('Ця марка вже додана', true);
   if (c.marks.length >= need) return toast(`Вже додано ${need} марок — збільште кількість товару`, true);
   try {
