@@ -468,6 +468,53 @@ def cleanup_old_temp():
                  f"; не вдалося видалити {len(still)}: {', '.join(sorted(still)[:15])}" if still else " — видалено")
 
 
+def skip_bootloader_cleanup():
+    """
+    Лише при перезапуску після оновлення, останнім кроком перед виходом: закрити завантажувач onefile
+    (батьківський процес Kasa.exe), поки він не почав прибирати папку _MEI…. Саме це прибирання після
+    оновлення натрапляло на тимчасово зайняті файли й показувало «Failed to remove temporary directory»
+    (при звичайному «Вийти» — ні). Папку за 20 с прибирає нова копія (cleanup_old_temp) — без помилок.
+    Батьківський процес закриваємо, лише якщо це справді наш Kasa.exe.
+    """
+    if os.name != "nt" or not getattr(sys, "frozen", False) or not getattr(sys, "_MEIPASS", None):
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                   ctypes.POINTER(wintypes.DWORD))
+        k32.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        ppid = os.getppid()
+        h = k32.OpenProcess(0x0001 | 0x1000, False, ppid)     # PROCESS_TERMINATE | QUERY_LIMITED_INFORMATION
+        if not h:
+            log.info("Завантажувач PID %s недоступний (%s) — пропускаю", ppid, ctypes.get_last_error())
+            return
+        try:
+            buf, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
+            if not k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return
+            same = os.path.normcase(os.path.abspath(buf.value)) == os.path.normcase(os.path.abspath(sys.executable))
+            if not same:
+                log.info("Батьківський процес %s — не Kasa.exe (%s), не чіпаю", ppid, buf.value)
+                return
+            log.info("Закриваю завантажувач Kasa.exe (PID %s): тимчасову папку %s прибере нова копія",
+                     ppid, os.path.basename(sys._MEIPASS))
+            for h_ in log.handlers if hasattr(log, "handlers") else []:
+                try:
+                    h_.flush()
+                except Exception:  # noqa
+                    pass
+            k32.TerminateProcess(h, 0)
+        finally:
+            k32.CloseHandle(h)
+    except Exception as e:  # noqa
+        log.warning("Не вдалося закрити завантажувач Kasa.exe: %s", e)
+
+
 def cleanup_after_update():
     """Прибрати Kasa.old.exe, що лишився після попереднього оновлення."""
     if getattr(sys, "frozen", False):

@@ -4848,6 +4848,7 @@ def main():
     if RESTART_AFTER_STOP:
         kasa_update.spawn_restarted()
         print("\nКасу оновлено — запускаю нову версію…")
+        kasa_update.skip_bootloader_cleanup()     # останнім: без вікна «Failed to remove temporary directory»
         return
     log.info("Касу зупинено")
     print("\nКасу зупинено.")
