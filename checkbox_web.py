@@ -1793,7 +1793,7 @@ PAGE = r"""<!DOCTYPE html>
     gap: 8px; cursor: pointer; font-weight: 500; text-align: left; color: var(--text); }
   .form .autoclose label.check input { width: 18px; height: 18px; margin: 0; flex: 0 0 auto; }
   .form .autoclose small { display: block; margin-top: 4px; }
-  .autoclose select { width: auto; min-width: 70px; font-variant-numeric: tabular-nums; }
+  .autoclose #cfgAcTime { width: 110px; font-variant-numeric: tabular-nums; letter-spacing: .04em; font-size: 16px; text-align: center; }
   .warnbox { margin-top: 10px; padding: 10px 12px; border-radius: 10px; font-size: 13px; line-height: 1.45;
              border: 1px solid rgba(217, 119, 6, .45); background: rgba(245, 158, 11, .12); color: var(--text); }
   .btn.zbtn { padding: 3px 10px; font-size: 12px; line-height: 1.4; margin-left: 8px; vertical-align: middle; white-space: nowrap; }
@@ -2225,9 +2225,12 @@ PAGE = r"""<!DOCTYPE html>
       <div id="cfgAutoCloseBox" style="display:none">
         <span class="row" style="flex-wrap:nowrap;gap:6px;align-items:center;margin-top:6px">
           <span class="muted">о</span>
-          <select id="cfgAcH" aria-label="Година"></select><b>:</b><select id="cfgAcM" aria-label="Хвилини"></select>
+          <input type="text" id="cfgAcTime" list="cfgAcList" inputmode="numeric" maxlength="5" placeholder="ГГ:ХХ"
+                 autocomplete="off" spellcheck="false" aria-label="Час автоматичного закриття зміни">
+          <datalist id="cfgAcList"></datalist>
         </span>
-        <small class="muted">Checkbox сам закриє зміну з Z-звітом. Не пізніше 23:45. Діє з наступного відкриття зміни.</small>
+        <small class="muted" id="cfgAcHint">Введіть час (24-годинний формат, напр. 21:30) або оберіть зі списку.
+          Не пізніше 23:45. Checkbox сам закриє зміну з Z-звітом; діє з наступного відкриття зміни.</small>
       </div>
     </div>
   </div>
@@ -4755,23 +4758,58 @@ document.querySelectorAll('input[name="authMode"]').forEach(r => r.onchange = re
 document.querySelectorAll('.eye').forEach(b => b.onclick = () => {
   const i = document.getElementById(b.dataset.for); i.type = i.type === 'password' ? 'text' : 'password';
 });
-// автозакриття: 24-годинний час двома списками (години 00–23, хвилини 00–59), не пізніше 23:45
+// автозакриття: час вручну «ГГ:ХХ» (24-годинний) або зі списку через 15 хв; не пізніше 23:45
 const AUTO_CLOSE_MAX = '23:45';
 function p2(n) { return String(n).padStart(2, '0'); }
-$('#cfgAcH').innerHTML = Array.from({ length: 24 }, (_, h) => `<option>${p2(h)}</option>`).join('');
-function fillAcMinutes() {
-  const keep = $('#cfgAcM').value, max = $('#cfgAcH').value === AUTO_CLOSE_MAX.slice(0, 2) ? +AUTO_CLOSE_MAX.slice(3) : 59;
-  $('#cfgAcM').innerHTML = Array.from({ length: max + 1 }, (_, m) => `<option>${p2(m)}</option>`).join('');
-  $('#cfgAcM').value = p2(Math.min(+keep || 0, max));
+$('#cfgAcList').innerHTML = Array.from({ length: 96 }, (_, i) => `<option value="${p2(Math.floor(i / 4))}:${p2(i % 4 * 15)}">`).join('');
+function acProblem(v) {
+  const m = /^(\d{2}):(\d{2})$/.exec(v);
+  if (!m) return 'Введіть час у форматі ГГ:ХХ, напр. 21:30';
+  if (+m[1] > 23 || +m[2] > 59) return 'Такого часу немає: години 00–23, хвилини 00–59';
+  if (v > AUTO_CLOSE_MAX) return `Не пізніше ${AUTO_CLOSE_MAX} — серверам Checkbox потрібен час, щоб закрити зміну`;
+  return null;
 }
+const AC_HINT = 'Введіть час (24-годинний формат, напр. 21:30) або оберіть зі списку. Не пізніше 23:45. ' +
+  'Checkbox сам закриє зміну з Z-звітом; діє з наступного відкриття зміни.';
+function acNormalize() {                                     // «9:5» → «09:05», «930» → «09:30», «21» → «21:00»
+  const el = $('#cfgAcTime'), v = el.value.trim();
+  const m = /^(\d{1,2}):(\d{1,2})$/.exec(v) || (/^\d{3}$/.test(v) && [v, v.slice(0, 1), v.slice(1)]);
+  if (m) el.value = p2(+m[1]) + ':' + p2(+m[2]);
+  else if (/^\d{1,2}$/.test(v)) el.value = p2(+v) + ':00';
+}
+function acValue() {
+  acNormalize();
+  const v = $('#cfgAcTime').value.trim(), p = acProblem(v);
+  if (p) { acHint(); $('#cfgAcTime').focus(); throw new Error('Автоматичне закриття зміни: ' + p); }
+  return v;
+}
+function acHint() {
+  const v = $('#cfgAcTime').value.trim(), p = v.length === 5 ? acProblem(v) : null, h = $('#cfgAcHint');
+  h.style.color = p ? 'var(--bad)' : '';
+  h.textContent = p || AC_HINT;
+}
+$('#cfgAcTime').oninput = e => {
+  const el = $('#cfgAcTime'), raw = el.value;
+  if (!/^\d{1,2}:\d{0,2}$/.test(raw)) {                     // лише цифри: «2130» → «21:30»
+    let d = raw.replace(/\D/g, '');
+    if (d && d[0] > '2') d = '0' + d;                      // «930» → 09:30: години 3–9 — без нуля попереду
+    d = d.slice(0, 4);
+    el.value = d.length > 2 ? d.slice(0, 2) + ':' + d.slice(2) : d;
+  }
+  acHint();
+};
+$('#cfgAcTime').onblur = () => { acNormalize(); if ($('#cfgAcTime').value) acHint(); };
 function setAutoClose(hhmm) {
-  const on = !!hhmm, [h, m] = (hhmm || AUTO_CLOSE_MAX).split(':');
-  $('#cfgAutoCloseOn').checked = on;
-  $('#cfgAcH').value = h; $('#cfgAcM').innerHTML = `<option>${m}</option>`; $('#cfgAcM').value = m; fillAcMinutes();
-  $('#cfgAutoCloseBox').style.display = on ? '' : 'none';
+  $('#cfgAutoCloseOn').checked = !!hhmm;
+  $('#cfgAcTime').value = hhmm || AUTO_CLOSE_MAX;
+  acHint();
+  $('#cfgAutoCloseBox').style.display = hhmm ? '' : 'none';
 }
-$('#cfgAcH').onchange = fillAcMinutes;
-$('#cfgAutoCloseOn').onchange = () => { $('#cfgAutoCloseBox').style.display = $('#cfgAutoCloseOn').checked ? '' : 'none'; };
+$('#cfgAutoCloseOn').onchange = () => {
+  const on = $('#cfgAutoCloseOn').checked;
+  $('#cfgAutoCloseBox').style.display = on ? '' : 'none';
+  if (on) { if (!$('#cfgAcTime').value) $('#cfgAcTime').value = AUTO_CLOSE_MAX; $('#cfgAcTime').focus(); $('#cfgAcTime').select(); }
+};
 $('#settingsBtn').onclick = () => openSettings().catch(e => toast(e.message, true));
 $('#settingsClose').onclick = closeSettings; $('#settingsCancel').onclick = closeSettings;
 $('#settingsModal').onclick = e => { if (e.target.id === 'settingsModal') closeSettings(); };
@@ -4782,7 +4820,7 @@ $('#settingsSave').onclick = e => busy(e.target, async () => {
     auth_mode: mode,
     license_key: $('#cfgLicense').value, login: $('#cfgLogin').value,
     cash_rounding: $('#cfgRounding').value,
-    auto_close_time: $('#cfgAutoCloseOn').checked ? `${$('#cfgAcH').value}:${$('#cfgAcM').value}` : '',
+    auto_close_time: $('#cfgAutoCloseOn').checked ? acValue() : '',
   };
   if (mode === 'password' && $('#cfgPassword').value) body.password = $('#cfgPassword').value;
   if (mode === 'pin' && $('#cfgPin').value) body.pin_code = $('#cfgPin').value;
