@@ -4632,7 +4632,9 @@ def main():
     for name in ("stdout", "stderr"):
         if getattr(sys, name) is None:
             setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+    kasa_update.relaunch_if_inherited()
     kasa_update.cleanup_after_update()
+    net.ssl_context()           # сертифікати — у пам'ять, поки файл точно на місці
     # порт займаємо до довгої авторизації; повторний запуск лише відкриває вже запущену касу
     SERVER, PORT, busy = start_server()
     # 127.0.0.1, а не localhost: інакше браузер у Windows спершу пробує IPv6 і чекає кілька секунд

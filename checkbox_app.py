@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.4.1"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.4.2"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -197,12 +197,22 @@ class net:
 
     @classmethod
     def ssl_context(cls):
+        """
+        Сертифікати читаються в пам'ять одразу (каса викликає це при старті): у Kasa.exe файл certifi
+        лежить у тимчасовій папці _MEI…, і якщо вона зникне під час роботи, HTTPS не має ламатися
+        («[Errno 2] No such file or directory»). Немає файлу — беремо системні сертифікати Windows/Mac.
+        """
         if cls._ssl_context is None:
+            ctx = None
             try:
                 import certifi
-                cls._ssl_context = ssl.create_default_context(cafile=certifi.where())
+                with open(certifi.where(), encoding="ascii", errors="ignore") as f:
+                    ctx = ssl.create_default_context(cadata=f.read())
             except ImportError:
-                cls._ssl_context = ssl.create_default_context()
+                pass
+            except (OSError, ssl.SSLError, ValueError) as e:
+                log.warning("Сертифікати certifi недоступні (%s) — використовую системні", e)
+            cls._ssl_context = ctx or ssl.create_default_context()
         return cls._ssl_context
 
     class Session:

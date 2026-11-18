@@ -206,7 +206,7 @@ def restart_command():
 
 def spawn_restarted():
     """Запустити нову копію каси (після того, як стара звільнила порт)."""
-    env = dict(os.environ, CHECKBOX_NO_BROWSER="1", CHECKBOX_RESTARTED="1")
+    env = dict(os.environ, CHECKBOX_NO_BROWSER="1", CHECKBOX_RESTARTED="1", CHECKBOX_CLEAN_SPAWN="1")
     if getattr(sys, "frozen", False):
         # Без цього нова копія Kasa.exe (onefile) підхоплює тимчасову папку _MEI… старої,
         # і стара при виході не може її видалити: «Failed to remove temporary directory».
@@ -224,6 +224,20 @@ def spawn_restarted():
         kw["start_new_session"] = True
     subprocess.Popen(restart_command(), **kw)
     log.info("Каса перезапускається після оновлення")
+
+
+def relaunch_if_inherited():
+    """
+    Каси до 1.2.5 після оновлення запускали нову Kasa.exe зі своїми змінними PyInstaller, і вона
+    працювала з тимчасової папки _MEI… старої копії. Стара закривалась, папка зникала — і разом
+    з нею сертифікати: «Немає зв'язку … [Errno 2] No such file or directory» на кожному запиті.
+    Таку копію одразу перезапускаємо «начисто» (власна тимчасова папка), а самі виходимо.
+    """
+    clean = os.environ.pop("CHECKBOX_CLEAN_SPAWN", None) == "1"
+    if getattr(sys, "frozen", False) and os.environ.get("CHECKBOX_RESTARTED") == "1" and not clean:
+        log.warning("Каса запущена старим оновлювачем зі спільною тимчасовою папкою — перезапускаю начисто")
+        spawn_restarted()
+        sys.exit(0)
 
 
 def cleanup_after_update():
