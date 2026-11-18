@@ -2347,8 +2347,11 @@ PAGE = r"""<!DOCTYPE html>
         <datalist id="spSupplierList"></datalist>
         <label>№ накладної (необов'язково)<input type="text" id="spDoc" maxlength="60" autocomplete="off"></label>
       </div>
-      <input type="text" id="spScan" class="spscan" autocomplete="off" spellcheck="false"
-             placeholder="▦ Скануйте штрихкод (або код / назва і Enter)">
+      <div class="row" style="gap:8px;flex-wrap:nowrap;margin-top:12px">
+        <input type="text" id="spScan" class="spscan" autocomplete="off" spellcheck="false" style="margin-top:0"
+               placeholder="▦ Скануйте штрихкод (або код / назва і Enter)">
+        <button class="btn sec" id="spPickOpen" style="white-space:nowrap" title="Без сканера: обрати товари зі списку">📋 Зі списку</button>
+      </div>
       <div id="spHint" class="muted" style="min-height:18px;font-size:13px;margin-top:6px"></div>
       <table class="sptable" style="margin-top:6px">
         <thead><tr><th>Товар</th><th class="num">Залишок</th><th class="num">Кількість</th><th class="num">Собівартість, ₴</th><th class="num">Сума, ₴</th><th></th></tr></thead>
@@ -2613,6 +2616,21 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn ok" id="termOpenShift" style="grid-column:1/-1">Відкрити зміну і пробити чек</button>
     <button class="btn" id="termFiscalRetry" style="grid-column:1/-1">Пробити чек ще раз</button>
   </div>
+</div></div>
+<div class="modal" id="spPickModal"><div class="card wide">
+  <div class="row" style="justify-content:space-between">
+    <h3 style="margin:0">📋 Додати товари зі списку</h3>
+    <button class="x" id="spPickX" title="Готово">✕</button>
+  </div>
+  <p class="muted" style="margin:4px 0 10px;font-size:13px">Клацніть товар — він додасться в документ (повторний клік — ще +1 шт).
+    Кількість і собівартість потім можна змінити в таблиці.</p>
+  <input type="text" id="spPickQ" autocomplete="off" spellcheck="false" placeholder="🔍 Назва, код або штрихкод">
+  <div style="max-height:52vh;overflow:auto;margin-top:8px">
+    <table class="sptable"><thead><tr><th>Товар</th><th class="num">Залишок</th><th class="num">У документі</th></tr></thead>
+      <tbody id="spPickList"></tbody></table>
+  </div>
+  <div id="spPickMore" class="muted" style="font-size:12px;margin-top:6px"></div>
+  <div class="row" style="margin-top:12px;justify-content:flex-end"><button class="btn" id="spPickDone">Готово</button></div>
 </div></div>
 <div class="modal" id="scanNewModal"><div class="card wide">
   <div class="row" style="justify-content:space-between">
@@ -3704,6 +3722,43 @@ async function supplyBack(saved) {         // після картки новог
   supplyAdd(g, { focusQty: true });
   spHint(`Новий товар «${g.name}» додано в поставку — вкажіть кількість`, 'ok');
 }
+// без сканера: вибір товарів зі списку
+const SP_PICK_MAX = 200;
+function spPickRender() {
+  const q = $('#spPickQ').value.trim();
+  const list = goods.filter(g => !q || match(g, q))
+    .sort((a, b) => a.name.localeCompare(b.name, 'uk'));
+  const inDoc = new Map(supply.lines.map(l => [l.id, l.qty]));
+  $('#spPickList').innerHTML = list.slice(0, SP_PICK_MAX).map(g => {
+    const n = inDoc.get(g.id), w = g.is_weight;
+    return `<tr data-id="${esc(g.id)}" style="cursor:pointer" class="${n != null ? 'hot' : ''}">
+      <td>${esc(g.name)}<br><small class="muted">${esc(g.barcode || '')} · код ${esc(g.code.trim())}${w ? ' · ваговий' : ''}</small></td>
+      <td class="num"><small class="muted">${g.count != null ? qtyStr(g.count, w) : 'не ведеться'}</small></td>
+      <td class="num">${n != null ? (n ? qtyStr(n, w) : '✓') : ''}</td></tr>`;
+  }).join('') || `<tr><td colspan="3" class="muted">${q ? `«${esc(q)}» не знайдено` : 'Товарів ще немає'}</td></tr>`;
+  $('#spPickMore').textContent = list.length > SP_PICK_MAX ? `Показано ${SP_PICK_MAX} з ${list.length} — уточніть пошук` : '';
+}
+function spPickOpen() {
+  $('#spPickQ').value = ''; spPickRender();
+  $('#spPickModal').classList.add('show'); setTimeout(() => $('#spPickQ').focus(), 30);
+}
+function spPickClose() { $('#spPickModal').classList.remove('show'); $('#spScan').focus(); }
+$('#spPickOpen').onclick = spPickOpen;
+$('#spPickX').onclick = $('#spPickDone').onclick = spPickClose;
+$('#spPickQ').oninput = spPickRender;
+$('#spPickList').onclick = e => {
+  const tr = e.target.closest('tr[data-id]'); if (!tr) return;
+  const g = goods.find(x => x.id === tr.dataset.id); if (!g) return;
+  if (g.is_weight) { $('#spPickModal').classList.remove('show'); supplyAdd(g); return; }   // вагу вводять у таблиці
+  supplyAdd(g); spPickRender(); $('#spPickQ').focus();
+};
+$('#spPickModal').onkeydown = e => {
+  if (e.key === 'Escape') { e.preventDefault(); spPickClose(); }
+  if (e.key === 'Enter') {                                         // Enter — додати, якщо знайдено один товар
+    e.preventDefault(); const rows = $('#spPickList').querySelectorAll('tr[data-id]');
+    if (rows.length === 1) rows[0].click();
+  }
+};
 $('#spScan').onkeydown = e => { if (e.key !== 'Enter') return; e.preventDefault(); const v = $('#spScan').value; $('#spScan').value = ''; supplyScan(v); };
 $('#spSupplier').oninput = () => { supply.supplier = $('#spSupplier').value; saveSupply(); };
 $('#spDoc').oninput = () => { supply.doc = $('#spDoc').value; saveSupply(); };
