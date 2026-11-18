@@ -2661,8 +2661,8 @@ PAGE = r"""<!DOCTYPE html>
     <h3 style="margin:0">📋 Додати товари зі списку</h3>
     <button class="x" id="spPickX" title="Готово">✕</button>
   </div>
-  <p class="muted" style="margin:4px 0 10px;font-size:13px">Клацніть товар — він додасться в документ (повторний клік — ще +1 шт).
-    Кількість і собівартість потім можна змінити в таблиці.</p>
+  <p class="muted" style="margin:4px 0 10px;font-size:13px">Клацніть товар — він додасться в документ (повторний клік — ще +1 шт); для вагового
+    введіть вагу, кг, і Enter. Сортування — клік по заголовку колонки. Кількість і собівартість можна змінити в таблиці.</p>
   <input type="text" id="spPickQ" autocomplete="off" spellcheck="false" placeholder="🔍 Назва, код або штрихкод">
   <div style="max-height:52vh;overflow:auto;margin-top:8px">
     <table class="sptable"><thead id="spPickHead"><tr><th data-s="name" class="sortable">Товар</th><th data-s="count" class="num sortable">Залишок</th><th data-s="doc" class="num sortable">У документі</th></tr></thead>
@@ -3806,10 +3806,35 @@ function spPickClose() { $('#spPickModal').classList.remove('show'); $('#spScan'
 $('#spPickOpen').onclick = spPickOpen;
 $('#spPickX').onclick = $('#spPickDone').onclick = spPickClose;
 $('#spPickQ').oninput = spPickRender;
+const spPickDoc = () => typeof curDoc === 'function' ? curDoc() : supply;   // alpha: поставка або списання
+function spPickWeight(tr, g) {                                     // ваговий товар — вага прямо у вікні вибору
+  const td = tr.querySelector('td:last-child');
+  td.innerHTML = `<span class="row" style="gap:6px;justify-content:flex-end;flex-wrap:nowrap">
+    <input type="text" class="pickw" inputmode="decimal" placeholder="кг" style="width:84px;text-align:right">
+    <button class="btn small" data-wadd>Додати</button></span>`;
+  const inp = td.querySelector('input'); inp.focus();
+  const add = () => {
+    const q = spParse(inp.value, true);
+    if (q == null || isNaN(q) || q <= 0) { toast('Вкажіть вагу, кг — напр. 0.75', true); return inp.focus(); }
+    const doc = spPickDoc(), prev = (doc.lines.find(x => x.id === g.id) || {}).qty || 0;
+    supplyAdd(g);                                                   // рядок у документі (або вгору наявний)
+    const l = doc.lines.find(x => x.id === g.id); if (!l) return;
+    l.qty = prev + q;
+    saveSupply(); renderSupply(g.id);
+    spHint(`${g.name}: +${qtyIn(q, true)} кг — разом ${qtyIn(l.qty, true)} кг`, 'ok');
+    spPickRender(); $('#spPickQ').focus();
+  };
+  inp.onkeydown = e => {
+    if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); add(); }
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); spPickRender(); $('#spPickQ').focus(); }
+  };
+  td.querySelector('[data-wadd]').onclick = ev => { ev.stopPropagation(); add(); };
+  inp.onclick = ev => ev.stopPropagation();
+}
 $('#spPickList').onclick = e => {
   const tr = e.target.closest('tr[data-id]'); if (!tr) return;
   const g = goods.find(x => x.id === tr.dataset.id); if (!g) return;
-  if (g.is_weight) { $('#spPickModal').classList.remove('show'); supplyAdd(g); return; }   // вагу вводять у таблиці
+  if (g.is_weight) return spPickWeight(tr, g);
   supplyAdd(g); spPickRender(); $('#spPickQ').focus();
 };
 $('#spPickModal').onkeydown = e => {
