@@ -1584,6 +1584,17 @@ PAGE = r"""<!DOCTYPE html>
   .seg label { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 9px; cursor: pointer; font-weight: 600; }
   .seg input { display: none; }
   .seg label:has(input:checked) { background: var(--accent-btn); color: #fff; }
+  .optlist { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; max-height: 260px; overflow-y: auto; }
+  .optlist .opt { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border: 0; border-bottom: 1px solid var(--line);
+                  background: var(--surface); color: var(--text); font: inherit; font-size: 14px; text-align: left; cursor: pointer; }
+  .optlist .opt:last-child { border-bottom: 0; }
+  .optlist .opt:hover { background: var(--hover); }
+  .optlist .opt .dot { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--line); flex-shrink: 0; }
+  .optlist .opt.on { background: var(--hover); font-weight: 600; }
+  .optlist .opt.on .dot { border-color: var(--accent); background: radial-gradient(var(--accent) 0 45%, transparent 50%); }
+  .optlist .opt .nm { flex: 1; }
+  .optlist .opt .del { color: var(--muted); padding: 0 4px; border-radius: 4px; }
+  .optlist .opt .del:hover { color: var(--bad); }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .chip { border: 1px solid var(--line); background: var(--surface); border-radius: 999px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer; }
   .chip:hover { border-color: var(--accent); color: var(--accent); }
@@ -2091,8 +2102,8 @@ PAGE = r"""<!DOCTYPE html>
     <label><input type="radio" name="otherType" value="CASH"> Готівка</label>
   </div>
   <p class="muted" style="margin:14px 0 6px">Назва оплати в чеку:</p>
-  <input type="text" id="otherLabel" maxlength="100" placeholder="Напр. Сертифікат, Бонуси, Переказ на рахунок">
-  <div class="chips" id="otherChips"></div>
+  <div class="optlist" id="otherChips" role="listbox"></div>
+  <input type="text" id="otherLabel" maxlength="100" placeholder="Або введіть свою назву…" style="margin-top:8px">
   <div class="pay" style="margin-top:16px">
     <button class="btn sec" id="otherCancel">Скасувати</button>
     <button class="btn other" id="otherSubmit">Пробити чек</button>
@@ -3232,18 +3243,37 @@ $('#scanModal').onclick = e => { if (e.target.id === 'scanModal' || e.target.clo
 
 // --- інша оплата ---
 const LABELS_KEY = 'checkbox_payment_labels';
-const DEFAULT_LABELS = ['Сертифікат', 'Бонуси', 'Переказ на рахунок'];
+const DEFAULT_LABELS = ['Сертифікат', 'Бонуси', 'Переказ на рахунок', 'Інтернет Банкінг', 'Інтернет Еквайринг'];
+const ADDED_LABELS = { 'v1.4.6.10': ['Інтернет Банкінг', 'Інтернет Еквайринг'] };   // нові варіанти — і в уже збережені списки
 function loadLabels() {
-  try { const v = JSON.parse(localStorage.getItem(LABELS_KEY)); if (Array.isArray(v)) return v; } catch (e) {}
-  return DEFAULT_LABELS.slice();
+  let list = null;
+  try { const v = JSON.parse(localStorage.getItem(LABELS_KEY)); if (Array.isArray(v)) list = v; } catch (e) {}
+  if (!list) return DEFAULT_LABELS.slice();
+  let done = [];
+  try { done = JSON.parse(localStorage.getItem(LABELS_KEY + '_added')) || []; } catch (e) {}
+  const todo = Object.keys(ADDED_LABELS).filter(k => !done.includes(k));
+  if (todo.length) {
+    todo.forEach(k => ADDED_LABELS[k].forEach(l => { if (!list.some(x => x.toLowerCase() === l.toLowerCase())) list.push(l); }));
+    saveLabels(list);
+    try { localStorage.setItem(LABELS_KEY + '_added', JSON.stringify(done.concat(todo))); } catch (e) {}
+  }
+  return list;
 }
-function saveLabels(list) { try { localStorage.setItem(LABELS_KEY, JSON.stringify(list.slice(0, 12))); } catch (e) {} }
+function saveLabels(list) { try { localStorage.setItem(LABELS_KEY, JSON.stringify(list.slice(0, 20))); } catch (e) {} }
 const otherType = () => document.querySelector('input[name="otherType"]:checked').value;
 function renderOther() {
   const sum = otherType() === 'CASH' ? roundCash(cartTotal, roundingMode) : cartTotal;
   $('#otherSum').textContent = uah(sum) + ' ₴';
-  $('#otherChips').innerHTML = loadLabels().map((l, i) =>
-    `<button class="chip" data-label="${esc(l)}">${esc(l)}<span class="del" data-del="${i}" title="Прибрати">✕</span></button>`).join('');
+  renderOtherList();
+}
+function renderOtherList() {
+  const cur = $('#otherLabel').value.trim().toLowerCase();
+  const list = loadLabels();
+  $('#otherChips').innerHTML = list.map((l, i) =>
+    `<button type="button" class="opt${l.toLowerCase() === cur ? ' on' : ''}" role="option" data-label="${esc(l)}">
+       <span class="dot"></span><span class="nm">${esc(l)}</span><span class="del" data-del="${i}" title="Прибрати зі списку">✕</span></button>`).join('')
+    || '<div class="muted" style="padding:9px 12px">Список порожній — введіть назву нижче</div>';
+  $('#otherChips').style.display = '';
 }
 function openOther() {
   if (!cart.length) return toast('Кошик порожній', true);
@@ -3255,9 +3285,16 @@ function closeOther() { $('#otherModal').classList.remove('show'); }
 document.querySelectorAll('input[name="otherType"]').forEach(r => r.onchange = renderOther);
 $('#otherChips').onclick = e => {
   const d = e.target.dataset.del;
-  if (d !== undefined) { e.stopPropagation(); const l = loadLabels(); l.splice(+d, 1); saveLabels(l); return renderOther(); }
-  const chip = e.target.closest('.chip'); if (chip) { $('#otherLabel').value = chip.dataset.label; $('#otherLabel').focus(); }
+  if (d !== undefined) { e.stopPropagation(); const l = loadLabels(); l.splice(+d, 1); saveLabels(l); return renderOtherList(); }
+  const opt = e.target.closest('.opt');
+  if (opt) {
+    $('#otherLabel').value = opt.dataset.label;
+    $('#otherChips').querySelectorAll('.opt').forEach(o => o.classList.toggle('on', o === opt));
+    $('#otherLabel').focus();
+  }
 };
+$('#otherChips').ondblclick = e => { if (e.target.closest('.opt') && !e.target.dataset.del) $('#otherSubmit').click(); };
+$('#otherLabel').oninput = renderOtherList;
 $('#payOther').onclick = openOther;
 $('#otherClose').onclick = closeOther; $('#otherCancel').onclick = closeOther;
 $('#otherModal').onclick = e => { if (e.target.id === 'otherModal') closeOther(); };
@@ -3270,7 +3307,18 @@ $('#otherSubmit').onclick = async () => {
   closeOther();
   await pay(type, $('#payOther'), null, label);
 };
-$('#otherLabel').onkeydown = e => { if (e.key === 'Enter') $('#otherSubmit').click(); if (e.key === 'Escape') closeOther(); };
+$('#otherLabel').onkeydown = e => {
+  if (e.key === 'Enter') $('#otherSubmit').click();
+  if (e.key === 'Escape') closeOther();
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {      // стрілками — по списку
+    e.preventDefault();
+    const list = loadLabels(); if (!list.length) return;
+    const cur = list.findIndex(l => l.toLowerCase() === $('#otherLabel').value.trim().toLowerCase());
+    const next = cur < 0 ? (e.key === 'ArrowDown' ? 0 : list.length - 1) : (cur + (e.key === 'ArrowDown' ? 1 : -1) + list.length) % list.length;
+    $('#otherLabel').value = list[next]; renderOtherList();
+    const el = $('#otherChips').querySelectorAll('.opt')[next]; if (el) el.scrollIntoView({ block: 'nearest' });
+  }
+};
 
 // --- акцизні марки ---
 let exciseIdx = null;
