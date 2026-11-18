@@ -1475,6 +1475,35 @@ PAGE = r"""<!DOCTYPE html>
   tr.grouprow td { background: var(--subtle); font-weight: 700; font-size: 13px; color: var(--muted); cursor: default; }
   tr.grouprow td small { font-weight: 400; }
   .ghead { cursor: pointer; user-select: none; } .ghead:hover { color: var(--text); }
+  /* плитки: папки-групи і товари */
+  .viewbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 10px; min-height: 30px; }
+  .viewbar .crumbs { font-size: 14px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+  .viewbar .crumbs a { color: var(--accent); cursor: pointer; text-decoration: none; padding: 2px 4px; border-radius: 4px; }
+  .viewbar .crumbs a:hover { background: var(--hover); }
+  .viewbar .crumbs b { color: var(--text); padding: 2px 4px; }
+  .viewsw { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; flex-shrink: 0; }
+  .viewsw button { border: 0; background: var(--surface); color: var(--muted); padding: 5px 10px; cursor: pointer; font: inherit; font-size: 13px; }
+  .viewsw button.on { background: var(--accent-btn); color: #fff; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(142px, 1fr)); gap: 10px; margin-top: 10px; }
+  .tile { position: relative; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 4px;
+          padding: 12px 8px 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); cursor: pointer;
+          transition: transform .08s, border-color .12s, box-shadow .12s; min-height: 132px; }
+  .tile:hover { border-color: var(--accent); box-shadow: 0 4px 14px rgba(37, 99, 235, .14); transform: translateY(-1px); }
+  .tile:active { transform: translateY(0); }
+  .tile .ico { width: 44px; height: 44px; display: block; }
+  .tile .tn { font-weight: 600; font-size: 13px; line-height: 1.25; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+  .tile .tp { font-weight: 700; font-size: 14px; margin-top: auto; }
+  .tile .ts { font-size: 11px; color: var(--muted); }
+  .tile .ts.zero { color: var(--bad); }
+  .tile .tg { font-size: 11px; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; }
+  .tile.folder { background: var(--subtle); }
+  .tile.folder .tn { font-size: 14px; }
+  .tile.up { border-style: dashed; background: transparent; }
+  .tile .dot { position: absolute; top: 8px; right: 8px; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
+  .tile .dot.err { background: var(--bad); }
+  .tile .incart { position: absolute; top: 6px; left: 6px; min-width: 22px; height: 22px; padding: 0 6px; border-radius: 11px; background: var(--ok-btn); color: #fff; font-size: 12px; font-weight: 700; line-height: 22px; }
+  .tile.off { opacity: .55; }
+  .tilesbox { max-height: 62vh; overflow: auto; padding: 2px; }
   .ghead.sub { text-transform: none; letter-spacing: 0; font-size: 13px; border-bottom-style: dashed; margin-top: 6px; }
   .grow-sub td { font-weight: 600 !important; }
   tr.grouprow td { cursor: pointer; user-select: none; } tr.grouprow:hover td { color: var(--text); }
@@ -1549,8 +1578,11 @@ PAGE = r"""<!DOCTYPE html>
           <input type="text" id="search" placeholder="Штрихкод, код або назва — Enter додає в кошик" autofocus>
           <button class="btn" id="scanBtn" style="white-space:nowrap" title="Сканувати товари один за одним, потім одразу оплата (F2)">▦ Сканувати підряд</button>
         </div>
+        <div class="viewbar"><div class="crumbs" id="posCrumbs"></div>
+          <div class="viewsw" id="posView"><button data-v="tiles" title="Плитками: групи — папки">▦ Плитки</button><button data-v="list" title="Списком: дерево груп">☰ Список</button></div></div>
         <div class="groupbar" id="posGroups"></div>
         <div class="results" id="results"></div>
+        <div class="tilesbox" id="posTiles"><div class="tiles" id="posTilesGrid"></div></div>
       </div>
       <div class="card">
         <h3 style="margin-top:0">Кошик</h3>
@@ -1600,7 +1632,10 @@ PAGE = r"""<!DOCTYPE html>
         <button class="btn" id="goodAddBtn" style="white-space:nowrap">+ Додати товар</button>
       </div>
       <p class="muted" style="font-size:12px;margin:6px 0 0">Клікніть товар, щоб змінити його. Зміни одразу діють у касі, а в Checkbox ідуть під час синхронізації (⟳, відкриття або закриття зміни).</p>
-      <table style="margin-top:12px" class="goods-edit">
+      <div class="viewbar"><div class="crumbs" id="gdCrumbs"></div>
+        <div class="viewsw" id="gdView"><button data-v="tiles">▦ Плитки</button><button data-v="list">☰ Таблиця</button></div></div>
+      <div class="tiles" id="gdTiles"></div>
+      <table style="margin-top:12px" class="goods-edit" id="gdTable">
         <thead><tr><th>Назва</th><th>Код</th><th>Штрихкод</th><th>УКТЗЕД</th><th>Податок</th><th class="num">Ціна, ₴</th><th class="num">Залишок</th></tr></thead>
         <tbody id="goodsTable"></tbody>
       </table>
@@ -2306,6 +2341,21 @@ function groupTree(list, rootId, open, head, item) {
   return html;
 }
 function renderSearch() {
+  const tiles = posViewMode === 'tiles' && groupList.length;
+  setViewButtons($('#posView'), tiles ? 'tiles' : 'list');
+  $('#posView').style.display = groupList.length ? '' : 'none';
+  $('#results').style.display = tiles ? 'none' : '';
+  $('#posTiles').style.display = tiles ? '' : 'none';
+  $('#posGroups').style.display = tiles ? 'none' : '';
+  if (tiles) {
+    const q = $('#search').value;
+    $('#posCrumbs').innerHTML = q.trim() ? '<span>🔎 Пошук по всіх групах</span>' : crumbsHtml(posGroup, 'Усі товари');
+    const inCart = g => { const c = cart.find(x => x.id === g.id); return c ? qtyStr(c.qty, g.is_weight).replace(/ (шт|кг)$/, '') : 0; };
+    $('#posTilesGrid').innerHTML = tilesHtml(posGroup, q, { cartQty: inCart })
+      || '<p class="muted">Нічого не знайдено. Можливо, потрібна синхронізація.</p>';
+    return;
+  }
+  $('#posCrumbs').innerHTML = '';
   renderPosGroups();
   const q = $('#search').value, searching = !!q.trim();
   // пошук — по всіх товарах; без пошуку — товари обраної групи з підгрупами, деревом
@@ -2329,6 +2379,18 @@ function pendingBadge(g) {
     : ' <span class="pend" title="Зміни ще не відправлені в Checkbox">● змінено локально</span>';
 }
 function renderGoodsTable() {
+  const tiles = gdViewMode === 'tiles' && groupList.length;
+  setViewButtons($('#gdView'), tiles ? 'tiles' : 'list');
+  $('#gdView').style.display = groupList.length ? '' : 'none';
+  $('#gdTiles').style.display = tiles ? '' : 'none';
+  $('#gdTable').style.display = tiles ? 'none' : '';
+  $('#goodsGroup').style.display = tiles || !groupList.length ? 'none' : '';
+  if (tiles) {
+    if (gdFolder && gdFolder !== NO_GROUP && !groupById[gdFolder]) gdFolder = null;
+    const q = $('#goodsFilter').value;
+    $('#gdCrumbs').innerHTML = q.trim() ? '<span>🔎 Фільтр по всіх групах</span>' : crumbsHtml(gdFolder, 'Усі товари');
+    $('#gdTiles').innerHTML = tilesHtml(gdFolder, q, { showEmpty: true }) || '<p class="muted">Нічого не знайдено</p>';
+  } else $('#gdCrumbs').innerHTML = '';
   const gsel = $('#goodsGroup').value;
   const list = sortByGroup(goods.filter(g => match(g, $('#goodsFilter').value) && inGroup(g, gsel || null)));
   $('#stCount').textContent = goods.length;
@@ -2352,6 +2414,77 @@ function renderGoodsTable() {
 $('#goodsGroup').onchange = renderGoodsTable;
 $('#search').oninput = renderSearch;
 $('#goodsFilter').oninput = renderGoodsTable;
+
+// --- плитки: групи — папки, товари — картки ---
+const ICON_FOLDER = '<svg class="ico" viewBox="0 0 48 48" aria-hidden="true"><path d="M5 13a4 4 0 0 1 4-4h10l4 5h16a4 4 0 0 1 4 4v19a4 4 0 0 1-4 4H9a4 4 0 0 1-4-4z" fill="#f5b740"/><path d="M5 19h38v18a4 4 0 0 1-4 4H9a4 4 0 0 1-4-4z" fill="#fcd36b"/></svg>';
+const ICON_UP = '<svg class="ico" viewBox="0 0 48 48" aria-hidden="true"><path d="M24 12 12 24h8v12h8V24h8z" fill="currentColor" opacity=".55"/></svg>';
+function goodIcon(g) {
+  const c = isExciseGood(g) ? '#e5484d' : g.is_weight ? '#16a34a' : '#3b82f6';
+  if (g.is_weight)   // ваги
+    return `<svg class="ico" viewBox="0 0 48 48" aria-hidden="true"><path d="M24 8v6M10 18h28" stroke="${c}" stroke-width="3" stroke-linecap="round"/><path d="M10 18 5 30a5 5 0 0 0 10 0zM38 18l-5 12a5 5 0 0 0 10 0z" fill="${c}" opacity=".85"/><rect x="18" y="36" width="12" height="4" rx="2" fill="${c}"/><path d="M24 14v22" stroke="${c}" stroke-width="3"/></svg>`;
+  return `<svg class="ico" viewBox="0 0 48 48" aria-hidden="true"><path d="M24 5 41 14v20L24 43 7 34V14z" fill="${c}" opacity=".18"/><path d="M24 5 41 14 24 23 7 14z" fill="${c}" opacity=".55"/><path d="M24 23v20L7 34V14z" fill="${c}" opacity=".75"/><path d="M24 23v20l17-9V14z" fill="${c}"/></svg>`;
+}
+function plural(n, one, few, many) {
+  const m10 = n % 10, m100 = n % 100;
+  return `${n} ${m10 === 1 && m100 !== 11 ? one : m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14) ? few : many}`;
+}
+function folderStats(id) {      // товарів у групі з підгрупами; кількість підгруп з товарами
+  const n = goods.filter(g => inGroup(g, id)).length;
+  const subs = (groupChildren[id] || []).filter(c => goods.some(g => inGroup(g, c.id))).length;
+  return { n, subs };
+}
+function crumbsHtml(cur, rootLabel) {
+  const chain = [];
+  for (let x = cur && cur !== NO_GROUP ? cur : null; x && groupById[x]; x = groupById[x].parent_id) chain.unshift(groupById[x]);
+  const parts = [cur ? `<a data-fold="">🏠 ${esc(rootLabel)}</a>` : `<b>🏠 ${esc(rootLabel)}</b>`];
+  chain.forEach((g, i) => parts.push(i === chain.length - 1 ? `<b>${esc(g.path[g.path.length - 1])}</b>` : `<a data-fold="${esc(g.id)}">${esc(g.path[g.path.length - 1])}</a>`));
+  return parts.join('<span>›</span>');
+}
+// Плитки поточної папки cur (null — верхній рівень): «вгору», підгрупи, товари; при пошуку — знайдені товари
+function tilesHtml(cur, q, opts) {
+  const searching = !!q.trim();
+  const tileGood = g => {
+    const inCart = opts.cartQty ? opts.cartQty(g) : 0, dot = g.pending ? `<span class="dot${g.pending_error ? ' err' : ''}" title="${g.pending_error ? 'Не відправлено в Checkbox' : 'Змінено локально'}"></span>` : '';
+    return `<div class="tile${g.count === 0 && useLeftovers ? ' off' : ''}" data-good="${esc(g.id)}" title="${esc(g.name)}\n${esc(g.barcode || g.code)}">
+      ${inCart ? `<span class="incart">${esc(inCart)}</span>` : ''}${dot}${goodIcon(g)}
+      <span class="tn">${esc(g.name)}</span>
+      ${searching && g.group_path && g.group_path.length ? `<span class="tg">📁 ${esc(g.group_path.join(' / '))}</span>` : ''}
+      <span class="tp">${uah(g.price)} ₴</span><span class="ts ${g.count === 0 ? 'zero' : ''}">${g.count != null ? qtyStr(g.count, g.is_weight) : (g.is_weight ? 'кг' : 'шт')}</span></div>`;
+  };
+  if (searching) return goods.filter(g => match(g, q)).sort(byName).slice(0, 200).map(tileGood).join('');
+  let html = '';
+  if (cur) {
+    const up = cur === NO_GROUP ? '' : (groupById[cur] && groupById[cur].parent_id) || '';
+    html += `<div class="tile up" data-fold="${esc(up)}">${ICON_UP}<span class="tn">Назад</span></div>`;
+  }
+  if (cur !== NO_GROUP) {
+    html += (groupChildren[cur || ''] || []).slice().sort(byName).map(c => {
+      const st = folderStats(c.id);
+      if (!st.n && !opts.showEmpty) return '';
+      return `<div class="tile folder" data-fold="${esc(c.id)}" title="${esc(c.path.join(' / '))}">${ICON_FOLDER}
+        <span class="tn">${esc(c.path[c.path.length - 1])}</span>
+        <span class="ts">${plural(st.n, 'товар', 'товари', 'товарів')}${st.subs ? ' · ' + plural(st.subs, 'підгрупа', 'підгрупи', 'підгруп') : ''}</span></div>`;
+    }).join('');
+  }
+  const own = goods.filter(g => cur === NO_GROUP || !cur ? (!g.group_id || !groupById[g.group_id]) : g.group_id === cur);
+  return html + own.sort(byName).map(tileGood).join('');
+}
+function loadView(key) { try { return localStorage.getItem(key) || 'tiles'; } catch (e) { return 'tiles'; } }
+function saveView(key, v) { try { localStorage.setItem(key, v); } catch (e) {} }
+let posViewMode = loadView('kasa_pos_view'), gdViewMode = loadView('kasa_goods_view'), gdFolder = null;
+function setViewButtons(box, mode) { box.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.v === mode)); }
+$('#posView').onclick = e => { const b = e.target.closest('button'); if (!b) return; posViewMode = b.dataset.v; saveView('kasa_pos_view', posViewMode); renderSearch(); $('#search').focus(); };
+$('#gdView').onclick = e => { const b = e.target.closest('button'); if (!b) return; gdViewMode = b.dataset.v; saveView('kasa_goods_view', gdViewMode); renderGoodsTable(); };
+$('#posCrumbs').onclick = e => { const a = e.target.closest('[data-fold]'); if (!a) return; posGroup = a.dataset.fold || null; renderSearch(); $('#search').focus(); };
+$('#gdCrumbs').onclick = e => { const a = e.target.closest('[data-fold]'); if (!a) return; gdFolder = a.dataset.fold || null; renderGoodsTable(); };
+$('#posTilesGrid').onclick = e => {
+  const f = e.target.closest('[data-fold]'); if (f) { posGroup = f.dataset.fold || null; renderSearch(); $('#posTiles').scrollTop = 0; $('#search').focus(); return; }
+  const t = e.target.closest('[data-good]'); if (t) { addToCart(t.dataset.good); renderSearch(); }
+};
+$('#gdTiles').onclick = e => {
+  const f = e.target.closest('[data-fold]'); if (f) { gdFolder = f.dataset.fold || null; return renderGoodsTable(); }
+  const t = e.target.closest('[data-good]'); if (t) openGood(goods.find(g => g.id === t.dataset.good));
+};
 
 // --- дерево груп і їх редагування (одразу в Checkbox) ---
 function subtreeCount(id) { return goods.filter(g => inGroup(g, id)).length; }
