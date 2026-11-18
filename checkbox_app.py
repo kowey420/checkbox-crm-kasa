@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.7.1.1"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.7.2.0"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -982,6 +982,10 @@ class LocalDB:
             status TEXT,                    -- OPEN | PAID | RETURNED
             receipts TEXT,                  -- JSON: [{id, kind, value, payment_type, fiscal_code, at}]
             updated_at TEXT)""")
+        # Облік закупівлі: собівартість і постачальник товару — лише в касі (у Checkbox таких полів немає).
+        # За кодом товару: переживає синхронізації, що перезаписують таблицю goods.
+        self.con.execute("""CREATE TABLE IF NOT EXISTS goods_extra (
+            code TEXT PRIMARY KEY, cost INTEGER, supplier TEXT, updated_at TEXT)""")
         # Відповіді відкритих баз штрихкодів (Open Food Facts тощо): щоб не питати те саме двічі
         self.con.execute("""CREATE TABLE IF NOT EXISTS barcode_cache (
             code TEXT PRIMARY KEY, found INTEGER, data TEXT, at TEXT)""")
@@ -1241,6 +1245,28 @@ class LocalDB:
                  receipt_type, related_id))
             self._excise_apply(receipt_type, receipt, items, datetime.now().isoformat(timespec="milliseconds"), commit=False)
         self.set_receipt_shift(receipt)
+
+    # --- собівартість і постачальник ---
+    def extras(self):
+        return {r["code"]: dict(r) for r in self.con.execute("SELECT * FROM goods_extra")}
+
+    def set_extra(self, code, cost, supplier):
+        code = (code or "").strip()
+        with self.con:
+            if cost is None and not supplier:
+                self.con.execute("DELETE FROM goods_extra WHERE code=?", (code,))
+            else:
+                self.con.execute("INSERT OR REPLACE INTO goods_extra VALUES (?,?,?,?)",
+                                 (code, cost, supplier or None, datetime.now().isoformat(timespec="seconds")))
+
+    def move_extra(self, old_code, new_code):
+        with self.con:
+            self.con.execute("UPDATE OR REPLACE goods_extra SET code=? WHERE code=?", (new_code.strip(), old_code.strip()))
+
+    def suppliers(self):
+        return [r[0] for r in self.con.execute(
+            "SELECT supplier FROM goods_extra WHERE supplier IS NOT NULL AND supplier<>'' "
+            "GROUP BY supplier ORDER BY COUNT(*) DESC, supplier")]
 
     # --- Z-звіти ---
     def add_z_report(self, r, shift_serial=None, source="checkbox"):

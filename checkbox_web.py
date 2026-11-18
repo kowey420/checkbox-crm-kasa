@@ -417,6 +417,17 @@ class App:
             if gid and not self.db.con.execute("SELECT 1 FROM goods_groups WHERE id=?", (gid,)).fetchone():
                 errors.append("групу не знайдено — синхронізуйте товари")
             good["group_id"] = gid
+        # собівартість (₴ → копійки) і постачальник — лише в касі
+        cost, supplier = None, None
+        extra_given = "cost" in body or "supplier" in body
+        if extra_given:
+            raw = str(body.get("cost") if body.get("cost") is not None else "").strip().replace(",", ".").replace(" ", "")
+            if raw:
+                if not re.match(r"^\d+(\.\d{1,2})?$", raw):
+                    errors.append("невірна собівартість — напр. 18.50")
+                else:
+                    cost = int(round(float(raw) * 100))
+            supplier = " ".join(str(body.get("supplier") or "").split())[:120] or None
         if errors:
             raise UserError("; ".join(errors))
         good["stock"] = stock
@@ -429,11 +440,23 @@ class App:
                 changes.append(f"залишок → {stock / 1000:g}" if stock is not None else "залишок — як у Checkbox")
             if "group_id" in good and good["group_id"] != existing["group_id"]:
                 changes.append("група → " + (good["group_id"] or "без групи"))
+            old_x = self.db.extras().get((existing["code"] or "").strip()) or {}
+            extra_changed = extra_given and (cost != old_x.get("cost") or (supplier or None) != (old_x.get("supplier") or None))
+            if extra_changed:
+                self.db.set_extra(existing["code"], cost, supplier)
+                log.info("Товар %s: собівартість %s, постачальник %s (лише в касі)", good["code"] or existing["code"],
+                         f"{cost / 100:.2f}" if cost is not None else "—", supplier or "—")
             if not changes:
+                if extra_changed:
+                    return {"saved": True, "local_only": True, "pending": self.db.pending_count()}
                 return {"unchanged": True, "pending": self.db.pending_count()}
             log.info("Локальна правка товару %s: %s", good["code"], "; ".join(changes))
         else:
             log.info("Новий товар (локально) %s «%s»", good["code"], good["name"])
+            if extra_given:
+                self.db.set_extra(good["code"], cost, supplier)
+        if code_changed and pending_new:              # новий товар змінив код — собівартість переїжджає з ним
+            self.db.move_extra(existing["code"], good["code"])
         # лише локально: у Checkbox піде під час синхронізації (кнопка, відкриття/закриття зміни)
         self.db.put_pending(good, existing)
         if existing is not None and stock is None and prev_stock is not None:
@@ -547,8 +570,11 @@ class App:
             goods.append(g)
         groups = self.db.groups()
         paths = {g["id"]: g["path"] for g in groups}
+        extras = self.db.extras()
         for g in goods:
             g["group_path"] = paths.get(g.get("group_id")) or []
+            x = extras.get((g["code"] or "").strip()) or {}
+            g["cost"], g["supplier"] = x.get("cost"), x.get("supplier") or ""
         return {
             "goods": goods,
             "groups": groups,
@@ -559,6 +585,7 @@ class App:
             "cash_rounding": self.rounding_mode(),
             "pending": self.db.pending_count(),
             "images": images_index(),
+            "suppliers": self.db.suppliers(),
             "excise_total": self.db.con.execute("SELECT COUNT(*) FROM excise_marks").fetchone()[0],
         }
 
@@ -1928,6 +1955,9 @@ PAGE = r"""<!DOCTYPE html>
              border: 1px solid rgba(217, 119, 6, .45); background: rgba(245, 158, 11, .12); color: var(--text); }
   .btn.zbtn { padding: 3px 10px; font-size: 12px; line-height: 1.4; margin-left: 8px; vertical-align: middle; white-space: nowrap; }
   td .btn.zbtn { margin-left: 0; }
+  .form .margin { grid-column: 1 / -1; font-size: 12px; color: var(--muted); margin-top: -4px; min-height: 16px; }
+  .form .margin b { color: var(--text); }
+  .form .margin .neg { color: var(--bad); }
   .codebox { display: flex; gap: 6px; } .codebox input { flex: 1; min-width: 0; }
   .optlist { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; max-height: 260px; overflow-y: auto; }
   .optlist .opt { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border: 0; border-bottom: 1px solid var(--line);
@@ -2167,7 +2197,7 @@ PAGE = r"""<!DOCTYPE html>
         <div class="viewsw" id="gdView"><button data-v="tiles">▦ Плитки</button><button data-v="list">☰ Таблиця</button></div></div>
       <div class="tiles" id="gdTiles"></div>
       <table style="margin-top:12px" class="goods-edit" id="gdTable">
-        <thead><tr><th>Назва</th><th>Код</th><th>Штрихкод</th><th>УКТЗЕД</th><th>Податок</th><th class="num">Ціна, ₴</th><th class="num">Залишок</th></tr></thead>
+        <thead><tr><th>Назва</th><th>Код</th><th>Штрихкод</th><th>УКТЗЕД</th><th>Податок</th><th class="num">Ціна, ₴</th><th class="num">Собів., ₴</th><th>Постачальник</th><th class="num">Залишок</th></tr></thead>
         <tbody id="goodsTable"></tbody>
       </table>
     </div>
@@ -2469,6 +2499,10 @@ PAGE = r"""<!DOCTYPE html>
     <label>Ціна, ₴<input type="text" id="gPrice" inputmode="decimal" placeholder="0.00"></label>
     <label>Штрихкод<input type="text" id="gBarcode" inputmode="numeric" spellcheck="false"></label>
     <label>УКТЗЕД<input type="text" id="gUktzed" placeholder="2202 10 00 00" spellcheck="false"></label>
+    <label>Собівартість, ₴<input type="text" id="gCost" inputmode="decimal" placeholder="0.00"></label>
+    <label>Постачальник<input type="text" id="gSupplier" list="gSupplierList" maxlength="120" autocomplete="off"></label>
+    <datalist id="gSupplierList"></datalist>
+    <div class="wide margin" id="gMargin"></div>
     <label class="wide" id="gGroupWrap">Група<select id="gGroup"></select></label>
     <label class="wide chk"><input type="checkbox" id="gWeight"> Ваговий товар (продається в кілограмах)</label>
   </div>
@@ -2864,7 +2898,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
 // --- товари ---
 async function loadGoods() {
   const d = await api('/api/goods');
-  goods = d.goods; images = d.images || {}; window.exciseTotal = d.excise_total; useLeftovers = !!d.use_leftovers; roundingMode = d.cash_rounding; taxes = d.taxes || [];
+  goods = d.goods; images = d.images || {}; window.suppliers = d.suppliers || []; window.exciseTotal = d.excise_total; useLeftovers = !!d.use_leftovers; roundingMode = d.cash_rounding; taxes = d.taxes || [];
   setGroups(d.groups || []);
   renderPending(d.pending);
   renderTaxes(d.taxes_source);
@@ -2873,7 +2907,8 @@ async function loadGoods() {
 }
 const match = (g, q) => {
   q = q.trim().toLowerCase();
-  return !q || g.name.toLowerCase().includes(q) || g.code.trim().toLowerCase().includes(q) || (g.barcode || '').includes(q);
+  return !q || g.name.toLowerCase().includes(q) || g.code.trim().toLowerCase().includes(q) || (g.barcode || '').includes(q)
+    || (g.supplier || '').toLowerCase().includes(q);
 };
 // --- групи й підгрупи ---
 function setGroups(list) {
@@ -3022,16 +3057,18 @@ function renderGoodsTable() {
   });
   const filtering = !!$('#goodsFilter').value.trim() || !!quick;
   const ind = d => d ? ` style="padding-left:${12 + d * 18}px"` : '';
-  const head = (id, name, depth, n, shut) => `<tr class="grouprow${depth ? ' grow-sub' : ''}" data-gkey="${esc(id)}"><td colspan="7"${ind(depth)}>` +
+  const head = (id, name, depth, n, shut) => `<tr class="grouprow${depth ? ' grow-sub' : ''}" data-gkey="${esc(id)}"><td colspan="9"${ind(depth)}>` +
     `<span class="tw">${shut ? '▸' : '▾'}</span>${esc(name)} <small>· ${n}</small></td></tr>`;
   const item = (g, depth) => `
     <tr data-id="${esc(g.id)}"><td${ind(depth)}>${esc(g.name)}${pendingBadge(g)}</td>
       <td>${g.code !== g.code.trim() ? '<span class="zero" title="Код містить пробіли">⚠ </span>' : ''}${esc(g.code)}</td>
       <td>${esc(g.barcode)}</td><td>${esc(g.uktzed)}</td><td>${taxBadges(g.tax_codes)}</td>
       <td class="num">${uah(g.price)}</td>
+      <td class="num ${g.cost != null && g.cost > g.price ? 'zero' : ''}" title="${g.cost != null && g.cost > 0 ? `націнка ${((g.price - g.cost) / g.cost * 100).toFixed(1)}%` : ''}">${g.cost != null ? uah(g.cost) : '<span class="muted">—</span>'}</td>
+      <td>${g.supplier ? esc(g.supplier) : '<span class="muted">—</span>'}</td>
       <td class="num ${g.count === 0 ? 'zero' : ''}">${qtyStr(g.count, g.is_weight)}</td></tr>`;
   $('#goodsTable').innerHTML = groupTree(list, filtering ? null : (gsel || null), filtering, head, item)
-    || '<tr><td colspan="7" class="muted">Нічого не знайдено</td></tr>';
+    || '<tr><td colspan="9" class="muted">Нічого не знайдено</td></tr>';
 }
 $('#goodsGroup').onchange = renderGoodsTable;
 document.querySelectorAll('#goods .statq').forEach(el => el.onclick = () => {
@@ -3371,6 +3408,10 @@ function openGood(g) {
   $('#gBarcode').value = g ? (g.barcode || '') : '';
   $('#gUktzed').value = g ? (g.uktzed || '') : '';
   $('#gWeight').checked = g ? !!g.is_weight : false;
+  $('#gCost').value = g && g.cost != null ? (g.cost / 100).toFixed(2) : '';
+  $('#gSupplier').value = g ? (g.supplier || '') : '';
+  $('#gSupplierList').innerHTML = (window.suppliers || []).map(s => `<option value="${esc(s)}">`).join('');
+  renderMargin();
   const sel = g ? (g.tax_codes || []) : [];
   $('#gTaxes').innerHTML = taxes.length ? taxes.map(t => `<label title="${esc(t.label)}">
       <input type="checkbox" value="${t.code}" ${sel.includes(t.code) ? 'checked' : ''}>
@@ -3413,6 +3454,15 @@ function readStock() {         // тисячні або null; виняток —
   if (stockCb != null && t < stockCb) throw new Error(`Зменшити залишок (у Checkbox ${qtyStr(stockCb, $('#gWeight').checked)}) можна лише списанням у кабінеті Checkbox`);
   return t;
 }
+function renderMargin() {        // націнка й прибуток з ціни продажу та собівартості
+  const num = s => { const v = parseFloat(String(s || '').replace(',', '.').replace(/\s/g, '')); return isFinite(v) ? v : null; };
+  const price = num($('#gPrice').value), cost = num($('#gCost').value), el = $('#gMargin');
+  if (price == null || cost == null || cost <= 0) { el.textContent = ''; return; }
+  const profit = price - cost, markup = profit / cost * 100, margin = price > 0 ? profit / price * 100 : 0;
+  el.innerHTML = `Націнка <b class="${profit < 0 ? 'neg' : ''}">${markup.toFixed(1)}%</b> · прибуток з одиниці <b class="${profit < 0 ? 'neg' : ''}">${profit.toFixed(2)} ₴</b>` +
+    ` · маржа ${margin.toFixed(1)}%${profit < 0 ? ' · <span class="neg">ціна нижча за собівартість</span>' : ''}`;
+}
+['#gPrice', '#gCost'].forEach(s => $(s).addEventListener('input', renderMargin));
 function closeGood() {
   if ($('#goodSave').disabled) return toast('Зачекайте — зберігається в Checkbox', true);
   $('#goodModal').classList.remove('show'); editing = null;
@@ -3527,6 +3577,7 @@ $('#goodSave').onclick = async e => {
     name: $('#gName').value, code: $('#gCode').value, price: $('#gPrice').value,
     barcode: $('#gBarcode').value, uktzed: $('#gUktzed').value, is_weight: $('#gWeight').checked,
     tax_codes: [...document.querySelectorAll('#gTaxes input:checked')].map(i => +i.value),
+    cost: $('#gCost').value, supplier: $('#gSupplier').value,
   };
   try { body.stock = readStock(); } catch (err) { goodStatus('✖ ' + err.message, 'bad'); return $('#gStock').focus(); }
   if (groupList.length) body.group_id = $('#gGroup').value || null;   // без довідника груп групу не чіпаємо
@@ -3536,6 +3587,11 @@ $('#goodSave').onclick = async e => {
     const r = await api('/api/goods/save', body);
     btn.disabled = false; $('#goodCancel').disabled = false;
     if (r.unchanged) { goodStatus('Змін немає.', 'ok'); return; }
+    if (r.local_only) {
+      $('#goodModal').classList.remove('show'); editing = null;
+      toast('Збережено в касі: собівартість і постачальник у Checkbox не передаються');
+      await loadGoods(); scanNewBack(body); return;
+    }
     $('#goodModal').classList.remove('show');
     toast((editing ? 'Зміни збережено' : 'Товар додано') +
       ' в касі. У Checkbox вони підуть під час синхронізації (⟳, відкриття або закриття зміни)' +
