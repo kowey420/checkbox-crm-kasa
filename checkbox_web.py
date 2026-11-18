@@ -327,7 +327,10 @@ class App:
         if "auto_close_time" in body:
             ac = str(body.get("auto_close_time") or "").strip()
             if ac and not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", ac):
-                raise UserError("Час автоматичного закриття зміни — у форматі ГГ:ХХ, напр. 23:50")
+                raise UserError("Час автоматичного закриття зміни — у форматі ГГ:ХХ, напр. 23:45")
+            if ac and ac > AUTO_CLOSE_MAX:
+                raise UserError(f"Автоматичне закриття зміни — не пізніше {AUTO_CLOSE_MAX}: серверам Checkbox "
+                                "потрібен час, щоб закрити зміну до кінця доби")
             new["auto_close_time"] = ac or None
         # у вікні їх немає: вшиті значення дописуються в config.json, щоб було видно, де їх змінити
 
@@ -626,7 +629,7 @@ class App:
         h, m = map(int, hhmm.split(":"))
         now = datetime.now().astimezone()
         at = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if at <= now + timedelta(minutes=5):          # уже минуло (або от-от) — завтра
+        if at <= now:                                 # сьогодні вже минуло — завтра
             at += timedelta(days=1)
         u = at.astimezone(timezone.utc)
         return u.strftime("%Y-%m-%dT%H:%M:%S.") + f"{u.microsecond // 1000:03d}Z"
@@ -1326,6 +1329,7 @@ class App:
 
 
 APP: App = None
+AUTO_CLOSE_MAX = "23:45"    # найпізніший час автоматичного закриття зміни
 EXCISE_MARK_LEN = 10        # акцизна марка: серія й номер — рівно 10 символів
 
 # --- власні зображення плиток (лише локально, у папці даних) ---
@@ -1784,6 +1788,12 @@ PAGE = r"""<!DOCTYPE html>
   .seg label { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 9px; cursor: pointer; font-weight: 600; }
   .seg input { display: none; }
   .seg label:has(input:checked) { background: var(--accent-btn); color: #fff; }
+  .autoclose { grid-column: 1 / -1; }
+  .form .autoclose label.check { display: flex; flex-direction: row; align-items: center; justify-content: flex-start;
+    gap: 8px; cursor: pointer; font-weight: 500; text-align: left; color: var(--text); }
+  .form .autoclose label.check input { width: 18px; height: 18px; margin: 0; flex: 0 0 auto; }
+  .form .autoclose small { display: block; margin-top: 4px; }
+  .autoclose select { width: auto; min-width: 70px; font-variant-numeric: tabular-nums; }
   .warnbox { margin-top: 10px; padding: 10px 12px; border-radius: 10px; font-size: 13px; line-height: 1.45;
              border: 1px solid rgba(217, 119, 6, .45); background: rgba(245, 158, 11, .12); color: var(--text); }
   .btn.zbtn { padding: 3px 10px; font-size: 12px; line-height: 1.4; margin-left: 8px; vertical-align: middle; white-space: nowrap; }
@@ -2210,12 +2220,16 @@ PAGE = r"""<!DOCTYPE html>
         <option value="">Без заокруглення</option>
       </select>
     </label>
-    <label>Автоматичне закриття зміни
-      <span class="row" style="flex-wrap:nowrap;gap:6px"><input type="time" id="cfgAutoClose" style="flex:1">
-        <button type="button" class="btn sec small" id="cfgAutoCloseOff" title="Вимкнути">✕</button></span>
-      <small class="muted">Checkbox сам закриє зміну (з Z-звітом) о цій годині; порожньо — вимкнено.
-        Діє з наступного відкриття зміни.</small>
-    </label>
+    <div class="autoclose">
+      <label class="check"><input type="checkbox" id="cfgAutoCloseOn"> Закривати зміну автоматично</label>
+      <div id="cfgAutoCloseBox" style="display:none">
+        <span class="row" style="flex-wrap:nowrap;gap:6px;align-items:center;margin-top:6px">
+          <span class="muted">о</span>
+          <select id="cfgAcH" aria-label="Година"></select><b>:</b><select id="cfgAcM" aria-label="Хвилини"></select>
+        </span>
+        <small class="muted">Checkbox сам закриє зміну з Z-звітом. Не пізніше 23:45. Діє з наступного відкриття зміни.</small>
+      </div>
+    </div>
   </div>
   <div class="termrow">
     <span>💳 Платіжний термінал: <b id="termSummary">не налаштовано</b></span>
@@ -4148,7 +4162,7 @@ async function loadShift(fresh) {
     if (shift) {
       b.textContent = `Зміна №${shift.serial ?? ''} відкрита`; b.className = 'badge open';
       const ac = shift.auto_close_at ? new Date(shift.auto_close_at) : null;
-      const acText = ac && !isNaN(ac) ? ` · автозакриття <b>${ac.toLocaleString('uk-UA', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}</b>` : '';
+      const acText = ac && !isNaN(ac) ? ` · автозакриття <b>${p2(ac.getDate())}.${p2(ac.getMonth() + 1)} ${p2(ac.getHours())}:${p2(ac.getMinutes())}</b>` : '';
       $('#shiftInfo').innerHTML = `Зміна <b>№${esc(shift.serial)}</b> · статус <b>${esc(shift.status)}</b> · відкрита ${esc((shift.opened_at || '').replace('T', ' ').slice(0, 19))}${acText}`;
       const bal = shift.balance || {};
       $('#cashNow').innerHTML = bal.balance != null ? `Готівка в касі: <b>${uah(bal.balance)} ₴</b>` +
@@ -4730,7 +4744,7 @@ async function openSettings() {
   $('#cfgPassword').placeholder = c.has_password ? '•••••••• (збережено)' : '';
   $('#cfgPin').placeholder = c.has_pin ? '•••• (збережено)' : '';
   $('#cfgRounding').value = c.cash_rounding;
-  $('#cfgAutoClose').value = c.auto_close_time || '';
+  setAutoClose(c.auto_close_time || '');
   document.querySelector(`input[name="authMode"][value="${c.auth_mode}"]`).checked = true;
   renderAuthMode();
   $('#settingsModal').classList.add('show');
@@ -4741,7 +4755,23 @@ document.querySelectorAll('input[name="authMode"]').forEach(r => r.onchange = re
 document.querySelectorAll('.eye').forEach(b => b.onclick = () => {
   const i = document.getElementById(b.dataset.for); i.type = i.type === 'password' ? 'text' : 'password';
 });
-$('#cfgAutoCloseOff').onclick = () => { $('#cfgAutoClose').value = ''; };
+// автозакриття: 24-годинний час двома списками (години 00–23, хвилини 00–59), не пізніше 23:45
+const AUTO_CLOSE_MAX = '23:45';
+function p2(n) { return String(n).padStart(2, '0'); }
+$('#cfgAcH').innerHTML = Array.from({ length: 24 }, (_, h) => `<option>${p2(h)}</option>`).join('');
+function fillAcMinutes() {
+  const keep = $('#cfgAcM').value, max = $('#cfgAcH').value === AUTO_CLOSE_MAX.slice(0, 2) ? +AUTO_CLOSE_MAX.slice(3) : 59;
+  $('#cfgAcM').innerHTML = Array.from({ length: max + 1 }, (_, m) => `<option>${p2(m)}</option>`).join('');
+  $('#cfgAcM').value = p2(Math.min(+keep || 0, max));
+}
+function setAutoClose(hhmm) {
+  const on = !!hhmm, [h, m] = (hhmm || AUTO_CLOSE_MAX).split(':');
+  $('#cfgAutoCloseOn').checked = on;
+  $('#cfgAcH').value = h; $('#cfgAcM').innerHTML = `<option>${m}</option>`; $('#cfgAcM').value = m; fillAcMinutes();
+  $('#cfgAutoCloseBox').style.display = on ? '' : 'none';
+}
+$('#cfgAcH').onchange = fillAcMinutes;
+$('#cfgAutoCloseOn').onchange = () => { $('#cfgAutoCloseBox').style.display = $('#cfgAutoCloseOn').checked ? '' : 'none'; };
 $('#settingsBtn').onclick = () => openSettings().catch(e => toast(e.message, true));
 $('#settingsClose').onclick = closeSettings; $('#settingsCancel').onclick = closeSettings;
 $('#settingsModal').onclick = e => { if (e.target.id === 'settingsModal') closeSettings(); };
@@ -4752,7 +4782,7 @@ $('#settingsSave').onclick = e => busy(e.target, async () => {
     auth_mode: mode,
     license_key: $('#cfgLicense').value, login: $('#cfgLogin').value,
     cash_rounding: $('#cfgRounding').value,
-    auto_close_time: $('#cfgAutoClose').value,
+    auto_close_time: $('#cfgAutoCloseOn').checked ? `${$('#cfgAcH').value}:${$('#cfgAcM').value}` : '',
   };
   if (mode === 'password' && $('#cfgPassword').value) body.password = $('#cfgPassword').value;
   if (mode === 'pin' && $('#cfgPin').value) body.pin_code = $('#cfgPin').value;
