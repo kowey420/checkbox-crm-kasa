@@ -484,6 +484,7 @@ class App:
             "cash_rounding": self.rounding_mode(),
             "pending": self.db.pending_count(),
             "images": images_index(),
+            "excise_total": self.db.con.execute("SELECT COUNT(*) FROM excise_marks").fetchone()[0],
         }
 
     def rounding_mode(self):
@@ -601,6 +602,14 @@ class App:
             all_marks.update(marks)
 
             cart.append((row, qty, marks))
+        sold = self.db.excise_sold(all_marks)
+        if sold:
+            m, r = next(iter(sold.items()))
+            when = (r.get("sold_at") or "").replace("T", " ")[:16]
+            more = f" (і ще {len(sold) - 1})" if len(sold) > 1 else ""
+            raise UserError(f"Акцизна марка {m} вже продана{more}: {r.get('good_name') or 'товар'}, "
+                            f"чек {r.get('fiscal_code') or r.get('receipt_id') or '—'} від {when or '—'}. "
+                            "Повторно продати марку можна лише після повернення.", code="EXCISE_SOLD")
 
         try:
             line_ds, receipt_ds, line_totals, total = apply_discounts(
@@ -681,6 +690,16 @@ class App:
                 "total_sum": receipt.get("total_sum", total),
                 "round_sum": receipt.get("round_sum"),
                 "rest": receipt.get("rest")}
+
+    # ---- акцизні марки ----
+    def excise_check(self, mark):
+        mark = str(mark or "").strip()
+        r = self.db.excise_sold([mark]).get(mark) if mark else None
+        return {"mark": mark, "sold": bool(r), "info": r}
+
+    def excise_list(self, q):
+        rows, total, sold = self.db.excise_list(q)
+        return {"marks": rows, "total": total, "sold": sold}
 
     # ---- групи товарів (одразу в Checkbox: POST/PUT/DELETE /goods/groups) ----
     GROUP_NAME_MAX = 100
@@ -773,8 +792,9 @@ class App:
             log.error("Чек передплати %s створено, але Checkbox не повернув pre_payment_relation_id", receipt["id"])
             raise UserError("Чек передплати пробито, але Checkbox не повернув номер замовлення. "
                             "Знайдіть його в кабінеті Checkbox.")
-        items = [{"name": g["name"], "code": g["code"], "qty": q, "price": g["price"], "sum": t}
-                 for (g, q, _), t in zip(cart, line_totals)]
+        items = [{"name": g["name"], "code": g["code"], "qty": q, "price": g["price"], "sum": t,
+                  **({"excise_barcodes": m} if m else {})}
+                 for (g, q, m), t in zip(cart, line_totals)]
         self.db.add_prepayment(relation_id, note, total, amount, items, self._chain_entry(receipt, "PREPAYMENT", amount, payment_type))
         self.db.add_sale(receipt, payment_type, items, label, details, "PREPAYMENT", relation_id, amount)
         log.info("Передплата: замовлення %s, чек %s, %.2f з %.2f грн, %s", relation_id, receipt["id"],
@@ -847,6 +867,9 @@ class App:
             raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
         resp = self.call(self.api.prepayment_return, p["relation_id"])
         self.db.update_prepayment(p["relation_id"], status="RETURNED")
+        marks = [m for it in p.get("items") or [] for m in it.get("excise_barcodes") or []]
+        if marks:
+            self.db.excise_release(marks, p["relation_id"])
         # чеки повернення — у журнал (якщо Checkbox повернув їх у відповіді)
         found = []
         def walk(x):
@@ -1018,7 +1041,9 @@ class App:
             goods.append(item)
             total += amount
             items.append({"line": idx, "name": ln["name"], "code": ln["code"], "qty": qty,
-                          "price": ln["price"], "sum": amount})
+                          "price": ln["price"], "sum": amount,
+                          **({"excise_barcodes": item["good"]["excise_barcodes"]}
+                             if item["good"].get("excise_barcodes") else {})})
         if not goods:
             raise UserError("Оберіть товари для повернення")
         if total <= 0:
@@ -1283,6 +1308,10 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.report_text, (q.get("id") or [""])[0])
         elif u.path == "/api/receipt":
             self._run(APP.receipt_info, (q.get("id") or [""])[0])
+        elif u.path == "/api/excise/check":
+            self._run(APP.excise_check, (q.get("mark") or [""])[0])
+        elif u.path == "/api/excise":
+            self._run(APP.excise_list, (q.get("q") or [""])[0])
         elif u.path == "/api/prepayments":
             self._run(APP.prepayments)
         elif u.path == "/api/prepay/state":
@@ -1749,6 +1778,7 @@ PAGE = r"""<!DOCTYPE html>
       <button data-pane="gpGoods"><span class="si">📦</span><span class="st">Товари</span><span class="sc" id="navGoodsN"></span></button>
       <button data-pane="gpGroups"><span class="si">📁</span><span class="st">Групи товарів</span><span class="sc" id="navGroupsN"></span></button>
       <button data-pane="gpTaxes"><span class="si">％</span><span class="st">Податкові ставки</span><span class="sc" id="navTaxesN"></span></button>
+      <button data-pane="gpExcise"><span class="si">🏷</span><span class="st">Акцизні марки</span><span class="sc" id="navExciseN"></span></button>
     </aside>
     <div class="subpanes">
     <div class="card subpane" id="gpGoods">
@@ -1788,6 +1818,19 @@ PAGE = r"""<!DOCTYPE html>
       <table style="margin-top:12px">
         <thead><tr><th>Код</th><th>Літера</th><th>Назва</th><th class="num">Ставка</th><th class="num">Акциз</th><th>Тип</th><th class="num">Товарів</th></tr></thead>
         <tbody id="taxTable"></tbody>
+      </table>
+    </div>
+    <div class="card subpane" id="gpExcise">
+      <div class="row" style="justify-content:space-between">
+        <h3 style="margin:0">Акцизні марки</h3>
+        <small class="muted" id="exciseStat"></small>
+      </div>
+      <p class="muted" style="font-size:12px;margin:6px 0 0">Марки з чеків продажу й передплати. Продану марку каса не дасть продати вдруге,
+        поки її не повернуть чеком повернення. Чеки, пробиті з інших кас, враховуються після «Завантажити з Checkbox» у журналі.</p>
+      <div class="row" style="margin-top:10px"><input type="text" id="exciseFilter" placeholder="Марка, товар або ФН чека…"></div>
+      <table style="margin-top:12px">
+        <thead><tr><th>Марка</th><th>Товар</th><th>Стан</th><th>Чек продажу</th><th>Продано</th><th>Повернуто</th></tr></thead>
+        <tbody id="exciseTable"></tbody>
       </table>
     </div>
     </div>
@@ -2400,7 +2443,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
 // --- товари ---
 async function loadGoods() {
   const d = await api('/api/goods');
-  goods = d.goods; images = d.images || {}; useLeftovers = !!d.use_leftovers; roundingMode = d.cash_rounding; taxes = d.taxes || [];
+  goods = d.goods; images = d.images || {}; window.exciseTotal = d.excise_total; useLeftovers = !!d.use_leftovers; roundingMode = d.cash_rounding; taxes = d.taxes || [];
   setGroups(d.groups || []);
   renderPending(d.pending);
   renderTaxes(d.taxes_source);
@@ -2563,13 +2606,30 @@ function showGoodsPane(id) {
   try { localStorage.setItem('kasa_goods_pane', id); } catch (e) {}
   document.querySelectorAll('#goods .subpane').forEach(p => p.classList.toggle('on', p.id === id));
   document.querySelectorAll('#goodsNav button').forEach(b => b.classList.toggle('on', b.dataset.pane === id));
+  if (id === 'gpExcise') loadExcise();
 }
 function renderGoodsNav() {
   $('#navGoodsN').textContent = goods.length;
   $('#navGroupsN').textContent = groupList.length;
   $('#navTaxesN').textContent = taxes.length;
+  if (window.exciseTotal != null) $('#navExciseN').textContent = window.exciseTotal;
 }
 $('#goodsNav').onclick = e => { const b = e.target.closest('button[data-pane]'); if (b) showGoodsPane(b.dataset.pane); };
+let exciseTimer = null;
+async function loadExcise() {
+  try {
+    const d = await api('/api/excise?q=' + encodeURIComponent($('#exciseFilter').value));
+    $('#navExciseN').textContent = d.total;
+    $('#exciseStat').textContent = `усього ${d.total} · продано ${d.sold} · повернуто ${d.total - d.sold}`;
+    const t = s => (s || '').replace('T', ' ').slice(0, 16);
+    $('#exciseTable').innerHTML = d.marks.map(m => `<tr>
+      <td><code>${esc(m.mark)}</code></td><td>${esc(m.good_name || m.good_code || '—')}</td>
+      <td>${m.status === 'SOLD' ? '<span class="badge" style="background:var(--bad);color:#fff">продана</span>' : '<span class="badge">повернута</span>'}</td>
+      <td>${esc(m.fiscal_code || (m.receipt_id || '').slice(0, 8) || '—')}</td><td>${esc(t(m.sold_at))}</td><td>${m.status === 'SOLD' ? '—' : esc(t(m.returned_at))}</td></tr>`).join('')
+      || '<tr><td colspan="6" class="muted">Марок ще немає</td></tr>';
+  } catch (e) { toast(e.message, true); }
+}
+$('#exciseFilter').oninput = () => { clearTimeout(exciseTimer); exciseTimer = setTimeout(loadExcise, 250); };
 showGoodsPane(goodsPane);
 
 // --- плитки: групи — папки, товари — картки ---
@@ -3218,15 +3278,23 @@ function renderExcise() {
     `<li>${esc(m)} <button class="x" data-k="${k}" title="Видалити">✕</button></li>`).join('');
 }
 function closeExcise() { $('#exciseModal').classList.remove('show'); exciseIdx = null; renderCart(); $('#search').focus(); }
-$('#exciseInput').onkeydown = e => {
+$('#exciseInput').onkeydown = async e => {
   if (e.key === 'Escape') return closeExcise();
   if (e.key !== 'Enter') return;
   e.stopPropagation();
   const v = $('#exciseInput').value.trim(); $('#exciseInput').value = '';
   if (!v) return;
-  const c = cart[exciseIdx]; const need = Math.round(c.qty / 1000);
-  if (c.marks.includes(v) || allMarks(exciseIdx).includes(v)) return toast('Ця марка вже додана', true);
+  const idx = exciseIdx, c = cart[idx]; const need = Math.round(c.qty / 1000);
+  if (c.marks.includes(v) || allMarks(idx).includes(v)) return toast('Ця марка вже додана', true);
   if (c.marks.length >= need) return toast(`Вже додано ${need} марок — збільште кількість товару`, true);
+  try {
+    const r = await api('/api/excise/check?mark=' + encodeURIComponent(v));
+    if (r.sold) {
+      const i = r.info || {};
+      return toast(`Марка ${v} вже продана: ${i.good_name || 'товар'}, чек ${i.fiscal_code || i.receipt_id || '—'} від ${(i.sold_at || '').replace('T', ' ').slice(0, 16)}`, true);
+    }
+  } catch (err) { /* перевірка недоступна — сервер усе одно не дасть продати повторно */ }
+  if (exciseIdx !== idx || c.marks.includes(v)) return;
   c.marks.push(v); renderExcise();
   if (c.marks.length === need) toast('Усі марки додано');
 };

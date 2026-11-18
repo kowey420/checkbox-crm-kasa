@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.4.6.5"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.4.6.6"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -887,6 +887,12 @@ class LocalDB:
             status TEXT,                    -- OPEN | PAID | RETURNED
             receipts TEXT,                  -- JSON: [{id, kind, value, payment_type, fiscal_code, at}]
             updated_at TEXT)""")
+        # Продані акцизні марки: одну марку не можна продати двічі (поки її не повернули).
+        # Стан визначається часом: продана, якщо останній продаж пізніший за останнє повернення.
+        self.con.execute("""CREATE TABLE IF NOT EXISTS excise_marks (
+            mark TEXT PRIMARY KEY,
+            sold_at TEXT, receipt_id TEXT, fiscal_code TEXT, good_code TEXT, good_name TEXT,
+            returned_at TEXT, return_receipt_id TEXT)""")
         # міграція старої бази: колонка з кодами податків товару
         cols = [r["name"] for r in self.con.execute("PRAGMA table_info(goods)")]
         if "group_id" not in cols:          # група товару в Checkbox
@@ -913,6 +919,8 @@ class LocalDB:
         for col in ("shift_id", "shift_serial", "shift_opened_at", "shift_closed_at"):   # зміна чека
             if col not in scols:
                 self.con.execute(f"ALTER TABLE sales ADD COLUMN {col} TEXT")
+        if not self.meta("excise_backfill"):     # після всіх міграцій sales
+            self._excise_backfill()
 
     def replace_goods(self, goods, use_leftovers):
         now = datetime.now().isoformat(timespec="seconds")
@@ -1123,7 +1131,84 @@ class LocalDB:
                  json.dumps(items, ensure_ascii=False), payment_label,
                  json.dumps(payment_details, ensure_ascii=False) if payment_details else None,
                  receipt_type, related_id))
+            self._excise_apply(receipt_type, receipt, items, datetime.now().isoformat(timespec="milliseconds"), commit=False)
         self.set_receipt_shift(receipt)
+
+    # --- акцизні марки ---
+    def _excise_backfill(self):
+        """Один раз: марки з уже збережених у журналі чеків (до 1.4.6.6 окремо не велися)."""
+        try:
+            rows = self.con.execute("SELECT receipt_id, created_at, fiscal_code, receipt_type, items FROM sales "
+                                    "ORDER BY created_at").fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        for r in rows:
+            try:
+                items = json.loads(r["items"] or "[]")
+            except ValueError:
+                continue
+            self._excise_apply(r["receipt_type"], {"id": r["receipt_id"], "fiscal_code": r["fiscal_code"]},
+                               items, r["created_at"], commit=False)
+        self.con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        self.con.execute("INSERT OR REPLACE INTO meta VALUES ('excise_backfill', ?)",
+                         (json.dumps(datetime.now().isoformat(timespec="seconds")),))
+        self.con.commit()
+
+    def _excise_apply(self, receipt_type, receipt, items, at, commit=True):
+        """Чек продажу/передплати — марки продані; чек повернення — повернуті."""
+        kind = "RETURN" if receipt_type == "RETURN" else "SELL" if receipt_type in (None, "SELL", "PREPAYMENT") else None
+        if not kind:
+            return
+        for it in items or []:
+            for m in it.get("excise_barcodes") or []:
+                m = str(m).strip()
+                if not m:
+                    continue
+                if kind == "SELL":
+                    self.con.execute(
+                        "INSERT INTO excise_marks (mark, sold_at, receipt_id, fiscal_code, good_code, good_name) "
+                        "VALUES (?,?,?,?,?,?) ON CONFLICT(mark) DO UPDATE SET sold_at=excluded.sold_at, "
+                        "receipt_id=excluded.receipt_id, fiscal_code=excluded.fiscal_code, "
+                        "good_code=excluded.good_code, good_name=excluded.good_name "
+                        "WHERE excise_marks.sold_at IS NULL OR excluded.sold_at > excise_marks.sold_at",
+                        (m, at, receipt.get("id"), receipt.get("fiscal_code"), it.get("code"), it.get("name")))
+                else:
+                    self.con.execute(
+                        "INSERT INTO excise_marks (mark, returned_at, return_receipt_id, good_code, good_name) "
+                        "VALUES (?,?,?,?,?) ON CONFLICT(mark) DO UPDATE SET returned_at=excluded.returned_at, "
+                        "return_receipt_id=excluded.return_receipt_id "
+                        "WHERE excise_marks.returned_at IS NULL OR excluded.returned_at > excise_marks.returned_at",
+                        (m, at, receipt.get("id"), it.get("code"), it.get("name")))
+        if commit:
+            self.con.commit()
+
+    def excise_release(self, marks, receipt_id, at=None):
+        """Марки повернуто (напр. повернення замовлення передплати)."""
+        self._excise_apply("RETURN", {"id": receipt_id}, [{"excise_barcodes": list(marks)}],
+                           at or datetime.now().isoformat(timespec="seconds"))
+
+    SOLD_MARK = "sold_at IS NOT NULL AND (returned_at IS NULL OR sold_at > returned_at)"
+
+    def excise_sold(self, marks):
+        """Які з марок уже продані (і не повернуті): {марка: рядок}."""
+        marks = [str(m).strip() for m in marks if str(m).strip()]
+        if not marks:
+            return {}
+        q = ",".join("?" * len(marks))
+        return {r["mark"]: dict(r) for r in self.con.execute(
+            f"SELECT * FROM excise_marks WHERE mark IN ({q}) AND {self.SOLD_MARK}", marks)}
+
+    def excise_list(self, q="", limit=300):
+        q = (q or "").strip()
+        sql = f"SELECT *, CASE WHEN {self.SOLD_MARK} THEN 'SOLD' ELSE 'RETURNED' END AS status FROM excise_marks"
+        args = []
+        if q:
+            sql += " WHERE mark LIKE ? OR good_name LIKE ? OR good_code LIKE ? OR fiscal_code LIKE ?"
+            args = [f"%{q}%"] * 4
+        sql += " ORDER BY COALESCE(MAX(COALESCE(sold_at,''), COALESCE(returned_at,'')), '') DESC LIMIT ?"
+        total = self.con.execute("SELECT COUNT(*) FROM excise_marks").fetchone()[0]
+        sold = self.con.execute(f"SELECT COUNT(*) FROM excise_marks WHERE {self.SOLD_MARK}").fetchone()[0]
+        return [dict(r) for r in self.con.execute(sql, args + [limit])], total, sold
 
     def returned_qty(self, sale_id):
         """Скільки вже повернуто за чеком продажу: {позиція: тисячні}. Позиція — номер рядка чека."""
@@ -1176,14 +1261,23 @@ class LocalDB:
         label = ", ".join(dict.fromkeys(labels)) if labels else None
         if label in ("Готівка", "Картка", "Безготівка"):
             label = None                      # стандартні назви показуємо за типом оплати
-        items = [{"name": (g.get("good") or {}).get("name"), "code": (g.get("good") or {}).get("code"),
-                  "qty": g.get("quantity"), "price": (g.get("good") or {}).get("price")} for g in r.get("goods") or []]
+        items = []
+        for g in r.get("goods") or []:
+            good = g.get("good") or {}
+            it = {"name": good.get("name"), "code": good.get("code"), "qty": g.get("quantity"), "price": good.get("price")}
+            marks = g.get("excise_barcodes") or good.get("excise_barcodes") or []
+            if marks:
+                it["excise_barcodes"] = list(marks)
+            items.append(it)
         cur = self.con.execute(
             "INSERT OR IGNORE INTO sales (receipt_id, created_at, fiscal_code, payment_type, total, items, "
             "payment_label, receipt_type, source, related_id) VALUES (?,?,?,?,?,?,?,?, 'checkbox', ?)",
             (r["id"], local_time(r.get("fiscal_date") or r.get("created_at")), r.get("fiscal_code"), ptype,
              abs(r.get("total_sum") or 0), json.dumps(items, ensure_ascii=False), label, r.get("type"),
              r.get("related_receipt_id")))
+        if cur.rowcount == 1:            # чек, пробитий не цією касою (або до 1.4.6.6), — марки теж враховуємо
+            self._excise_apply("RETURN" if r.get("type") == "RETURN" or r.get("is_return") else r.get("type") or "SELL",
+                               r, items, local_time(r.get("fiscal_date") or r.get("created_at")), commit=False)
         self.con.commit()
         self.set_receipt_shift(r)        # і для нових, і для вже наявних записів без зміни
         return cur.rowcount == 1
