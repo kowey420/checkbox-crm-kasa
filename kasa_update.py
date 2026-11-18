@@ -215,6 +215,19 @@ def spawn_restarted():
         for key in list(env):
             if key.startswith("_PYI_") or key.startswith("_MEIPASS"):
                 env.pop(key)
+        mei = getattr(sys, "_MEIPASS", None)
+        if mei and env.get("PATH"):     # шляхи в стару тимчасову папку нова копія не має бачити
+            env["PATH"] = os.pathsep.join(p for p in env["PATH"].split(os.pathsep)
+                                          if p and not os.path.normcase(p).startswith(os.path.normcase(mei)))
+        if os.name == "nt":
+            # Завантажувач Kasa.exe робить SetDllDirectory(_MEI… старої копії), і дочірні процеси це
+            # успадковують: нова Kasa.exe брала б DLL зі старої папки й тримала їх відкритими, тож стара
+            # при виході не могла її видалити — «Failed to remove temporary directory».
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetDllDirectoryW(None)
+            except Exception:  # noqa
+                pass
     kw = {"env": env, "cwd": str(APP_DIR), "close_fds": True}
     if os.name == "nt":
         flags = 0x00000200                                  # CREATE_NEW_PROCESS_GROUP
@@ -234,7 +247,15 @@ def relaunch_if_inherited():
     Таку копію одразу перезапускаємо «начисто» (власна тимчасова папка), а самі виходимо.
     """
     clean = os.environ.pop("CHECKBOX_CLEAN_SPAWN", None) == "1"
-    if getattr(sys, "frozen", False) and os.environ.get("CHECKBOX_RESTARTED") == "1" and not clean:
+    if not getattr(sys, "frozen", False) or os.environ.get("CHECKBOX_RESTARTED") != "1" or clean:
+        return
+    # 1.2.5–1.4.1 маркера не ставлять, але запускають правильно: своя папка _MEI… щойно створена.
+    # Спільна зі старою копією — створена тоді, коли запускалась стара (хвилини чи години тому).
+    try:
+        shared = time.time() - os.stat(sys._MEIPASS).st_ctime > 90
+    except (AttributeError, OSError):
+        shared = True
+    if shared:
         log.warning("Каса запущена старим оновлювачем зі спільною тимчасовою папкою — перезапускаю начисто")
         spawn_restarted()
         sys.exit(0)
