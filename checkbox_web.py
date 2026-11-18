@@ -1715,6 +1715,8 @@ PAGE = r"""<!DOCTYPE html>
   .seg label { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 9px; cursor: pointer; font-weight: 600; }
   .seg input { display: none; }
   .seg label:has(input:checked) { background: var(--accent-btn); color: #fff; }
+  .btn.zbtn { padding: 3px 10px; font-size: 12px; line-height: 1.4; margin-left: 8px; vertical-align: middle; white-space: nowrap; }
+  td .btn.zbtn { margin-left: 0; }
   .codebox { display: flex; gap: 6px; } .codebox input { flex: 1; min-width: 0; }
   .optlist { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; max-height: 260px; overflow-y: auto; }
   .optlist .opt { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border: 0; border-bottom: 1px solid var(--line);
@@ -2040,7 +2042,7 @@ PAGE = r"""<!DOCTYPE html>
       <p class="muted" style="font-size:12px;margin:6px 0 0">Звіти зберігаються в касі: закриті з цієї каси — одразу, з Checkbox — за останні 7 днів
         кнопкою «⟳ Завантажити з Checkbox». Клікніть звіт, щоб побачити його.</p>
       <table style="margin-top:12px" class="zrep">
-        <thead><tr><th>Дата</th><th>Зміна</th><th>Z №</th><th>ФН</th><th class="num">Продажі</th><th class="num">Повернення</th><th class="num">Чеків</th><th class="num">Готівка в касі</th></tr></thead>
+        <thead><tr><th>Дата</th><th>Зміна</th><th>Z №</th><th>ФН</th><th class="num">Продажі</th><th class="num">Повернення</th><th class="num">Чеків</th><th class="num">Готівка в касі</th><th></th></tr></thead>
         <tbody id="zTable"></tbody>
       </table>
     </div>
@@ -4060,7 +4062,7 @@ async function loadShift(fresh) {
     }
     $('#openShift').style.display = shift ? 'none' : '';
     $('#xReport').style.display = $('#closeShift').style.display = shift ? '' : 'none';
-    $('#lastZ').innerHTML = last_z ? `Останній Z-звіт: зміна №${esc(last_z.serial ?? '?')}, ${esc((last_z.closed_at || '').replace('T', ' ').slice(0, 16))} · <a href="#" id="lastZLink">показати</a>` : '';
+    $('#lastZ').innerHTML = last_z ? `Останній Z-звіт: зміна №${esc(last_z.serial ?? '?')}, ${esc((last_z.closed_at || '').replace('T', ' ').slice(0, 16))} <button type="button" class="btn sec small zbtn" id="lastZLink">🧾 Показати Z-звіт</button>` : '';
     if (last_z) $('#lastZLink').onclick = e => { e.preventDefault(); showReceipt(last_z.id, { report: true, title: `Z-звіт · зміна №${last_z.serial ?? ''}` }); };
   } catch (e) { $('#shiftBadge').textContent = 'Зміна: помилка'; toast(e.message, true); }
 }
@@ -4186,7 +4188,7 @@ function shiftTitle(sh, day) {
   const fmt = t => t && t.slice(0, 10) !== day ? dm(t) : hm(t);
   const span = sh.opened ? `${fmt(sh.opened)} – ${sh.closed ? fmt(sh.closed) : 'відкрита'}` : '';
   const z = zByShift[sh.id];
-  const zl = z ? ` · <a href="#" class="zlink" data-zid="${esc(z.id)}" data-no="${esc(sh.serial || '')}">Z-звіт</a>` : '';
+  const zl = z ? ` <button type="button" class="btn sec small zbtn zlink" data-zid="${esc(z.id)}" data-no="${esc(sh.serial || '')}" title="Показати Z-звіт зміни">🧾 Z-звіт</button>` : '';
   return `Зміна №${esc(sh.serial || '?')}${span ? ` <small class="muted">· ${span}</small>` : ''}${zl}`;
 }
 function receiptRows(list) {
@@ -4212,8 +4214,9 @@ async function loadZ() {
       <td>${esc((z.created_at || '').replace('T', ' ').slice(0, 16)) || '—'}</td><td>${z.shift_no != null ? '№' + esc(z.shift_no) : '—'}</td>
       <td>${esc(z.serial ?? '—')}</td><td>${esc(z.fiscal_code || '—')}</td><td class="num">${money(z.sell_sum)}</td>
       <td class="num">${money(z.return_sum)}</td><td class="num">${z.sell_count != null ? esc(z.sell_count + (z.return_count || 0)) : '—'}</td>
-      <td class="num">${money(z.balance)}</td></tr>`).join('')
-      || '<tr><td colspan="8" class="muted">Z-звітів ще немає</td></tr>';
+      <td class="num">${money(z.balance)}</td>
+      <td class="num"><button type="button" class="btn sec small zbtn">🧾 Показати</button></td></tr>`).join('')
+      || '<tr><td colspan="9" class="muted">Z-звітів ще немає</td></tr>';
   } catch (e) { toast(e.message, true); }
 }
 $('#zTable').onclick = e => {
