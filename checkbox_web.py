@@ -408,8 +408,6 @@ class App:
                 errors.append("невірний залишок")
             elif not good.get("is_weight") and stock % 1000:
                 errors.append("залишок штучного товару — ціле число")
-            elif cb_count is not None and stock < cb_count:
-                errors.append(f"зменшити залишок (у Checkbox {cb_count / 1000:g}) можна лише списанням у кабінеті Checkbox")
             elif stock == (cb_count or 0):
                 stock = None
         if "group_id" in body:                        # група товару: id групи або None — без групи
@@ -548,17 +546,24 @@ class App:
                     failed[p["code"]] = str(e)
                     self.db.set_pending_error(str(e), p["code"])
                 log.warning("Нові товари (%d) не збережено імпортом: %s", len(via_import), e)
-        self.db.clear_pending([p["code"] for p in done])
         pending = done
-        stock = {p["data"]["code"]: (p["data"]["stock"], bool(p["data"].get("is_weight")))
-                 for p in pending if p["data"].get("stock") is not None}
+        with_stock = [p for p in done if p["data"].get("stock") is not None]
+        # правки без залишку — готові; з залишком — лишаються в черзі, доки Checkbox не підтвердить залишок
+        self.db.clear_pending([p["code"] for p in done if p["data"].get("stock") is None])
+        stock = {p["data"]["code"]: (p["data"]["stock"], bool(p["data"].get("is_weight"))) for p in with_stock}
         if stock:
-            # правки товарів уже в Checkbox; поставку не повторюємо автоматично — лише повідомляємо
             try:
                 failed_stock = self.call(goods_csv.supply_stock, self.api, stock, None, saved.get("file"))
             except (CheckboxError, net.RequestException) as e:
+                for p in with_stock:
+                    self.db.set_pending_error(f"залишок не внесено: {e}", p["code"])
                 raise CheckboxError(f"товари збережено, але залишки не внесено: {e}")
+            bad = {f.split(":", 1)[0] for f in failed_stock}
+            self.db.clear_pending([p["code"] for p in with_stock if (p["data"]["code"] or "").strip() not in bad])
             if failed_stock:
+                for p in with_stock:
+                    if (p["data"]["code"] or "").strip() in bad:
+                        self.db.set_pending_error("Checkbox не прийняв залишок", p["code"])
                 raise CheckboxError("товари збережено, але Checkbox не прийняв залишки: " + "; ".join(failed_stock))
         if failed:
             raise CheckboxError(f"не збережено товарів: {len(failed)} — "
@@ -2652,8 +2657,8 @@ PAGE = r"""<!DOCTYPE html>
         <span>Залишок, <span id="gStockUnit">шт</span></span><input type="text" id="gStock" inputmode="decimal" placeholder="0"></label>
       <span class="muted" style="font-size:12px;padding-bottom:10px" id="gStockNow"></span>
     </div>
-    <p class="muted" style="font-size:12px;margin:6px 0 0">Збільшення залишку піде в Checkbox поставкою (імпорт з автопоставкою) під час синхронізації; у касі діє одразу.
-      Зменшити залишок можна лише списанням у кабінеті Checkbox.</p>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">Новий залишок піде в Checkbox під час синхронізації (імпорт з автопоставкою: у файлі — підсумковий залишок); у касі діє одразу.
+      Checkbox сам порахує різницю й зробить поставку або списання.</p>
   </div>
   <p class="muted" style="font-size:12px;margin:10px 0 0" id="gNote"></p>
   <div id="goodStatus" class="status" style="display:none"></div>
@@ -3593,7 +3598,6 @@ function readStock() {         // тисячні або null; виняток —
   if (!(v >= 0) || !/^\d+(\.\d{1,3})?$/.test(raw)) throw new Error('Невірний залишок — напр. 12 або 3.250');
   if (!$('#gWeight').checked && !Number.isInteger(v)) throw new Error('Залишок штучного товару — ціле число');
   const t = Math.round(v * 1000);
-  if (stockCb != null && t < stockCb) throw new Error(`Зменшити залишок (у Checkbox ${qtyStr(stockCb, $('#gWeight').checked)}) можна лише списанням у кабінеті Checkbox`);
   return t;
 }
 function renderMargin() {        // націнка й прибуток з ціни продажу та собівартості
