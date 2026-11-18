@@ -1015,7 +1015,7 @@ class App:
 
     def writeoff_post(self, body):
         """
-        Списання (alpha): залишок -= кількість; у Checkbox — тим самим імпортом з автопоставкою: у файлі
+        Списання: залишок -= кількість; у Checkbox — тим самим імпортом з автопоставкою: у файлі
         підсумковий (менший) залишок, Checkbox сам робить списання. Після імпорту каса звіряє залишки.
         """
         lines_in = (body or {}).get("lines") or []
@@ -2431,7 +2431,7 @@ PAGE = r"""<!DOCTYPE html>
     </div>
     <div class="card subpane" id="gpSupply">
       <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:10px">
-        <div class="viewsw" id="spMode"><button data-m="in">📥 Поставка</button><button data-m="out">📤 Списання <small>alpha</small></button></div>
+        <div class="viewsw" id="spMode"><button data-m="in">📥 Поставка</button><button data-m="out">📤 Списання</button></div>
         <small class="muted" id="spSub">Скануйте товари підряд; кількість і собівартість можна змінити</small>
       </div>
       <div class="form" style="margin-top:12px" id="spInFields">
@@ -3757,7 +3757,7 @@ var SUPPLY_KEY = 'kasa_supply_draft';
 var supply = (() => { try { return JSON.parse(localStorage.getItem(SUPPLY_KEY)) || null; } catch (e) { return null; } })()
   || { supplier: '', doc: '', lines: [] };
 var supplyNew = null;           // штрихкод нового товару, картку якого відкрито зі сканера поставки
-// списання (alpha): та сама таблиця й сканер, окрема чернетка
+// списання: та сама таблиця й сканер, окрема чернетка
 var WRITEOFF_KEY = 'kasa_writeoff_draft';
 var writeoff = (() => { try { return JSON.parse(localStorage.getItem(WRITEOFF_KEY)) || null; } catch (e) { return null; } })()
   || { reason: '', other: '', lines: [] };
