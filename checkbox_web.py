@@ -546,17 +546,24 @@ class App:
                     failed[p["code"]] = str(e)
                     self.db.set_pending_error(str(e), p["code"])
                 log.warning("Нові товари (%d) не збережено імпортом: %s", len(via_import), e)
-        self.db.clear_pending([p["code"] for p in done])
         pending = done
-        stock = {p["data"]["code"]: (p["data"]["stock"], bool(p["data"].get("is_weight")))
-                 for p in pending if p["data"].get("stock") is not None}
+        with_stock = [p for p in done if p["data"].get("stock") is not None]
+        # правки без залишку — готові; з залишком — лишаються в черзі, доки Checkbox не підтвердить залишок
+        self.db.clear_pending([p["code"] for p in done if p["data"].get("stock") is None])
+        stock = {p["data"]["code"]: (p["data"]["stock"], bool(p["data"].get("is_weight"))) for p in with_stock}
         if stock:
-            # правки товарів уже в Checkbox; поставку не повторюємо автоматично — лише повідомляємо
             try:
                 failed_stock = self.call(goods_csv.supply_stock, self.api, stock, None, saved.get("file"))
             except (CheckboxError, net.RequestException) as e:
+                for p in with_stock:
+                    self.db.set_pending_error(f"залишок не внесено: {e}", p["code"])
                 raise CheckboxError(f"товари збережено, але залишки не внесено: {e}")
+            bad = {f.split(":", 1)[0] for f in failed_stock}
+            self.db.clear_pending([p["code"] for p in with_stock if (p["data"]["code"] or "").strip() not in bad])
             if failed_stock:
+                for p in with_stock:
+                    if (p["data"]["code"] or "").strip() in bad:
+                        self.db.set_pending_error("Checkbox не прийняв залишок", p["code"])
                 raise CheckboxError("товари збережено, але Checkbox не прийняв залишки: " + "; ".join(failed_stock))
         if failed:
             raise CheckboxError(f"не збережено товарів: {len(failed)} — "
@@ -1008,8 +1015,8 @@ class App:
 
     def writeoff_post(self, body):
         """
-        Списання (alpha): залишок -= кількість; у Checkbox — тим самим імпортом з автопоставкою, але з
-        від'ємною кількістю. Після імпорту каса звіряє залишки — якщо Checkbox так не списує, буде видно одразу.
+        Списання (alpha): залишок -= кількість; у Checkbox — тим самим імпортом з автопоставкою: у файлі
+        підсумковий (менший) залишок, Checkbox сам робить списання. Після імпорту каса звіряє залишки.
         """
         lines_in = (body or {}).get("lines") or []
         reason = " ".join(str(body.get("reason") or "").split())[:120]
@@ -2726,8 +2733,8 @@ PAGE = r"""<!DOCTYPE html>
         <span>Залишок, <span id="gStockUnit">шт</span></span><input type="text" id="gStock" inputmode="decimal" placeholder="0"></label>
       <span class="muted" style="font-size:12px;padding-bottom:10px" id="gStockNow"></span>
     </div>
-    <p class="muted" style="font-size:12px;margin:6px 0 0">Збільшення залишку піде в Checkbox поставкою (імпорт з автопоставкою) під час синхронізації; у касі діє одразу.
-      Зменшення (alpha) — тим самим імпортом з від'ємною кількістю; після нього каса звіряє залишок з Checkbox.</p>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">Новий залишок піде в Checkbox під час синхронізації (імпорт з автопоставкою: у файлі — підсумковий залишок); у касі діє одразу.
+      Checkbox сам порахує різницю й зробить поставку або списання.</p>
   </div>
   <p class="muted" style="font-size:12px;margin:10px 0 0" id="gNote"></p>
   <div id="goodStatus" class="status" style="display:none"></div>

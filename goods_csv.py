@@ -591,9 +591,10 @@ STOCK_HEADERS = ("кількість", "к-сть", "залишок", "зали�
 
 def supply_stock(api, stock, on_status=None, cbfile=None):
     """
-    Довести залишки товарів у Checkbox до бажаних значень поставкою через імпорт.
-    stock — {код: (бажаний залишок у тисячних, ваговий)}. Поставка лише додає, тож у файл іде різниця
-    між бажаним і поточним залишком Checkbox. Файл містить лише ці товари (решта номенклатури не чіпається).
+    Довести залишки товарів у Checkbox до бажаних значень імпортом з автопоставкою.
+    stock — {код: (бажаний залишок у тисячних, ваговий)}. У колонку кількості йде саме бажаний (підсумковий)
+    залишок — Checkbox з auto_supply=true сам рахує різницю з поточним і робить поставку чи списання.
+    Файл містить лише ці товари (решта номенклатури не чіпається).
     Повертає список описів товарів, для яких після імпорту залишок не збігся (порожній — усе вдалося).
     cbfile — файл номенклатури, щойно завантажений у Checkbox (з save_goods_to_checkbox): тоді повторне
     вивантаження не потрібне — Checkbox дозволяє його не частіше ніж раз на 15 с.
@@ -603,7 +604,7 @@ def supply_stock(api, stock, on_status=None, cbfile=None):
     todo = {}
     for code, (target, is_weight) in stock.items():
         delta = target - (current.get(code) or 0)
-        if delta:                    # alpha: від'ємна різниця — спроба списання тим самим імпортом
+        if delta:                    # уже такий залишок — у файл не йде
             todo[code] = (delta, is_weight, target)
     if not todo:
         return []
@@ -620,24 +621,21 @@ def supply_stock(api, stock, on_status=None, cbfile=None):
         header.append(STOCK_HEADER)
         qcol = len(header) - 1
     rows, missing = [], []
-    for code, (delta, is_weight, _) in todo.items():
+    for code, (delta, is_weight, target) in todo.items():
         row = src.find(code)
         if row is None:
             missing.append(code)
             continue
         row = list(row) + [""] * (len(header) - len(row))
-        row[qcol] = fmt_count(delta, is_weight)
+        row[qcol] = fmt_count(target, is_weight)          # підсумковий залишок, не різниця
         rows.append(row)
     if missing:
         raise CheckboxError(f"товарів з кодами {', '.join(missing)} немає у вивантаженні Checkbox")
     out = CheckboxFile(header, rows, src.encoding, src.delimiter)
     say("Вношу залишки поставкою…")
     task = api.goods_import_upload("kasa_stock.csv", out.to_bytes(), True, True)
-    if any(d < 0 for d, _, _ in todo.values()):
-        log.info("Зменшення залишків від'ємною кількістю (alpha): %s",
-                 {c: fmt_count(d, w) for c, (d, w, _) in todo.items() if d < 0})
-    log.info("Поставка залишків через імпорт (колонка «%s»): %s, завдання %s", header[qcol],
-             {c: fmt_count(d, w) for c, (d, w, _) in todo.items()}, task)
+    log.info("Залишки через імпорт з автопоставкою (колонка «%s», підсумковий залишок): %s, завдання %s", header[qcol],
+             {c: f"{fmt_count(t, w)} ({'+' if d > 0 else ''}{fmt_count(d, w)})" for c, (d, w, t) in todo.items()}, task)
     result = api.wait_task(api.goods_import_status, task, ready={"completed", "done"})
     log.info("Поставка залишків: перевірка %s", json.dumps(result, ensure_ascii=False)[:4000])
     errors = result_errors(result)

@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.7.4.0-alpha1"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.7.4.0-alpha2"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -332,6 +332,7 @@ class CheckboxAPI:
             "X-License-Key": cfg.get("license_key") or "",
         })
 
+    RATE_LIMIT_TRIES = 5          # 1 запит + до 4 повторів після 429 (вивантаження — раз на 15 с)
     RATE_LIMIT_MAX_WAIT = 20      # с: довше на «занадто часто» (429) не чекаємо
 
     @staticmethod
@@ -359,14 +360,15 @@ class CheckboxAPI:
         if sent is not None:
             info["request"] = sent
         tail = f" | запит: {log_json(sent)}" if sent is not None else ""
-        for attempt in range(3):
+        tries = self.RATE_LIMIT_TRIES
+        for attempt in range(tries):
             started = time.monotonic()
             try:
                 r = self.s.request(method, self.base + path, timeout=timeout, **kw)
             except net.RequestException as e:
                 log.error("Checkbox %s %s — %s%s", method, path, e, tail, extra={"data": dict(info, error=str(e))})
                 raise
-            if r.status_code != 429 or attempt == 2:
+            if r.status_code != 429 or attempt == tries - 1:
                 break
             # 429 «Занадто часто»: запит не виконано — чекаємо, скільки просить Checkbox, і повторюємо
             wait = min(self._retry_after(r) + 1, self.RATE_LIMIT_MAX_WAIT)
