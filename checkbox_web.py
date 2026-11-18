@@ -598,10 +598,6 @@ class App:
             if bad:
                 raise UserError(f"Акцизна марка має містити {EXCISE_MARK_LEN} символів: «{bad[0]}» — {len(bad[0])} ({row['name']})",
                                 code="EXCISE_FORMAT")
-            bad = [m for m in marks if len(m) != EXCISE_MARK_LEN]
-            if bad:
-                raise UserError(f"Акцизна марка має містити {EXCISE_MARK_LEN} символів: «{bad[0]}» — {len(bad[0])} "
-                                f"({row['name']})", code="EXCISE_FORMAT")
             if marks and not row["is_weight"] and len(marks) > qty // 1000:
                 raise UserError(f"Марок більше, ніж одиниць товару: {row['name']}")
             dup = all_marks.intersection(marks) or (len(set(marks)) != len(marks))
@@ -1140,7 +1136,6 @@ class App:
 
 APP: App = None
 EXCISE_MARK_LEN = 10        # акцизна марка: серія й номер — рівно 10 символів
-EXCISE_MARK_LEN = 10          # серія й номер акцизної марки — рівно 10 символів
 
 # --- власні зображення плиток (лише локально, у папці даних) ---
 IMG_DIR = DATA_DIR / "images"
@@ -3299,8 +3294,7 @@ function renderExcise() {
     `<li>${esc(m)} <button class="x" data-k="${k}" title="Видалити">✕</button></li>`).join('');
 }
 function closeExcise() { $('#exciseModal').classList.remove('show'); exciseIdx = null; renderCart(); $('#search').focus(); }
-const EXCISE_LEN = 10;
-const markProblem = v => v.length !== EXCISE_LEN ? `Акцизна марка має містити ${EXCISE_LEN} символів — введено ${v.length}` : null;
+const markProblem = v => v.length !== EXCISE_MARK_LEN ? `Акцизна марка має містити ${EXCISE_MARK_LEN} символів — введено ${v.length}` : null;
 async function soldMarkInfo(v) {       // марка вже продана? (сервер усе одно перевірить при пробитті чека)
   try { const r = await api('/api/excise/check?mark=' + encodeURIComponent(v)); return r.sold ? (r.info || {}) : null; }
   catch (err) { return null; }
@@ -3308,8 +3302,8 @@ async function soldMarkInfo(v) {       // марка вже продана? (с�
 const soldText = (v, i) => `Марка ${v} вже продана: ${i.good_name || 'товар'}, чек ${i.fiscal_code || i.receipt_id || '—'} від ${(i.sold_at || '').replace('T', ' ').slice(0, 16)}`;
 function renderExciseLen() {
   const v = $('#exciseInput').value.trim(), el = $('#exciseLen');
-  el.textContent = v ? `${v.length} з ${EXCISE_LEN} символів` : '';
-  el.style.color = v && v.length !== EXCISE_LEN ? 'var(--bad)' : '';
+  el.textContent = v ? `${v.length} з ${EXCISE_MARK_LEN} символів` : '';
+  el.style.color = v && v.length !== EXCISE_MARK_LEN ? 'var(--bad)' : '';
 }
 $('#exciseInput').oninput = renderExciseLen;
 $('#exciseAdd').onclick = () => { addExciseMark(); $('#exciseInput').focus(); };
@@ -3326,7 +3320,6 @@ async function addExciseMark() {
   if (p) { toast(p, true); return $('#exciseInput').select(); }
   $('#exciseInput').value = ''; renderExciseLen();
   const idx = exciseIdx, c = cart[idx]; const need = Math.round(c.qty / 1000);
-  if (v.length !== EXCISE_MARK_LEN) return toast(`Акцизна марка має містити ${EXCISE_MARK_LEN} символів, а «${v}» — ${v.length}`, true);
   if (c.marks.includes(v) || allMarks(idx).includes(v)) return toast('Ця марка вже додана', true);
   if (c.marks.length >= need) return toast(`Вже додано ${need} марок — збільште кількість товару`, true);
   const sold = await soldMarkInfo(v);
