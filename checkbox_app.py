@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.7.0.1"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.7.0.2"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -1017,6 +1017,10 @@ class LocalDB:
         for col in ("shift_id", "shift_serial", "shift_opened_at", "shift_closed_at"):   # зміна чека
             if col not in scols:
                 self.con.execute(f"ALTER TABLE sales ADD COLUMN {col} TEXT")
+        try:
+            register_taxes(self.taxes())
+        except sqlite3.OperationalError:
+            pass
         if not self.meta("excise_backfill"):     # після всіх міграцій sales
             self._excise_backfill()
 
@@ -1192,6 +1196,7 @@ class LocalDB:
                 [(t["code"], t.get("symbol"), t.get("label"), t.get("rate"), t.get("extra_rate"),
                   int(bool(t.get("included"))), int(bool(t.get("no_vat")))) for t in taxes])
             self.con.execute("INSERT OR REPLACE INTO meta VALUES ('taxes_source', ?)", (source,))
+        register_taxes(self.taxes())
 
     def taxes(self):
         return self.con.execute("SELECT * FROM taxes ORDER BY code").fetchall()
@@ -1484,15 +1489,50 @@ def is_excise_only(t):
     return (not t.get("rate") and t.get("extra_rate")) or (label.startswith("акциз") and "пдв" not in label)
 
 
+# Довідник ставок організації (код → ставка) для впорядкування кодів, що йдуть у Checkbox.
+_TAX_INFO = {}
+
+
+def register_taxes(taxes):
+    """Оновити довідник ставок (з бази при старті й після кожного оновлення ставок)."""
+    _TAX_INFO.clear()
+    for t in taxes or []:
+        t = dict(t)
+        if t.get("code") is not None:
+            _TAX_INFO[int(t["code"])] = t
+
+
+def _tax_rank(t):
+    """0 — ПДВ (ставка > 0, без акцизу), 1 — інші (без ПДВ, ПДВ+акциз однією ставкою), 2 — чистий акциз."""
+    if not t:
+        return 1
+    if is_excise_only(t):
+        return 2
+    return 0 if (t.get("rate") or 0) > 0 and not t.get("extra_rate") else 1
+
+
 def ordered_tax_codes(taxes):
-    """Коди податків товару в порядку, який вимагає Checkbox: спершу ПДВ, потім акциз."""
-    return [t["code"] for t in sorted(taxes, key=lambda t: 1 if is_excise_only(t) else 0)]
+    """Коди податків товару в порядку, який вимагає Checkbox: спершу ПДВ (напр. 20%), потім акциз (5%)."""
+    return [t["code"] for t in sorted(taxes, key=_tax_rank)]
+
+
+def vat_first(codes):
+    """Той самий порядок для списку кодів: ПДВ першим, акциз останнім (за довідником ставок)."""
+    out = []
+    for c in codes or []:
+        try:
+            c = int(c)
+        except (TypeError, ValueError):
+            continue
+        if c not in out:
+            out.append(c)
+    return sorted(out, key=lambda c: _tax_rank(_TAX_INFO.get(c)))
 
 
 def good_tax_codes(row):
     try:
-        return json.loads(row["tax_codes"] or "[]")
-    except (ValueError, IndexError, KeyError):
+        return vat_first(json.loads(row["tax_codes"] or "[]"))
+    except (ValueError, IndexError, KeyError, TypeError):
         return []
 
 
@@ -1537,7 +1577,7 @@ def good_put_body(current, data):
     if "is_weight" in data:
         body["is_weight"] = bool(data["is_weight"])
     if "tax_codes" in data:
-        body["tax_codes"] = list(data["tax_codes"] or [])
+        body["tax_codes"] = vat_first(data["tax_codes"])
     if "group_id" in data:
         body["group"] = data["group_id"] or None
     if body.get("barcode") and body.get("barcodes") is not None and current and current.get("barcode") \
@@ -1629,7 +1669,7 @@ def discount_amount(spec, base, where):
 
 def tax_fields(codes):
     """Податки, від яких рахується знижка: tax_code для однієї ставки, tax_codes — для кількох."""
-    codes = list(codes or [])
+    codes = vat_first(codes)
     if not codes:
         return {}
     return {"tax_code": codes[0]} if len(codes) == 1 else {"tax_codes": codes}
@@ -1693,7 +1733,7 @@ def _line_tax_codes(line):
         c = t.get("code") if isinstance(t, dict) else t
         if c is not None and c not in codes:
             codes.append(c)
-    return codes
+    return vat_first(codes)
 
 
 def _line_total(line):
@@ -1759,7 +1799,7 @@ def return_good_payload(line, qty, use_leftovers):
     """Товар для чека повернення: is_return, та сама ціна, різниця з сумою — знижкою чи надбавкою."""
     good = {"code": line["code"], "name": line["name"], "price": line["price"]}
     if line["tax_codes"]:
-        good["tax"] = list(line["tax_codes"])
+        good["tax"] = vat_first(line["tax_codes"])
     if line.get("barcode"):
         good["barcode"] = line["barcode"]
     marks = line.get("excise_barcodes") or []

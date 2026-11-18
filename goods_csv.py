@@ -48,7 +48,7 @@ from pathlib import Path
 
 import json
 
-from checkbox_app import (CheckboxAPI, CheckboxError, LocalDB, good_tax_codes, is_excise_only,
+from checkbox_app import (CheckboxAPI, CheckboxError, LocalDB, good_tax_codes, is_excise_only, ordered_tax_codes,
                           load_config, log, net, setup_logging, sync_all)
 
 COLUMNS = ["id", "code", "barcode", "name", "price", "count", "is_weight", "uktzed", "tax_codes"]
@@ -183,7 +183,7 @@ def parse_taxes(s, by_code, by_symbol):
         if t not in taxes:
             taxes.append(t)
     # порядок, якого вимагає Checkbox: спершу ПДВ, потім акциз
-    return [t["code"] for t in sorted(taxes, key=lambda t: 1 if is_excise_only(t) else 0)]
+    return ordered_tax_codes(taxes)
 
 
 def _cp1251_ok(ch):
