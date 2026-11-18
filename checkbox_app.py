@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.3.4"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.3.5"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -430,6 +430,56 @@ class CheckboxAPI:
                 return result, use_leftovers
             offset += limit
 
+    # --- групи товарів ---
+    @staticmethod
+    def _parse_group(g):
+        if not isinstance(g, dict) or not g.get("id"):
+            return None
+        parent = g.get("parent_id") or g.get("parent_group_id") or g.get("parent")
+        if isinstance(parent, dict):
+            parent = parent.get("id")
+        return {"id": str(g["id"]), "name": g.get("name") or g.get("title"), "parent_id": str(parent) if parent else None}
+
+    def get_groups(self, limit=100):
+        """
+        Групи й підгрупи товарів (GET /goods/groups). None — метод недоступний
+        (тоді назви беремо з товарів чи вивантаження).
+        """
+        offset, result = 0, []
+        try:
+            while True:
+                data = self._req("GET", "/goods/groups", params={"limit": limit, "offset": offset})
+                batch = data.get("results", []) if isinstance(data, dict) else (data or [])
+                for g in batch:
+                    flat = [g]
+                    while flat:                       # групи можуть приходити деревом (children)
+                        item = flat.pop()
+                        parsed = self._parse_group(item)
+                        if parsed:
+                            result.append(parsed)
+                        for child in item.get("children") or [] if isinstance(item, dict) else []:
+                            if isinstance(child, dict):
+                                child.setdefault("parent_id", item.get("id"))
+                                flat.append(child)
+                if not isinstance(data, dict) or len(batch) < limit:
+                    return result
+                offset += limit
+        except (CheckboxError, net.RequestException) as e:
+            log.info("Групи товарів через /goods/groups недоступні (%s) — назви з товарів", e)
+            return None
+
+    def group_names_from_export(self):
+        """{group_id: назва} з вивантаження номенклатури (колонка «група товарів») — запасний варіант."""
+        import goods_csv                    # тут, щоб не було циклічного імпорту
+        task = self.goods_export_start("csv")
+        self.wait_task(self.goods_export_status, task, ready={"done"})
+        f = goods_csv.CheckboxFile.from_bytes(self.goods_export_file(task))
+        col = next((i for i, h in enumerate(f.header) if goods_csv._norm_header(h) in ("група товарів", "група")), None)
+        code_col = next((i for i, h in enumerate(f.header) if goods_csv._norm_header(h) == "код"), None)
+        if col is None or code_col is None:
+            return {}
+        return {str(r[code_col]).strip(): r[col].strip() for r in f.rows if len(r) > max(col, code_col) and r[col].strip()}
+
     # --- податкові ставки ---
     def get_taxes(self, goods=None):
         """
@@ -761,6 +811,10 @@ class LocalDB:
             updated_at TEXT)""")
         # міграція старої бази: колонка з кодами податків товару
         cols = [r["name"] for r in self.con.execute("PRAGMA table_info(goods)")]
+        if "group_id" not in cols:          # група товару в Checkbox
+            self.con.execute("ALTER TABLE goods ADD COLUMN group_id TEXT")
+        # групи й підгрупи товарів (parent_id — батьківська група)
+        self.con.execute("CREATE TABLE IF NOT EXISTS goods_groups (id TEXT PRIMARY KEY, name TEXT, parent_id TEXT)")
         if "tax_codes" not in cols:
             self.con.execute("ALTER TABLE goods ADD COLUMN tax_codes TEXT")  # JSON-список кодів
         if "pending" not in cols:
@@ -786,16 +840,56 @@ class LocalDB:
             self.con.execute("DELETE FROM goods")
             self.con.executemany(
                 "INSERT INTO goods (id, code, name, barcode, price, count, is_weight, uktzed, "
-                "synced_at, tax_codes) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "synced_at, tax_codes, group_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 [(g["id"], g["code"], g["name"], g.get("barcode"),
                   g["price"], g.get("count"), int(bool(g.get("is_weight"))),
                   g.get("uktzed"), now,
-                  json.dumps(ordered_tax_codes(g.get("taxes") or [])))
+                  json.dumps(ordered_tax_codes(g.get("taxes") or [])), good_group_id(g))
                  for g in goods])
             self.con.execute("INSERT OR REPLACE INTO meta VALUES ('use_leftovers', ?)",
                              (json.dumps(use_leftovers),))
             self.con.execute("INSERT OR REPLACE INTO meta VALUES ('synced_at', ?)", (now,))
             self._overlay_pending()        # невідправлені правки не губляться при синхронізації
+
+    # --- групи товарів ---
+    def replace_groups(self, groups):
+        """groups — [{id, name, parent_id}] з Checkbox; назви, відомі раніше, не губимо, якщо нових немає."""
+        with self.con:
+            known = {r["id"]: r["name"] for r in self.con.execute("SELECT id, name FROM goods_groups")}
+            self.con.execute("DELETE FROM goods_groups")
+            self.con.executemany("INSERT OR REPLACE INTO goods_groups (id, name, parent_id) VALUES (?,?,?)",
+                                 [(g["id"], g.get("name") or known.get(g["id"]), g.get("parent_id")) for g in groups])
+
+    def set_group_names(self, names):
+        """Назви груп з іншого джерела (group_name товару, вивантаження) — лише для груп без назви."""
+        with self.con:
+            for gid, name in names.items():
+                self.con.execute("INSERT INTO goods_groups (id, name) VALUES (?, ?) "
+                                 "ON CONFLICT(id) DO UPDATE SET name=COALESCE(goods_groups.name, excluded.name)",
+                                 (gid, name))
+
+    def groups(self):
+        """Групи з повним шляхом: [{id, name, parent_id, path: [назви від кореня]}]."""
+        rows = {r["id"]: dict(r) for r in self.con.execute("SELECT id, name, parent_id FROM goods_groups")}
+        used = {r["group_id"] for r in self.con.execute("SELECT DISTINCT group_id FROM goods WHERE group_id IS NOT NULL")}
+        for gid in used - rows.keys():       # група товару, якої немає в довіднику
+            rows[gid] = {"id": gid, "name": None, "parent_id": None}
+
+        def path(gid, seen=()):
+            g = rows.get(gid)
+            if not g or gid in seen:
+                return []
+            name = g["name"] or f"Група {gid[:8]}"
+            return path(g["parent_id"], seen + (gid,)) + [name] if g["parent_id"] else [name]
+
+        for g in rows.values():
+            g["path"] = path(g["id"])
+        return sorted(rows.values(), key=lambda g: [p.lower() for p in g["path"]])
+
+    def groups_without_names(self):
+        return {r["group_id"] for r in self.con.execute(
+            "SELECT DISTINCT g.group_id FROM goods g LEFT JOIN goods_groups gg ON gg.id = g.group_id "
+            "WHERE g.group_id IS NOT NULL AND gg.name IS NULL")}
 
     # --- невідправлені правки товарів ---
     LOCAL_ID_PREFIX = "local-"         # тимчасовий id нового товару, поки його немає в Checkbox
@@ -1082,6 +1176,14 @@ def good_tax_codes(row):
 def is_excise_tax(t):
     """Ставка містить акциз (окремий акциз або «ПДВ + Акцизний податок»)."""
     return bool(t.get("extra_rate")) or "акциз" in (t.get("label") or "").lower()
+
+
+def good_group_id(g):
+    """Група товару з відповіді /goods: group_id або вкладений об'єкт group."""
+    gid = g.get("group_id")
+    if not gid and isinstance(g.get("group"), dict):
+        gid = g["group"].get("id")
+    return str(gid) if gid else None
 
 
 def build_goods_payload(cart, use_leftovers, line_discounts=None):
@@ -1401,10 +1503,39 @@ def print_goods(rows, db=None):
 
 # ───────────────────────── Дії меню ─────────────────────────
 
+def sync_groups(api, db, goods):
+    """Групи товарів: довідник Checkbox, а для груп без назви — group_name товарів чи вивантаження."""
+    groups = api.get_groups()
+    if groups is not None:
+        db.replace_groups(groups)
+    names = {}
+    for g in goods:
+        grp = g.get("group") if isinstance(g.get("group"), dict) else {}
+        gid, name = good_group_id(g), g.get("group_name") or grp.get("name")
+        if gid and name:
+            names[gid] = name
+    if names:
+        db.set_group_names(names)
+    missing = db.groups_without_names()
+    last = db.meta("groups_export_at")
+    recent = last and (datetime.now() - datetime.fromisoformat(json.loads(last))).total_seconds() < 6 * 3600
+    if missing and not recent:   # останній варіант — колонка «група товарів» у вивантаженні (не частіше раз на 6 год)
+        with db.con:
+            db.con.execute("INSERT OR REPLACE INTO meta VALUES ('groups_export_at', ?)",
+                           (json.dumps(datetime.now().isoformat(timespec="seconds")),))
+        try:
+            by_code = api.group_names_from_export()
+            code_group = {str(g["code"]).strip(): good_group_id(g) for g in goods}
+            db.set_group_names({code_group[c]: n for c, n in by_code.items() if code_group.get(c) in missing})
+        except (CheckboxError, net.RequestException) as e:
+            log.info("Назви груп з вивантаження недоступні: %s", e)
+
+
 def sync_all(api, db):
-    """Синхронізує товари і податкові ставки. Повертає (goods, use_leftovers, taxes, source)."""
+    """Синхронізує товари, групи і податкові ставки. Повертає (goods, use_leftovers, taxes, source)."""
     goods, use_leftovers = api.get_all_goods()
     db.replace_goods(goods, use_leftovers)
+    sync_groups(api, db, goods)
     taxes, source = api.get_taxes(goods)
     db.replace_taxes(taxes, source)
     return goods, use_leftovers, taxes, source

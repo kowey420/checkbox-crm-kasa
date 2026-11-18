@@ -415,8 +415,13 @@ class App:
                 g["pending_error"] = errors.get((g["code"] or "").strip())
                 g["cb_count"] = self.db.checkbox_count(r)
             goods.append(g)
+        groups = self.db.groups()
+        paths = {g["id"]: g["path"] for g in groups}
+        for g in goods:
+            g["group_path"] = paths.get(g.get("group_id")) or []
         return {
             "goods": goods,
+            "groups": groups,
             "taxes": [dict(t) for t in self.db.taxes()],
             "taxes_source": self.db.meta("taxes_source"),
             "use_leftovers": self.db.meta("use_leftovers"),
@@ -1338,6 +1343,15 @@ PAGE = r"""<!DOCTYPE html>
   .phonebox label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
   .phonebox input.bad, input.bad { border-color: var(--bad); outline-color: var(--bad); }
   .phonebox small { font-size: 12px; }
+  .groupbar { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 2px; align-items: center; }
+  .groupbar .crumb { font-size: 13px; color: var(--muted); }
+  .groupbar .crumb a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .groupbar .chip.on { background: var(--accent-btn); border-color: var(--accent-btn); color: #fff; }
+  .groupbar .chip small { color: inherit; opacity: .7; margin-left: 2px; }
+  .ghead { margin: 12px 0 2px; padding: 4px 2px; font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; border-bottom: 1px solid var(--line); }
+  .ghead:first-child { margin-top: 4px; }
+  tr.grouprow td { background: var(--subtle); font-weight: 700; font-size: 13px; color: var(--muted); cursor: default; }
+  tr.grouprow td small { font-weight: 400; }
   .stockbox { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
   #askModal { z-index: 60; }
   #scanModal .card { max-width: 620px; }
@@ -1401,6 +1415,7 @@ PAGE = r"""<!DOCTYPE html>
           <input type="text" id="search" placeholder="Штрихкод, код або назва — Enter додає в кошик" autofocus>
           <button class="btn" id="scanBtn" style="white-space:nowrap" title="Сканувати товари один за одним, потім одразу оплата (F2)">▦ Сканувати підряд</button>
         </div>
+        <div class="groupbar" id="posGroups"></div>
         <div class="results" id="results"></div>
       </div>
       <div class="card">
@@ -1447,6 +1462,7 @@ PAGE = r"""<!DOCTYPE html>
       </div>
       <div class="row">
         <input type="text" id="goodsFilter" placeholder="Фільтр…">
+        <select id="goodsGroup" style="max-width:280px" title="Група товарів"></select>
         <button class="btn" id="goodAddBtn" style="white-space:nowrap">+ Додати товар</button>
       </div>
       <p class="muted" style="font-size:12px;margin:6px 0 0">Клікніть товар, щоб змінити його. Зміни одразу діють у касі, а в Checkbox ідуть під час синхронізації (⟳, відкриття або закриття зміни).</p>
@@ -1888,7 +1904,10 @@ PAGE = r"""<!DOCTYPE html>
 <script>
 const $ = s => document.querySelector(s);
 let goods = [], cart = [], useLeftovers = false, roundingMode = null, cartTotal = 0, taxes = [];
-let cartDisc = null;   // знижка/надбавка на весь чек: { type, mode, value, name }
+let cartDisc = null;
+// групи товарів: groupList — [{id, name, parent_id, path}], posGroup — обрана група в касі (null — усі)
+let groupList = [], groupById = {}, groupChildren = {}, posGroup = null;
+const NO_GROUP = '__none__';   // знижка/надбавка на весь чек: { type, mode, value, name }
 
 const taxBadges = codes => {
   if (!codes || !codes.length) return '<span class="tax none" title="Товар без податкової ставки — чек буде без податку">—</span>';
@@ -2031,6 +2050,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
 async function loadGoods() {
   const d = await api('/api/goods');
   goods = d.goods; useLeftovers = !!d.use_leftovers; roundingMode = d.cash_rounding; taxes = d.taxes || [];
+  setGroups(d.groups || []);
   renderPending(d.pending);
   renderTaxes(d.taxes_source);
   $('#synced').textContent = d.synced_at ? d.synced_at.replace('T', ' ') : '—';
@@ -2040,13 +2060,65 @@ const match = (g, q) => {
   q = q.trim().toLowerCase();
   return !q || g.name.toLowerCase().includes(q) || g.code.trim().toLowerCase().includes(q) || (g.barcode || '').includes(q);
 };
+// --- групи й підгрупи ---
+function setGroups(list) {
+  groupList = list; groupById = {}; groupChildren = {};
+  list.forEach(g => { groupById[g.id] = g; });
+  list.forEach(g => { const p = g.parent_id && groupById[g.parent_id] ? g.parent_id : ''; (groupChildren[p] = groupChildren[p] || []).push(g); });
+  if (posGroup && posGroup !== NO_GROUP && !groupById[posGroup]) posGroup = null;
+  const sel = $('#goodsGroup'), cur = sel.value;
+  sel.innerHTML = '<option value="">Усі групи</option>' + list.map(g =>
+    `<option value="${esc(g.id)}">${'\u00a0\u00a0'.repeat(g.path.length - 1)}${esc(g.path[g.path.length - 1])}</option>`).join('') +
+    (goods.some(g => !g.group_id) && list.length ? `<option value="${NO_GROUP}">Без групи</option>` : '');
+  sel.value = [...sel.options].some(o => o.value === cur) ? cur : '';
+  sel.style.display = list.length ? '' : 'none';
+}
+function inGroup(g, gid) {            // товар у групі gid або її підгрупах
+  if (!gid) return true;
+  if (gid === NO_GROUP) return !g.group_id || !groupById[g.group_id];
+  for (let x = g.group_id, n = 0; x && n < 20; x = (groupById[x] || {}).parent_id, n++) if (x === gid) return true;
+  return false;
+}
+const groupKey = g => (g.group_path && g.group_path.length ? '0' + g.group_path.join('\u0001') : '1').toLowerCase();
+const sortByGroup = list => list.slice().sort((a, b) => groupKey(a).localeCompare(groupKey(b), 'uk') || a.name.localeCompare(b.name, 'uk'));
+const groupTitle = (g, from) => (g.group_path && g.group_path.length ? g.group_path.slice(from).join(' / ') : 'Без групи') || '';
+function renderPosGroups() {
+  const bar = $('#posGroups');
+  if (!groupList.length) { bar.innerHTML = ''; bar.style.display = 'none'; return; }
+  bar.style.display = '';
+  const searching = !!$('#search').value.trim();
+  const count = gid => goods.filter(g => inGroup(g, gid)).length;
+  const chain = [];
+  for (let x = posGroup !== NO_GROUP ? posGroup : null; x && groupById[x]; x = groupById[x].parent_id) chain.unshift(groupById[x]);
+  const crumbs = `<span class="crumb"><a data-grp="">Усі товари</a>${chain.map(g => ` › <a data-grp="${esc(g.id)}">${esc(g.name || g.path[g.path.length - 1])}</a>`).join('')}${posGroup === NO_GROUP ? ' › Без групи' : ''}</span>`;
+  const level = posGroup === NO_GROUP ? [] : (groupChildren[posGroup || ''] || []).filter(g => count(g.id));
+  const chips = level.map(g => `<button class="chip" data-grp="${esc(g.id)}">${esc(g.path[g.path.length - 1])}<small>${count(g.id)}</small></button>`).join('');
+  const none = !posGroup && goods.some(g => !g.group_id || !groupById[g.group_id]) ? `<button class="chip" data-grp="${NO_GROUP}">Без групи<small>${count(NO_GROUP)}</small></button>` : '';
+  bar.innerHTML = (posGroup ? crumbs : '') + chips + none + (searching && posGroup ? '<span class="crumb">· пошук по всіх групах</span>' : '');
+}
+$('#posGroups').onclick = e => {
+  const a = e.target.closest('[data-grp]'); if (!a) return;
+  posGroup = a.dataset.grp || null; renderSearch(); $('#search').focus();
+};
 function renderSearch() {
-  const list = goods.filter(g => match(g, $('#search').value)).slice(0, 100);
-  $('#results').innerHTML = list.map(g => `
+  renderPosGroups();
+  const q = $('#search').value;
+  // пошук — по всіх товарах; без пошуку — товари обраної групи з підгрупами
+  const list = sortByGroup(goods.filter(g => q.trim() ? match(g, q) : inGroup(g, posGroup))).slice(0, 300);
+  const depth = posGroup && posGroup !== NO_GROUP && groupById[posGroup] ? groupById[posGroup].path.length : 0;
+  let lastHead = null;
+  $('#results').innerHTML = list.map(g => {
+    let head = '';
+    if (groupList.length) {
+      const t = groupTitle(g, depth);
+      if (t !== lastHead) { head = t ? `<div class="ghead">${esc(t)}</div>` : ''; lastHead = t; }
+    }
+    return head + `
     <div class="item" data-id="${esc(g.id)}">
       <div><b>${esc(g.name)}</b>${pendingBadge(g)}<small>${esc(g.barcode || g.code)}</small></div>
       <div class="r">${uah(g.price)} ₴<small class="${g.count === 0 ? 'zero' : ''}">${qtyStr(g.count, g.is_weight)}</small></div>
-    </div>`).join('') || '<p class="muted">Нічого не знайдено. Можливо, потрібна синхронізація.</p>';
+    </div>`;
+  }).join('') || '<p class="muted">Нічого не знайдено. Можливо, потрібна синхронізація.</p>';
 }
 function pendingBadge(g) {
   if (!g.pending) return '';
@@ -2056,19 +2128,31 @@ function pendingBadge(g) {
     : ' <span class="pend" title="Зміни ще не відправлені в Checkbox">● змінено локально</span>';
 }
 function renderGoodsTable() {
-  const list = goods.filter(g => match(g, $('#goodsFilter').value));
+  const gsel = $('#goodsGroup').value;
+  const list = sortByGroup(goods.filter(g => match(g, $('#goodsFilter').value) && inGroup(g, gsel || null)));
   $('#stCount').textContent = goods.length;
   $('#stZero').textContent = goods.filter(g => g.count === 0).length;
   $('#stLeft').textContent = useLeftovers ? 'увімкнено' : 'вимкнено';
   const noTax = goods.filter(g => !(g.tax_codes || []).length).length;
   $('#stNoTax').textContent = noTax; $('#stNoTax').className = noTax ? 'zero' : '';
-  $('#goodsTable').innerHTML = list.map(g => `
+  const sizes = {};
+  list.forEach(g => { const t = groupTitle(g, 0); sizes[t] = (sizes[t] || 0) + 1; });
+  let lastHead = null;
+  $('#goodsTable').innerHTML = list.map(g => {
+    let head = '';
+    if (groupList.length) {
+      const t = groupTitle(g, 0);
+      if (t !== lastHead) { head = `<tr class="grouprow"><td colspan="7">${esc(t)} <small>· ${sizes[t]}</small></td></tr>`; lastHead = t; }
+    }
+    return head + `
     <tr data-id="${esc(g.id)}"><td>${esc(g.name)}${pendingBadge(g)}</td>
       <td>${g.code !== g.code.trim() ? '<span class="zero" title="Код містить пробіли">⚠ </span>' : ''}${esc(g.code)}</td>
       <td>${esc(g.barcode)}</td><td>${esc(g.uktzed)}</td><td>${taxBadges(g.tax_codes)}</td>
       <td class="num">${uah(g.price)}</td>
-      <td class="num ${g.count === 0 ? 'zero' : ''}">${qtyStr(g.count, g.is_weight)}</td></tr>`).join('');
+      <td class="num ${g.count === 0 ? 'zero' : ''}">${qtyStr(g.count, g.is_weight)}</td></tr>`;
+  }).join('') || '<tr><td colspan="7" class="muted">Нічого не знайдено</td></tr>';
 }
+$('#goodsGroup').onchange = renderGoodsTable;
 $('#search').oninput = renderSearch;
 $('#goodsFilter').oninput = renderGoodsTable;
 
