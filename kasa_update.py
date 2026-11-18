@@ -331,15 +331,61 @@ def relaunch_if_inherited():
     if not getattr(sys, "frozen", False):
         return
     mei, age = _mei_age()
-    pyi = sorted(k for k in os.environ if k.upper().startswith(("_PYI_", "_MEIPASS", "PYINSTALLER")))
-    log.info("Тимчасова папка: %s (створена %s тому); змінні PyInstaller: %s", mei,
-             f"{age:.0f} с" if age is not None else "?", ", ".join(pyi) or "—")
     if os.environ.get("CHECKBOX_RESTARTED") != "1" or os.environ.get("CHECKBOX_RELAUNCHED") == "1":
         return
     if age is None or age > 90:
         log.warning("Каса працює зі спільною тимчасовою папкою старої копії — перезапускаю начисто")
         spawn_restarted(relaunch=True)
         sys.exit(0)
+
+
+_PYI_ENV_AT_START = sorted(k for k in os.environ if k.upper().startswith(("_PYI_", "_MEIPASS", "PYINSTALLER")))
+
+
+def log_temp_state():
+    """У журнал: власна тимчасова папка Kasa.exe, її вік і змінні PyInstaller на старті."""
+    if not getattr(sys, "frozen", False):
+        return
+    mei, age = _mei_age()
+    log.info("Тимчасова папка: %s (створена %s тому); змінні PyInstaller: %s", mei,
+             f"{age:.0f} с" if age is not None else "?", ", ".join(_PYI_ENV_AT_START) or "—")
+
+
+def _is_kasa_mei(folder):
+    """Папка _MEI… саме Kasa.exe (а не іншої програми на PyInstaller): є kasa.ico і certifi."""
+    return (folder / "kasa.ico").is_file() or ((folder / "certifi").is_dir() and (folder / "pystray").is_dir())
+
+
+def cleanup_old_temp():
+    """
+    Прибрати папки _MEI… попередніх копій каси, які їхній завантажувач не зміг видалити
+    («Failed to remove temporary directory»), і записати в журнал, що саме там лишилось —
+    за цим видно, хто тримав файли. Власну папку й папки інших програм не чіпаємо.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    import shutil
+    import tempfile
+    own = os.path.normcase(os.path.abspath(getattr(sys, "_MEIPASS", "") or ""))
+    try:
+        candidates = [p for p in Path(tempfile.gettempdir()).glob("_MEI*") if p.is_dir()]
+    except OSError:
+        return
+    for folder in candidates:
+        try:
+            if os.path.normcase(os.path.abspath(folder)) == own or not _is_kasa_mei(folder):
+                continue
+            left = [str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file()]
+            age = time.time() - folder.stat().st_mtime
+        except OSError:
+            continue
+        if age < 60:                    # ще може належати копії, що саме завершується
+            continue
+        shutil.rmtree(folder, ignore_errors=True)
+        still = [str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file()] if folder.exists() else []
+        log.info("Залишок тимчасової папки попередньої копії %s: %d файлів (%s)%s", folder.name, len(left),
+                 ", ".join(sorted(left)[:15]) + ("…" if len(left) > 15 else ""),
+                 f"; не вдалося видалити {len(still)}: {', '.join(sorted(still)[:15])}" if still else " — видалено")
 
 
 def cleanup_after_update():

@@ -10,6 +10,7 @@
 """
 
 import base64
+import io
 import json
 import os
 import re
@@ -4521,7 +4522,10 @@ def _tray_image(Image):
     for folder in (getattr(sys, "_MEIPASS", None), Path(__file__).resolve().parent):
         if folder and (Path(folder) / "kasa.ico").exists():
             try:
-                return Image.open(Path(folder) / "kasa.ico")
+                # у пам'ять: Image.open лінивий і тримав би kasa.ico в _MEI… відкритим увесь час роботи
+                img = Image.open(io.BytesIO((Path(folder) / "kasa.ico").read_bytes()))
+                img.load()
+                return img
             except OSError:
                 pass
     from PIL import ImageDraw
@@ -4704,6 +4708,8 @@ def main():
 
     log_path = setup_logging()
     log.info("──── Запуск каси %s, дані: %s", APP_VERSION, CONFIG_PATH.parent)
+    kasa_update.log_temp_state()
+    threading.Timer(20, kasa_update.cleanup_old_temp).start()   # залишки _MEI… попередніх копій
     if busy:
         log.info("Зайняті іншими програмами порти: %s — каса працює на порту %d", ", ".join(map(str, busy)), PORT)
         print(f"Порт {busy[0]} зайнятий іншою програмою — каса працює на порту {PORT}.")
