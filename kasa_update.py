@@ -53,6 +53,21 @@ def install_kind():
     return "py"
 
 
+def install_problem():
+    """Чому оновлення файлів .py неможливе на цьому місці (None — можна)."""
+    if install_kind() != "py":
+        return None
+    d = str(APP_DIR)
+    if "/AppTranslocation/" in d:
+        # macOS запускає завантажену й не переміщену програму з тимчасової копії «лише для читання»
+        return ("macOS запустила касу з тимчасової копії, у яку не можна записати оновлення. "
+                "Закрийте касу, у Finder перетягніть «Каса» в папку «Програми» (Applications) "
+                "і запускайте звідти — тоді оновлення встановиться")
+    if not os.access(APP_DIR, os.W_OK):
+        return f"Немає прав на запис у папку каси ({APP_DIR}) — перемістіть касу в папку, де у вас є права, напр. «Програми»"
+    return None
+
+
 def _session():
     s = net.Session()
     s.headers["User-Agent"] = f"checkbox-kasa/{APP_VERSION}"     # GitHub вимагає User-Agent
@@ -94,7 +109,11 @@ def check(force=False):
         "available": bool(newer and kind and need in assets and SUMS_ASSET in assets),
         "_assets": assets, "checked_at": datetime.now().isoformat(timespec="seconds"),
     }
-    if newer and not kind:
+    blocked = install_problem() if newer else None
+    if blocked:
+        data["available"] = False
+        data["problem"] = blocked
+    elif newer and not kind:
         data["problem"] = "Цю збірку оновлюють вручну — завантажте нову версію зі сторінки випуску"
     elif newer and (need not in assets or SUMS_ASSET not in assets):
         data["problem"] = f"У випуску {latest} ще немає файлу {need} — можливо, збирання ще триває"
@@ -161,7 +180,7 @@ def _install_py(data):
                     os.replace(backup / f, APP_DIR / f)
             except OSError:
                 pass
-        raise UpdateError(f"Немає прав на запис у папку каси ({APP_DIR}): {e}")
+        raise UpdateError(install_problem() or f"Немає прав на запис у папку каси ({APP_DIR}): {e}")
     log.info("Оновлено файли %s; резервна копія — %s", ", ".join(files), backup)
     return backup
 
