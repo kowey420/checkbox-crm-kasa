@@ -603,7 +603,7 @@ def supply_stock(api, stock, on_status=None, cbfile=None):
     todo = {}
     for code, (target, is_weight) in stock.items():
         delta = target - (current.get(code) or 0)
-        if delta > 0:
+        if delta:                    # alpha: від'ємна різниця — спроба списання тим самим імпортом
             todo[code] = (delta, is_weight, target)
     if not todo:
         return []
@@ -633,6 +633,9 @@ def supply_stock(api, stock, on_status=None, cbfile=None):
     out = CheckboxFile(header, rows, src.encoding, src.delimiter)
     say("Вношу залишки поставкою…")
     task = api.goods_import_upload("kasa_stock.csv", out.to_bytes(), True, True)
+    if any(d < 0 for d, _, _ in todo.values()):
+        log.info("Зменшення залишків від'ємною кількістю (alpha): %s",
+                 {c: fmt_count(d, w) for c, (d, w, _) in todo.items() if d < 0})
     log.info("Поставка залишків через імпорт (колонка «%s»): %s, завдання %s", header[qcol],
              {c: fmt_count(d, w) for c, (d, w, _) in todo.items()}, task)
     result = api.wait_task(api.goods_import_status, task, ready={"completed", "done"})
