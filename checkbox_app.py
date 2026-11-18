@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.4.6.16"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.7.0.0"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -889,6 +889,29 @@ class CheckboxAPI:
         return self._req("GET", f"/receipts/{receipt_id}/png", raw=True)
 
     # --- звіти ---
+    def z_reports(self, date_from, date_to, limit=1000):
+        """
+        Z-звіти за період: GET /reports (звіти каси за дату; працює з токеном касира), а якщо цей
+        метод недоступний — GET /reports/search. Пагінація limit/offset (limit до 1000).
+        """
+        params = {"from_date": date_from.isoformat(timespec="seconds"), "to_date": date_to.isoformat(timespec="seconds"),
+                  "is_z_report": "true", "desc": "true", "limit": limit}
+        last_err = None
+        for path in ("/reports", "/reports/search"):
+            out, offset = [], 0
+            try:
+                while True:
+                    data = self._req("GET", path, params=dict(params, offset=offset))
+                    batch = (data or {}).get("results", []) if isinstance(data, dict) else (data or [])
+                    out.extend(r for r in batch if isinstance(r, dict) and r.get("is_z_report", True))
+                    if len(batch) < limit or offset > 20000:
+                        return out
+                    offset += limit
+            except CheckboxError as e:
+                last_err = e
+                log.info("Z-звіти через %s недоступні: %s", path, e)
+        raise last_err
+
     def create_x_report(self):
         """X-звіт поточної зміни; повертає об'єкт звіту (з id)."""
         return self._req("POST", "/reports")
@@ -957,6 +980,11 @@ class LocalDB:
             status TEXT,                    -- OPEN | PAID | RETURNED
             receipts TEXT,                  -- JSON: [{id, kind, value, payment_type, fiscal_code, at}]
             updated_at TEXT)""")
+        # Z-звіти: зберігаються назавжди (з Checkbox — за останні дні, з цієї каси — при закритті зміни)
+        self.con.execute("""CREATE TABLE IF NOT EXISTS z_reports (
+            id TEXT PRIMARY KEY, shift_id TEXT, shift_serial TEXT, serial INTEGER, fiscal_code TEXT,
+            created_at TEXT, sell_sum INTEGER, return_sum INTEGER, service_in INTEGER, service_out INTEGER,
+            sell_count INTEGER, return_count INTEGER, balance INTEGER, payments TEXT, source TEXT)""")
         # Продані акцизні марки: одну марку не можна продати двічі (поки її не повернули).
         # Стан визначається часом: продана, якщо останній продаж пізніший за останнє повернення.
         self.con.execute("""CREATE TABLE IF NOT EXISTS excise_marks (
@@ -1203,6 +1231,37 @@ class LocalDB:
                  receipt_type, related_id))
             self._excise_apply(receipt_type, receipt, items, datetime.now().isoformat(timespec="milliseconds"), commit=False)
         self.set_receipt_shift(receipt)
+
+    # --- Z-звіти ---
+    def add_z_report(self, r, shift_serial=None, source="checkbox"):
+        """Зберегти Z-звіт (модель звіту Checkbox). Наявний запис доповнюється, а не затирається."""
+        if not isinstance(r, dict) or not r.get("id"):
+            return False
+        pays = r.get("payments") or []
+        total = lambda k: sum(int(p.get(k) or 0) for p in pays) if pays else None
+        at = r.get("fiscal_date") or r.get("created_at")
+        row = (r["id"], r.get("shift_id"), str(shift_serial) if shift_serial is not None else None, r.get("serial"),
+               r.get("fiscal_code"), local_time(at) if at else None, total("sell_sum"), total("return_sum"),
+               total("service_in"), total("service_out"), r.get("sell_receipts_count"), r.get("return_receipts_count"),
+               r.get("balance"), json.dumps(pays, ensure_ascii=False) if pays else None, source)
+        with self.con:
+            cur = self.con.execute("INSERT OR IGNORE INTO z_reports VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
+            if cur.rowcount == 0:      # уже є — дописуємо те, чого бракувало
+                self.con.execute(
+                    "UPDATE z_reports SET shift_id=COALESCE(shift_id,?), shift_serial=COALESCE(?,shift_serial), "
+                    "serial=COALESCE(serial,?), fiscal_code=COALESCE(fiscal_code,?), created_at=COALESCE(created_at,?), "
+                    "sell_sum=COALESCE(sell_sum,?), return_sum=COALESCE(return_sum,?), service_in=COALESCE(service_in,?), "
+                    "service_out=COALESCE(service_out,?), sell_count=COALESCE(sell_count,?), "
+                    "return_count=COALESCE(return_count,?), balance=COALESCE(balance,?), payments=COALESCE(payments,?) "
+                    "WHERE id=?", row[1:14] + (r["id"],))
+        return cur.rowcount == 1
+
+    def z_reports(self, limit=200):
+        """Z-звіти від нових; номер зміни — збережений або з чеків журналу цієї зміни."""
+        return [dict(x) for x in self.con.execute(
+            "SELECT z.*, COALESCE(z.shift_serial, (SELECT s.shift_serial FROM sales s WHERE s.shift_id=z.shift_id "
+            "AND s.shift_serial IS NOT NULL LIMIT 1)) AS shift_no FROM z_reports z "
+            "ORDER BY COALESCE(z.created_at, '') DESC LIMIT ?", (limit,))]
 
     # --- акцизні марки ---
     def _excise_backfill(self):

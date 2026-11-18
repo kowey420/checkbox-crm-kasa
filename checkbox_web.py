@@ -614,8 +614,15 @@ class App:
         sync = self._sync_quietly()          # правки дня — у Checkbox ще до Z-звіту
         shift = self.call(self.api.close_shift)
         self._set_shift(None)
+        if shift.get("id") and shift.get("closed_at"):      # журнал: зміна вже не «відкрита»
+            with self.db.con:
+                self.db.con.execute("UPDATE sales SET shift_closed_at=? WHERE shift_id=?",
+                                    (local_time(shift["closed_at"]), shift["id"]))
         z = shift.get("z_report") or {}
         if z.get("id"):
+            self.db.add_z_report(dict(z, shift_id=z.get("shift_id") or shift.get("id"),
+                                      created_at=z.get("created_at") or shift.get("closed_at")),
+                                 shift.get("serial"), "kasa")
             with self.db.con:
                 self.db.con.execute("INSERT OR REPLACE INTO meta VALUES ('last_z_report', ?)",
                                     (json.dumps({"id": z["id"], "serial": shift.get("serial"),
@@ -635,12 +642,26 @@ class App:
         return {"text": self.call(self.api.report_text, report_id)}
 
     def report_png(self, report_id):
+        """PNG X- чи Z-звіту. Звіт не змінюється — з Checkbox беремо лише раз, далі з диска."""
         if not self.RECEIPT_ID.match(report_id or ""):
             raise UserError("Невірний ID звіту")
+        cache = DATA_DIR / "reports" / f"{report_id.lower()}.png"
+        if cache.exists():
+            return cache.read_bytes()
         png = self.call(self.api.report_png, report_id)
         if not png.startswith(b"\x89PNG"):
             raise CheckboxError("Checkbox повернув не PNG")
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache.with_suffix(".tmp")
+            tmp.write_bytes(png)
+            tmp.replace(cache)
+        except OSError:
+            pass
         return png
+
+    def z_reports(self):
+        return {"reports": self.db.z_reports()}
 
     def last_z(self):
         try:
@@ -1197,12 +1218,19 @@ class App:
         now = datetime.now().astimezone()
         receipts = self.call(self.api.search_receipts, now - timedelta(days=JOURNAL_DAYS), now)
         new = sum(1 for r in receipts if r.get("id") and self.db.add_checkbox_receipt(r))
+        z_new, z_error = 0, None
+        try:
+            for z in self.call(self.api.z_reports, now - timedelta(days=JOURNAL_DAYS), now):
+                z_new += 1 if self.db.add_z_report(z) else 0
+        except (CheckboxError, net.RequestException) as e:
+            z_error = str(e)
+            log.warning("Z-звіти з Checkbox не завантажено: %s", e)
         stamp = datetime.now().isoformat(timespec="seconds")
         with self.db.con:
             self.db.con.execute("INSERT OR REPLACE INTO meta VALUES ('receipts_fetched_at', ?)", (stamp,))
         removed, _ = self.purge_old()
         log.info("Завантаження чеків з Checkbox: отримано %d, нових %d", len(receipts), new)
-        return {"fetched": len(receipts), "new": new, "removed": removed, "fetched_at": stamp}
+        return {"fetched": len(receipts), "new": new, "removed": removed, "fetched_at": stamp, "z_new": z_new, "z_error": z_error}
 
     def receipt_text(self, receipt_id):
         if not receipt_id:
@@ -1414,6 +1442,8 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.excise_check, (q.get("mark") or [""])[0])
         elif u.path == "/api/excise":
             self._run(APP.excise_list, (q.get("q") or [""])[0])
+        elif u.path == "/api/zreports":
+            self._run(APP.z_reports)
         elif u.path == "/api/prepayments":
             self._run(APP.prepayments)
         elif u.path == "/api/prepay/state":
@@ -2001,6 +2031,18 @@ PAGE = r"""<!DOCTYPE html>
           <button class="btn sec small" id="fetchReceipts">⟳ Завантажити з Checkbox</button></span>
       </div>
       <div id="salesDays" style="margin-top:12px"></div>
+    </div>
+    <div class="card" style="margin-top:20px">
+      <div class="row" style="justify-content:space-between">
+        <h3 style="margin:0">Z-звіти</h3>
+        <small class="muted" id="zStat"></small>
+      </div>
+      <p class="muted" style="font-size:12px;margin:6px 0 0">Звіти зберігаються в касі: закриті з цієї каси — одразу, з Checkbox — за останні 7 днів
+        кнопкою «⟳ Завантажити з Checkbox». Клікніть звіт, щоб побачити його.</p>
+      <table style="margin-top:12px" class="zrep">
+        <thead><tr><th>Дата</th><th>Зміна</th><th>Z №</th><th>ФН</th><th class="num">Продажі</th><th class="num">Повернення</th><th class="num">Чеків</th><th class="num">Готівка в касі</th></tr></thead>
+        <tbody id="zTable"></tbody>
+      </table>
     </div>
   </section>
 </main>
@@ -4143,7 +4185,9 @@ function shiftTitle(sh, day) {
   // час показуємо з датою, якщо зміна почалась або закінчилась не в цей день
   const fmt = t => t && t.slice(0, 10) !== day ? dm(t) : hm(t);
   const span = sh.opened ? `${fmt(sh.opened)} – ${sh.closed ? fmt(sh.closed) : 'відкрита'}` : '';
-  return `Зміна №${esc(sh.serial || '?')}${span ? ` <small class="muted">· ${span}</small>` : ''}`;
+  const z = zByShift[sh.id];
+  const zl = z ? ` · <a href="#" class="zlink" data-zid="${esc(z.id)}" data-no="${esc(sh.serial || '')}">Z-звіт</a>` : '';
+  return `Зміна №${esc(sh.serial || '?')}${span ? ` <small class="muted">· ${span}</small>` : ''}${zl}`;
 }
 function receiptRows(list) {
   return `<table><thead><tr><th>Час</th><th>Тип</th><th>Оплата</th><th class="num">Сума, ₴</th><th>Фіскальний №</th><th></th></tr></thead><tbody>
@@ -4156,7 +4200,28 @@ function receiptRows(list) {
       <td class="muted" style="font-size:11px">${s.source === 'checkbox' ? 'з Checkbox' : 'з каси'}</td></tr>`; }).join('')}
     </tbody></table>`;
 }
+let zByShift = {};
+async function loadZ() {
+  try {
+    const { reports } = await api('/api/zreports');
+    zByShift = {};
+    reports.forEach(z => { if (z.shift_id) zByShift[z.shift_id] = z; });
+    const money = v => v == null ? '—' : uah(v) + ' ₴';
+    $('#zStat').textContent = reports.length ? `збережено: ${reports.length}` : '';
+    $('#zTable').innerHTML = reports.map(z => `<tr data-z="${esc(z.id)}" data-no="${esc(z.shift_no ?? '')}" style="cursor:pointer">
+      <td>${esc((z.created_at || '').replace('T', ' ').slice(0, 16)) || '—'}</td><td>${z.shift_no != null ? '№' + esc(z.shift_no) : '—'}</td>
+      <td>${esc(z.serial ?? '—')}</td><td>${esc(z.fiscal_code || '—')}</td><td class="num">${money(z.sell_sum)}</td>
+      <td class="num">${money(z.return_sum)}</td><td class="num">${z.sell_count != null ? esc(z.sell_count + (z.return_count || 0)) : '—'}</td>
+      <td class="num">${money(z.balance)}</td></tr>`).join('')
+      || '<tr><td colspan="8" class="muted">Z-звітів ще немає</td></tr>';
+  } catch (e) { toast(e.message, true); }
+}
+$('#zTable').onclick = e => {
+  const tr = e.target.closest('tr[data-z]'); if (!tr) return;
+  showReceipt(tr.dataset.z, { report: true, title: `Z-звіт · зміна №${tr.dataset.no || ''}` });
+};
 async function loadSales() {
+  await loadZ();
   try {
     const r = await api('/api/sales');
     $('#fetchedAt').textContent = r.fetched_at ? 'Завантажено з Checkbox: ' + r.fetched_at.replace('T', ' ').slice(0, 16) : '';
@@ -4193,13 +4258,16 @@ $('#salesDays').addEventListener('toggle', e => {
   d.open ? openDays.add(d.dataset.key) : openDays.delete(d.dataset.key);
 }, true);
 $('#salesDays').onclick = e => {
+  const zl = e.target.closest('.zlink');
+  if (zl) { e.preventDefault(); return showReceipt(zl.dataset.zid, { report: true, title: `Z-звіт · зміна №${zl.dataset.no}` }); }
   const tr = e.target.closest('tr[data-id]'); if (!tr) return;
   const k = KINDS[tr.dataset.type];
   showReceipt(tr.dataset.id, { returnable: tr.dataset.type === 'SELL', title: k ? `Чек · ${k[1].toLowerCase()}` : 'Чек' });
 };
 $('#fetchReceipts').onclick = e => busy(e.target, async () => {
   const r = await api('/api/sales/fetch', {});
-  toast(`З Checkbox отримано чеків: ${r.fetched}, нових у журналі: ${r.new}` + (r.removed ? ` · видалено старих: ${r.removed}` : ''));
+  toast(`З Checkbox отримано чеків: ${r.fetched}, нових у журналі: ${r.new}` + (r.removed ? ` · видалено старих: ${r.removed}` : '')
+    + (r.z_error ? ` · Z-звіти не завантажено: ${r.z_error}` : r.z_new ? ` · нових Z-звітів: ${r.z_new}` : ''), !!r.z_error);
   await loadSales();
 });
 
