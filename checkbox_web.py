@@ -884,7 +884,7 @@ class App:
                 "round_sum": receipt.get("round_sum"),
                 "rest": receipt.get("rest")}
 
-    # ---- пошук товару за штрихкодом (alpha) ----
+    # ---- пошук товару за штрихкодом у відкритих базах ----
     def barcode_lookup(self, code):
         code = re.sub(r"\D", "", str(code or ""))
         if len(code) < 8 or len(code) > 14:
@@ -1394,7 +1394,7 @@ class App:
 
 APP: App = None
 
-# --- пошук товару за штрихкодом у відкритих базах (alpha) ---
+# --- пошук товару за штрихкодом у відкритих базах ---
 # Open Food Facts і споріднені бази: без ключа, ліцензія ODbL; ліміт — 15 запитів на хвилину з IP на читання.
 BARCODE_SOURCES = (
     ("Open Food Facts", "https://world.openfoodfacts.org"),
@@ -2436,7 +2436,7 @@ PAGE = r"""<!DOCTYPE html>
 </div></div>
 <div class="modal" id="scanNewModal"><div class="card wide">
   <div class="row" style="justify-content:space-between">
-    <h3 style="margin:0">▦ Сканування нових товарів <span class="badge" style="font-size:11px">alpha</span></h3>
+    <h3 style="margin:0">▦ Сканування нових товарів</h3>
     <button class="x" id="scanNewClose">✕</button>
   </div>
   <p class="muted" style="margin:6px 0 10px;font-size:13px">Відскануйте штрихкод — каса знайде назву у відкритих базах
@@ -3390,7 +3390,7 @@ function closeGood() {
 }
 $('#goodAddBtn').onclick = () => openGood(null);
 
-// --- alpha: сканування нових товарів (штрихкод → відкрита база → картка товару) ---
+// --- сканування нових товарів (штрихкод → відкрита база → картка товару) ---
 const scanNew = { active: false, current: null, log: [] };
 function scanNewOpen() {
   scanNew.active = true;
