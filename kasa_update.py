@@ -225,9 +225,10 @@ def spawn_restarted():
             # при виході не могла її видалити — «Failed to remove temporary directory».
             try:
                 import ctypes
-                ctypes.windll.kernel32.SetDllDirectoryW(None)
-            except Exception:  # noqa
-                pass
+                ok = ctypes.windll.kernel32.SetDllDirectoryW(None)
+                log.info("Перезапуск: SetDllDirectory скинуто (%s), PYINSTALLER_RESET_ENVIRONMENT=1", "так" if ok else "ні")
+            except Exception as e:  # noqa
+                log.warning("Перезапуск: не вдалося скинути SetDllDirectory: %s", e)
     kw = {"env": env, "cwd": str(APP_DIR), "close_fds": True}
     if os.name == "nt":
         flags = 0x00000200                                  # CREATE_NEW_PROCESS_GROUP
