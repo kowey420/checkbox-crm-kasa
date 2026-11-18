@@ -15,6 +15,7 @@
 Залежності: лише стандартна бібліотека Python 3.9+ (certifi — необов'язково).
 """
 
+import hashlib
 import http.client
 import json
 import logging
@@ -32,7 +33,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.4.6.13"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.4.6.14"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -418,6 +419,44 @@ class CheckboxAPI:
         return r.text
 
     # --- авторизація ---
+    TOKEN_FILE = DATA_DIR / "token.json"
+
+    def _cred_key(self):
+        """Відбиток облікових даних: збережений токен діє лише для тих самих ключа й касира."""
+        c = self.cfg
+        raw = "|".join(str(x or "") for x in (self.base, c.get("license_key"), auth_mode(c), c.get("login"),
+                                                c.get("password"), c.get("pin_code")))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def restore_token(self):
+        """Підставити збережений токен касира (без POST /cashier/signin). True — токен є."""
+        try:
+            d = json.loads(self.TOKEN_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(d, dict) or d.get("key") != self._cred_key() or not d.get("token"):
+            return False
+        self.s.headers["Authorization"] = f"Bearer {d['token']}"
+        return True
+
+    def _save_token(self, token):
+        try:
+            tmp = self.TOKEN_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"key": self._cred_key(), "token": token,
+                                       "saved_at": datetime.now().isoformat(timespec="seconds")}), encoding="utf-8")
+            if os.name != "nt":
+                os.chmod(tmp, 0o600)
+            os.replace(tmp, self.TOKEN_FILE)
+        except OSError as e:
+            log.warning("Не вдалося зберегти токен касира: %s", e)
+
+    def forget_token(self):
+        self.s.headers.pop("Authorization", None)
+        try:
+            self.TOKEN_FILE.unlink()
+        except OSError:
+            pass
+
     def signin(self):
         if not self.cfg.get("license_key"):
             raise CheckboxError("Не вказано ключ ліцензії каси")
@@ -433,6 +472,11 @@ class CheckboxAPI:
                              json={"login": self.cfg["login"],
                                    "password": self.cfg["password"]})
         self.s.headers["Authorization"] = f"Bearer {data['access_token']}"
+        self._save_token(data["access_token"])       # наступні запуски — без повторного входу
+
+    def me(self):
+        """GET /cashier/me — перевіряє токен (401, якщо недійсний) і дає ім'я касира."""
+        return self._req("GET", "/cashier/me") or {}
 
     def cashier_name(self):
         """Ім'я касира для показу в інтерфейсі; None, якщо отримати не вдалося."""
@@ -1771,14 +1815,37 @@ def sync_groups(api, db, goods):
             log.info("Назви груп з вивантаження недоступні: %s", e)
 
 
-def sync_all(api, db):
-    """Синхронізує товари, групи і податкові ставки. Повертає (goods, use_leftovers, taxes, source)."""
+def sync_all(api, db, refresh_taxes=False):
+    """
+    Синхронізує товари, групи і податкові ставки. Повертає (goods, use_leftovers, taxes, source).
+    Ставки організації змінюються рідко, тож GET /tax — лише коли довідник порожній або на вимогу
+    (кнопка «Оновити ставки»). Ставки, що трапились у товарах, але яких немає в довіднику, додаються
+    з самих товарів — без окремого запиту.
+    """
     goods, use_leftovers = api.get_all_goods()
     db.replace_goods(goods, use_leftovers)
     sync_groups(api, db, goods)
-    taxes, source = api.get_taxes(goods)
-    db.replace_taxes(taxes, source)
-    return goods, use_leftovers, taxes, source
+    known = {t["code"]: dict(t) for t in db.taxes()}
+    source = db.meta("taxes_source") or "товари"
+    if refresh_taxes or not known:
+        taxes, source = api.get_taxes(goods)
+        db.replace_taxes(taxes, source)
+        db.con.execute("INSERT OR REPLACE INTO meta VALUES ('taxes_fetched_at', ?)",
+                       (datetime.now().isoformat(timespec="seconds"),))
+        db.con.commit()
+        return goods, use_leftovers, taxes, source
+    added = {}
+    for g in goods:
+        for t in g.get("taxes") or []:
+            if t.get("code") is not None and t["code"] not in known and t["code"] not in added:
+                added[t["code"]] = t
+    if added:
+        log.info("Нові податкові ставки з товарів: %s", ", ".join(str(c) for c in sorted(added)))
+        known.update(added)
+        if "+ товари" not in source:
+            source += " + товари"
+        db.replace_taxes(sorted(known.values(), key=lambda t: t["code"]), source)
+    return goods, use_leftovers, sorted(known.values(), key=lambda t: t["code"]), source
 
 
 def no_tax_goods(db):

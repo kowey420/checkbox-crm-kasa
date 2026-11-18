@@ -189,6 +189,7 @@ class App:
         self.api_factory = api_factory
         self.cashier = None
         self.connecting = False     # True, поки при старті йде вхід і синхронізація
+        self._shift = {"at": 0.0, "data": None}   # кеш стану зміни (див. shift_state)
 
     def call(self, fn, *args):
         """Виклик API з повторною авторизацією, якщо токен застарів."""
@@ -198,9 +199,23 @@ class App:
             return fn(*args)
         except CheckboxError as e:
             if str(e).startswith("HTTP 401"):
+                log.info("Токен касира застарів — авторизуюся знову")
                 self.api.signin()
                 return fn(*args)
+            self._shift["at"] = 0.0          # помилка Checkbox (напр. зміну закрито деінде) — стан зміни перечитаємо
             raise
+
+    # ---- стан зміни: кешуємо, щоб не питати GET /cashier/shift перед кожною дією ----
+    SHIFT_TTL = 600                       # с; відкриття/закриття з цієї каси оновлюють кеш одразу
+
+    def shift_state(self, force=False):
+        c = self._shift
+        if force or time.time() - c["at"] > self.SHIFT_TTL:
+            c["data"], c["at"] = self.call(self.api.current_shift), time.time()
+        return c["data"]
+
+    def _set_shift(self, shift):
+        self._shift.update(data=shift, at=time.time())
 
     # ---- налаштування ----
     def config(self):
@@ -503,6 +518,20 @@ class App:
     def rounding_mode(self):
         return self.api.cfg.get("cash_rounding") or None
 
+    def refresh_taxes(self):
+        """Кнопка «Оновити ставки»: довідник податкових ставок з Checkbox (GET /tax)."""
+        taxes, source = self.call(self.api.get_taxes, [])
+        if not taxes:
+            raise UserError("Checkbox не повернув податкових ставок")
+        known = {t["code"]: dict(t) for t in self.db.taxes()}
+        merged = {**{c: t for c, t in known.items()}, **{t["code"]: t for t in taxes}}
+        self.db.replace_taxes(sorted(merged.values(), key=lambda t: t["code"]), source)
+        with self.db.con:
+            self.db.con.execute("INSERT OR REPLACE INTO meta VALUES ('taxes_fetched_at', ?)",
+                                (datetime.now().isoformat(timespec="seconds"),))
+        log.info("Податкові ставки оновлено: %d (%s)", len(taxes), source)
+        return {"taxes": len(taxes), "source": source}
+
     def sync(self):
         goods, use_leftovers, taxes, source = self.call(sync_all, self.api, self.db)
         bad = [g["name"] for g in goods if g["code"] != g["code"].strip()]
@@ -510,8 +539,9 @@ class App:
                 "taxes": len(taxes), "taxes_source": source, "no_tax": no_tax_goods(self.db)}
 
     # ---- зміна ----
-    def shift(self):
-        return {"shift": self.call(self.api.current_shift), "last_z": self.last_z()}
+    def shift(self, fresh=False):
+        """fresh — для вкладки «Зміна» (там потрібен актуальний баланс); інакше — з кешу."""
+        return {"shift": self.shift_state(force=fresh), "last_z": self.last_z()}
 
     def _sync_quietly(self):
         """Синхронізація при відкритті/закритті зміни: помилка не зриває саму операцію зі зміною."""
@@ -523,16 +553,18 @@ class App:
             return {"sync_error": str(e), "pending": self.db.pending_count()}
 
     def open_shift(self):
-        if self.call(self.api.current_shift):
+        if self.shift_state(force=True):
             raise UserError("Зміна вже відкрита")
         shift = self.call(self.api.open_shift)
+        self._set_shift(shift)
         return {"shift": shift, "sync": self._sync_quietly()}
 
     def close_shift(self):
-        if not self.call(self.api.current_shift):
+        if not self.shift_state(force=True):
             raise UserError("Немає відкритої зміни")
         sync = self._sync_quietly()          # правки дня — у Checkbox ще до Z-звіту
         shift = self.call(self.api.close_shift)
+        self._set_shift(None)
         z = shift.get("z_report") or {}
         if z.get("id"):
             with self.db.con:
@@ -543,7 +575,7 @@ class App:
         return {"shift": shift, "z_report_id": z.get("id"), "sync": sync}
 
     def x_report(self):
-        if not self.call(self.api.current_shift):
+        if not self.shift_state():
             raise UserError("Немає відкритої зміни")
         report = self.call(self.api.create_x_report)
         return {"report_id": report["id"]}
@@ -572,7 +604,7 @@ class App:
         value = body.get("value")
         if not isinstance(value, int) or isinstance(value, bool) or not value or abs(value) > 10 ** 10:
             raise UserError("Невірна сума")
-        shift = self.call(self.api.current_shift)
+        shift = self.shift_state(force=value < 0)   # для винесення — актуальний залишок готівки
         if not shift:
             raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
         if value < 0:
@@ -673,7 +705,7 @@ class App:
             raise UserError("Невірний тип оплати")
         if not body.get("items"):
             raise UserError("Кошик порожній")
-        if not self.call(self.api.current_shift):
+        if not self.shift_state():
             raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
         cart, line_ds, receipt_ds, line_totals, total, use_leftovers = self._cart(body)
 
@@ -791,7 +823,7 @@ class App:
             raise UserError("Невірний тип оплати")
         if not body.get("items"):
             raise UserError("Кошик порожній")
-        if not self.call(self.api.current_shift):
+        if not self.shift_state():
             raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
         cart, line_ds, receipt_ds, line_totals, total, use_leftovers = self._cart(body)
         amount = body.get("amount")
@@ -843,7 +875,7 @@ class App:
         payment_type = body.get("payment_type")
         if payment_type not in ("CASH", "CASHLESS"):
             raise UserError("Невірний тип оплати")
-        if not self.call(self.api.current_shift):
+        if not self.shift_state():
             raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
         left = p["left"]
         amount = body.get("amount", left)
@@ -880,7 +912,7 @@ class App:
             raise UserError("Замовлення не знайдено в касі")
         if p["status"] == "RETURNED":
             raise UserError("Замовлення вже повернуто")
-        if not self.call(self.api.current_shift):
+        if not self.shift_state():
             raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
         resp = self.call(self.api.prepayment_return, p["relation_id"])
         self.db.update_prepayment(p["relation_id"], status="RETURNED")
@@ -1036,7 +1068,7 @@ class App:
         return out
 
     def return_receipt(self, body):
-        if not self.call(self.api.current_shift):
+        if not self.shift_state():
             raise UserError("Спочатку відкрийте зміну", code="SHIFT_CLOSED")
         orig, lines = self._sale_for_return(body.get("id"))
         payment_type = body.get("payment_type")
@@ -1303,7 +1335,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._run(update_check, bool(q.get("force")), locked=False)
         routes = {
             "/api/goods": APP.goods,
-            "/api/shift": APP.shift,
             "/api/sales": APP.sales,
         }
         if u.path == "/":
@@ -1326,6 +1357,8 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.report_text, (q.get("id") or [""])[0])
         elif u.path == "/api/receipt":
             self._run(APP.receipt_info, (q.get("id") or [""])[0])
+        elif u.path == "/api/shift":
+            self._run(APP.shift, bool(q.get("fresh")))
         elif u.path == "/api/goods/next-code":
             self._run(APP.next_code)
         elif u.path == "/api/excise/check":
@@ -1368,6 +1401,8 @@ class Handler(BaseHTTPRequestHandler):
             self._run(image_set, body, locked=False)
         elif path == "/api/image/delete":
             self._run(image_delete, body, locked=False)
+        elif path == "/api/taxes/refresh":
+            self._run(APP.refresh_taxes)
         elif path == "/api/termlog":
             self._run(termlog, body, locked=False)
         elif path == "/api/prepay":
@@ -1845,7 +1880,8 @@ PAGE = r"""<!DOCTYPE html>
     <div class="card subpane" id="gpTaxes">
       <div class="row" style="justify-content:space-between">
         <h3 style="margin:0">Податкові ставки організації</h3>
-        <small class="muted">Джерело: <span id="taxSource">—</span></small>
+        <span class="row" style="gap:10px;flex-wrap:nowrap"><small class="muted">Джерело: <span id="taxSource">—</span></small>
+          <button class="btn sec small" id="taxRefresh" title="Завантажити довідник ставок з Checkbox (GET /tax)">⟳ Оновити ставки</button></span>
       </div>
       <table style="margin-top:12px">
         <thead><tr><th>Код</th><th>Літера</th><th>Назва</th><th class="num">Ставка</th><th class="num">Акциз</th><th>Тип</th><th class="num">Товарів</th></tr></thead>
@@ -2472,7 +2508,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button, .tab').forEach(x => x.classList.remove('active'));
   b.classList.add('active'); $('#' + b.dataset.tab).classList.add('active');
   if (b.dataset.tab === 'sales') loadSales();
-  if (b.dataset.tab === 'shift') loadShift();
+  if (b.dataset.tab === 'shift') loadShift(true);
   if (b.dataset.tab === 'prepay') loadPrepayments();
   if (b.dataset.tab === 'pos') $('#search').focus();
 });
@@ -2651,6 +2687,11 @@ function renderGoodsNav() {
   $('#navTaxesN').textContent = taxes.length;
   if (window.exciseTotal != null) $('#navExciseN').textContent = window.exciseTotal;
 }
+$('#taxRefresh').onclick = e => busy(e.target, async () => {
+  const r = await api('/api/taxes/refresh', {});
+  toast(`Податкові ставки оновлено: ${r.taxes}`);
+  await loadGoods();
+});
 $('#goodsNav').onclick = e => { const b = e.target.closest('button[data-pane]'); if (b) showGoodsPane(b.dataset.pane); };
 let exciseTimer = null;
 async function loadExcise() {
@@ -3904,9 +3945,11 @@ $('#syncBtn').onclick = e => busy(e.target, async () => {
 
 // --- зміна ---
 let shiftOpen = false;
-async function loadShift() {
+async function loadShift(fresh) {
   try {
-    const { shift, last_z } = await api('/api/shift');
+    // актуальний баланс потрібен лише на вкладці «Зміна»; для шапки досить стану з кешу каси
+    if (fresh === undefined) fresh = !!document.querySelector('#shift.tab.active');
+    const { shift, last_z } = await api('/api/shift' + (fresh ? '?fresh=1' : ''));
     const b = $('#shiftBadge');
     shiftOpen = !!shift;
     if (shift) {
@@ -3958,7 +4001,7 @@ $('#closeShift').onclick = async e => {
   clsBtn = e.target;
   const pend = pendingCount ? `Перед закриттям у Checkbox буде відправлено невідправлені зміни товарів: ${pendingCount}.` : '';
   let cash = null;
-  try { const { shift } = await api('/api/shift'); cash = shift && shift.balance ? shift.balance.balance : null; }
+  try { const { shift } = await api('/api/shift?fresh=1'); cash = shift && shift.balance ? shift.balance.balance : null; }
   catch (err) { return toast(err.message, true); }
   if (!(cash > 0)) {      // готівки немає (або Checkbox не повідомив залишок) — звичайне підтвердження
     if (!(await ask('Закрити зміну і сформувати Z-звіт?' + (pend ? '\n\n' + pend : ''), { title: 'Закриття зміни', ok: 'Закрити зміну', danger: true, icon: '🧾' }))) return;
@@ -4801,10 +4844,21 @@ def startup_connect(cfg):
 def _startup_connect(cfg):
     with APP_LOCK:
         try:
-            APP.api.signin()
+            me = None
+            if APP.api.restore_token():          # збережений токен — без POST /cashier/signin
+                try:
+                    me = APP.api.me()
+                    log.info("Авторизовано збереженим токеном (%s)", auth_mode(cfg))
+                except CheckboxError as e:
+                    if not str(e).startswith("HTTP 401"):
+                        raise
+                    log.info("Збережений токен касира недійсний — авторизуюся знову")
+            if me is None:
+                APP.api.signin()
+                me = APP.api.me()
+                log.info("Авторизовано (%s)", auth_mode(cfg))
             APP.auth_ok, APP.auth_error = True, None
-            APP.cashier = APP.api.cashier_name()
-            log.info("Авторизовано (%s)", auth_mode(cfg))
+            APP.cashier = (me or {}).get("full_name")
         except (CheckboxError, net.RequestException) as e:
             APP.auth_ok, APP.auth_error = False, str(e)
             log.warning("Не вдалося авторизуватися: %s", e)
