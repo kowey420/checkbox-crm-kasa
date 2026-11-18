@@ -1,5 +1,7 @@
 # Дані конкретної каси — ніколи не в репозиторій
 config.json
+token.json
+images/
 *.db
 *.db-journal
 port
