@@ -1475,6 +1475,8 @@ PAGE = r"""<!DOCTYPE html>
   tr.grouprow td { background: var(--subtle); font-weight: 700; font-size: 13px; color: var(--muted); cursor: default; }
   tr.grouprow td small { font-weight: 400; }
   .ghead { cursor: pointer; user-select: none; } .ghead:hover { color: var(--text); }
+  .ghead.sub { text-transform: none; letter-spacing: 0; font-size: 13px; border-bottom-style: dashed; margin-top: 6px; }
+  .grow-sub td { font-weight: 600 !important; }
   tr.grouprow td { cursor: pointer; user-select: none; } tr.grouprow:hover td { color: var(--text); }
   .tw { display: inline-block; width: 14px; color: var(--muted); }
   .gtree { margin-top: 8px; }
@@ -2079,9 +2081,9 @@ const NO_GROUP = '__none__';
 // згорнуті групи (ключ — повний шлях групи), окремо — у дереві груп
 function loadSet(key) { try { return new Set(JSON.parse(localStorage.getItem(key) || '[]')); } catch (e) { return new Set(); } }
 function saveSet(key, set) { try { localStorage.setItem(key, JSON.stringify([...set])); } catch (e) {} }
-const collapsed = loadSet('kasa_groups_collapsed'), treeCollapsed = loadSet('kasa_tree_collapsed');
+const collapsed = loadSet('kasa_groups_collapsed_ids'), treeCollapsed = loadSet('kasa_tree_collapsed');
 const fullKey = g => g.group_path && g.group_path.length ? g.group_path.join(' / ') : 'Без групи';
-function toggleCollapsed(key) { collapsed.has(key) ? collapsed.delete(key) : collapsed.add(key); saveSet('kasa_groups_collapsed', collapsed); }   // знижка/надбавка на весь чек: { type, mode, value, name }
+function toggleCollapsed(key) { collapsed.has(key) ? collapsed.delete(key) : collapsed.add(key); saveSet('kasa_groups_collapsed_ids', collapsed); }   // знижка/надбавка на весь чек: { type, mode, value, name }
 
 const taxBadges = codes => {
   if (!codes || !codes.length) return '<span class="tax none" title="Товар без податкової ставки — чек буде без податку">—</span>';
@@ -2274,32 +2276,50 @@ $('#posGroups').onclick = e => {
   const a = e.target.closest('[data-grp]'); if (!a) return;
   posGroup = a.dataset.grp || null; renderSearch(); $('#search').focus();
 };
+// Дерево «група → підгрупи → товари» для списку товарів. rootId — показувати від цієї групи
+// (її власні товари — без заголовка); open — розгорнути все (пошук/фільтр); head/item — розмітка.
+const byName = (a, b) => (a.name || '').localeCompare(b.name || '', 'uk');
+function groupTree(list, rootId, open, head, item) {
+  const direct = {};
+  list.forEach(g => { const k = g.group_id && groupById[g.group_id] ? g.group_id : NO_GROUP; (direct[k] = direct[k] || []).push(g); });
+  const total = {};
+  const count = id => total[id] != null ? total[id]
+    : (total[id] = (direct[id] || []).length + (groupChildren[id] || []).reduce((a, c) => a + count(c.id), 0));
+  const node = (grp, depth) => {
+    const n = count(grp.id);
+    if (!n) return '';
+    const shut = !open && collapsed.has(grp.id);
+    let h = head(grp.id, grp.path[grp.path.length - 1], depth, n, shut);
+    if (shut) return h;
+    h += (direct[grp.id] || []).slice().sort(byName).map(g => item(g, depth + 1)).join('');
+    return h + (groupChildren[grp.id] || []).slice().sort(byName).map(c => node(c, depth + 1)).join('');
+  };
+  if (!groupList.length) return list.slice().sort(byName).map(g => item(g, 0)).join('');
+  if (rootId === NO_GROUP) return (direct[NO_GROUP] || []).slice().sort(byName).map(g => item(g, 0)).join('');
+  let html = rootId ? (direct[rootId] || []).slice().sort(byName).map(g => item(g, 0)).join('') : '';
+  html += (groupChildren[rootId || ''] || []).slice().sort(byName).map(c => node(c, 0)).join('');
+  if (!rootId && (direct[NO_GROUP] || []).length) {
+    const shut = !open && collapsed.has(NO_GROUP);
+    html += head(NO_GROUP, 'Без групи', 0, direct[NO_GROUP].length, shut);
+    if (!shut) html += direct[NO_GROUP].slice().sort(byName).map(g => item(g, 1)).join('');
+  }
+  return html;
+}
 function renderSearch() {
   renderPosGroups();
-  const q = $('#search').value;
-  // пошук — по всіх товарах; без пошуку — товари обраної групи з підгрупами
-  const list = sortByGroup(goods.filter(g => q.trim() ? match(g, q) : inGroup(g, posGroup))).slice(0, 300);
-  const depth = posGroup && posGroup !== NO_GROUP && groupById[posGroup] ? groupById[posGroup].path.length : 0;
-  let lastHead = null;
-  const searching = !!q.trim(), sizes = {};
-  list.forEach(g => { const k = fullKey(g); sizes[k] = (sizes[k] || 0) + 1; });
-  $('#results').innerHTML = list.map(g => {
-    let head = '';
-    const key = fullKey(g), shut = !searching && collapsed.has(key);
-    if (groupList.length) {
-      const t = groupTitle(g, depth);
-      if (key !== lastHead) {
-        head = `<div class="ghead" data-gkey="${esc(key)}"><span class="tw">${shut ? '▸' : '▾'}</span>${esc(t || 'Без групи')} <small style="font-weight:400">· ${sizes[key]}</small></div>`;
-        lastHead = key;
-      }
-    }
-    if (shut) return head;
-    return head + `
-    <div class="item" data-id="${esc(g.id)}">
+  const q = $('#search').value, searching = !!q.trim();
+  // пошук — по всіх товарах; без пошуку — товари обраної групи з підгрупами, деревом
+  const list = goods.filter(g => searching ? match(g, q) : inGroup(g, posGroup)).slice(0, 300);
+  const pad = d => d ? ` style="margin-left:${d * 16}px"` : '';
+  const head = (id, name, depth, n, shut) => `<div class="ghead${depth ? ' sub' : ''}" data-gkey="${esc(id)}"${pad(depth)}>` +
+    `<span class="tw">${shut ? '▸' : '▾'}</span>${esc(name)} <small style="font-weight:400">· ${n}</small></div>`;
+  const item = (g, depth) => `
+    <div class="item" data-id="${esc(g.id)}"${pad(depth)}>
       <div><b>${esc(g.name)}</b>${pendingBadge(g)}<small>${esc(g.barcode || g.code)}</small></div>
       <div class="r">${uah(g.price)} ₴<small class="${g.count === 0 ? 'zero' : ''}">${qtyStr(g.count, g.is_weight)}</small></div>
     </div>`;
-  }).join('') || '<p class="muted">Нічого не знайдено. Можливо, потрібна синхронізація.</p>';
+  $('#results').innerHTML = groupTree(list, searching ? null : posGroup, searching, head, item)
+    || '<p class="muted">Нічого не знайдено. Можливо, потрібна синхронізація.</p>';
 }
 function pendingBadge(g) {
   if (!g.pending) return '';
@@ -2316,24 +2336,18 @@ function renderGoodsTable() {
   $('#stLeft').textContent = useLeftovers ? 'увімкнено' : 'вимкнено';
   const noTax = goods.filter(g => !(g.tax_codes || []).length).length;
   $('#stNoTax').textContent = noTax; $('#stNoTax').className = noTax ? 'zero' : '';
-  const sizes = {}, filtering = !!$('#goodsFilter').value.trim();
-  list.forEach(g => { const k = fullKey(g); sizes[k] = (sizes[k] || 0) + 1; });
-  let lastHead = null;
-  $('#goodsTable').innerHTML = list.map(g => {
-    let head = '';
-    const key = fullKey(g), shut = !filtering && collapsed.has(key);
-    if (groupList.length && key !== lastHead) {
-      head = `<tr class="grouprow" data-gkey="${esc(key)}"><td colspan="7"><span class="tw">${shut ? '▸' : '▾'}</span>${esc(key)} <small>· ${sizes[key]}</small></td></tr>`;
-      lastHead = key;
-    }
-    if (shut) return head;
-    return head + `
-    <tr data-id="${esc(g.id)}"><td>${esc(g.name)}${pendingBadge(g)}</td>
+  const filtering = !!$('#goodsFilter').value.trim();
+  const ind = d => d ? ` style="padding-left:${12 + d * 18}px"` : '';
+  const head = (id, name, depth, n, shut) => `<tr class="grouprow${depth ? ' grow-sub' : ''}" data-gkey="${esc(id)}"><td colspan="7"${ind(depth)}>` +
+    `<span class="tw">${shut ? '▸' : '▾'}</span>${esc(name)} <small>· ${n}</small></td></tr>`;
+  const item = (g, depth) => `
+    <tr data-id="${esc(g.id)}"><td${ind(depth)}>${esc(g.name)}${pendingBadge(g)}</td>
       <td>${g.code !== g.code.trim() ? '<span class="zero" title="Код містить пробіли">⚠ </span>' : ''}${esc(g.code)}</td>
       <td>${esc(g.barcode)}</td><td>${esc(g.uktzed)}</td><td>${taxBadges(g.tax_codes)}</td>
       <td class="num">${uah(g.price)}</td>
       <td class="num ${g.count === 0 ? 'zero' : ''}">${qtyStr(g.count, g.is_weight)}</td></tr>`;
-  }).join('') || '<tr><td colspan="7" class="muted">Нічого не знайдено</td></tr>';
+  $('#goodsTable').innerHTML = groupTree(list, filtering ? null : (gsel || null), filtering, head, item)
+    || '<tr><td colspan="7" class="muted">Нічого не знайдено</td></tr>';
 }
 $('#goodsGroup').onchange = renderGoodsTable;
 $('#search').oninput = renderSearch;
