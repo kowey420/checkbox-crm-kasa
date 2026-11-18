@@ -120,3 +120,6 @@ jobs:
             out/kasa-py.zip
             out/SHA256SUMS.txt
           generate_release_notes: true
+          # версія з дефісом (1.7.1.0-alpha1) — пре-реліз: каси його не бачать (беруть лише releases/latest)
+          prerelease: ${{ contains(needs.check-version.outputs.tag, '-') }}
+          make_latest: ${{ contains(needs.check-version.outputs.tag, '-') && 'false' || 'true' }}

@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import threading
+import http.client
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -29,7 +31,7 @@ from urllib.parse import parse_qs, urlparse
 
 import goods_csv
 import kasa_update
-from checkbox_app import (APP_VERSION, AUTH_MODES, DATA_DIR, LOG_PATH, log, setup_logging, net, CONFIG_PATH, DEFAULT_CLIENT_NAME, DEFAULT_CLIENT_VERSION,
+from checkbox_app import (APP_VERSION, GITHUB_REPO, AUTH_MODES, DATA_DIR, LOG_PATH, log, setup_logging, net, CONFIG_PATH, DEFAULT_CLIENT_NAME, DEFAULT_CLIENT_VERSION,
                           ROUNDING_MODES, CheckboxAPI,
                           CheckboxError, LocalDB, auth_mode, load_config, save_config,
                           build_goods_payload, clean_payment_label, good_tax_codes, new_receipt_id,
@@ -882,6 +884,68 @@ class App:
                 "round_sum": receipt.get("round_sum"),
                 "rest": receipt.get("rest")}
 
+    # ---- пошук товару за штрихкодом (alpha) ----
+    def barcode_lookup(self, code):
+        code = re.sub(r"\D", "", str(code or ""))
+        if len(code) < 8 or len(code) > 14:
+            raise UserError("Штрихкод — від 8 до 14 цифр")
+        valid = gtin_ok(code)
+        own = self.db.con.execute("SELECT id, name, code FROM goods WHERE TRIM(barcode)=? LIMIT 1", (code,)).fetchone()
+        base = {"barcode": code, "valid": valid, "exists": dict(own) if own else None}
+        row = self.db.con.execute("SELECT found, data, at FROM barcode_cache WHERE code=?", (code,)).fetchone()
+        if row:
+            age = (datetime.now() - datetime.fromisoformat(row["at"])).total_seconds()
+            if row["found"] or age < BARCODE_MISS_TTL:
+                return {**base, **json.loads(row["data"] or "{}"), "cached": True, "found": bool(row["found"])}
+        result, errors = {"found": False}, []
+        for source, url in BARCODE_SOURCES:
+            with _barcode_lock:
+                now = time.time()
+                hits = [t for t in _barcode_hits.get(source, []) if now - t < 60]
+                if len(hits) >= BARCODE_RATE:
+                    raise UserError(f"Забагато пошуків за хвилину (ліміт {source}) — зачекайте {int(60 - (now - hits[0])) + 1} с")
+                hits.append(now)
+                _barcode_hits[source] = hits
+            try:
+                p = _barcode_get(url, code)
+            except UserError:
+                raise
+            except (OSError, ValueError, http.client.HTTPException) as e:
+                errors.append(f"{source}: {getattr(e, 'reason', e)}")
+                continue
+            if p:
+                img = p.get("image_front_small_url") or p.get("image_front_url") or ""
+                result = {"found": True, "name": _barcode_name(p), "brand": (p.get("brands") or "").split(",")[0].strip(),
+                          "quantity": p.get("quantity") or "", "source": source,
+                          "url": f"{url}/product/{code}", "image_url": img}
+                break
+        if not result["found"] and errors and len(errors) == len(BARCODE_SOURCES):
+            raise UserError("Немає зв'язку з відкритими базами штрихкодів: " + "; ".join(errors[:2]))
+        with self.db.con:
+            self.db.con.execute("INSERT OR REPLACE INTO barcode_cache VALUES (?,?,?,?)",
+                                (code, int(result["found"]), json.dumps(result, ensure_ascii=False),
+                                 datetime.now().isoformat(timespec="seconds")))
+        return {**base, **result, "cached": False}
+
+    def image_from_url(self, body):
+        """Фото товару з відкритої бази — на плитку (лише з її серверів зображень)."""
+        url = str((body or {}).get("url") or "")
+        u = urllib.parse.urlparse(url)
+        if u.scheme != "https" or u.hostname not in BARCODE_IMAGE_HOSTS:
+            raise UserError("Зображення можна взяти лише з відкритої бази штрихкодів")
+        req = urllib.request.Request(url, headers={"User-Agent": f"CheckboxCRMKasa/{APP_VERSION}"})
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=net.ssl_context()) as r:
+                raw = r.read(IMG_MAX + 1)
+                ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip()
+        except (OSError, http.client.HTTPException) as e:
+            raise UserError(f"Не вдалося завантажити фото: {getattr(e, 'reason', e)}")
+        ext = {"image/jpeg": "jpeg", "image/png": "png", "image/webp": "webp"}.get(ctype)
+        if not ext:
+            raise UserError("Фото в непідтримуваному форматі")
+        return image_set({"kind": body.get("kind") or "good", "key": body.get("key"),
+                          "data": f"data:image/{ext};base64," + base64.b64encode(raw).decode("ascii")})
+
     # ---- акцизні марки ----
     def excise_check(self, mark):
         mark = str(mark or "").strip()
@@ -1329,6 +1393,68 @@ class App:
 
 
 APP: App = None
+
+# --- пошук товару за штрихкодом у відкритих базах (alpha) ---
+# Open Food Facts і споріднені бази: без ключа, ліцензія ODbL; ліміт — 15 запитів на хвилину з IP на читання.
+BARCODE_SOURCES = (
+    ("Open Food Facts", "https://world.openfoodfacts.org"),
+    ("Open Products Facts", "https://world.openproductsfacts.org"),
+    ("Open Beauty Facts", "https://world.openbeautyfacts.org"),
+    ("Open Pet Food Facts", "https://world.openpetfoodfacts.org"),
+)
+BARCODE_FIELDS = ("code,product_name,product_name_uk,product_name_en,generic_name,generic_name_uk,brands,quantity,"
+                  "image_front_small_url,image_front_url")
+BARCODE_RATE = 12              # запитів на хвилину до кожної бази (з запасом до 15)
+BARCODE_MISS_TTL = 7 * 86400   # «не знайдено» пам'ятаємо тиждень — раптом товар додадуть
+_barcode_hits = {}             # база → часи останніх запитів
+_barcode_lock = threading.Lock()
+BARCODE_IMAGE_HOSTS = ("images.openfoodfacts.org", "images.openproductsfacts.org", "images.openbeautyfacts.org",
+                       "images.openpetfoodfacts.org", "static.openfoodfacts.org")
+
+
+def gtin_ok(code):
+    """Контрольна цифра EAN-8 / UPC-A (12) / EAN-13 / GTIN-14."""
+    if not code.isdigit() or len(code) not in (8, 12, 13, 14):
+        return False
+    digits = [int(c) for c in code]
+    body, check = digits[:-1], digits[-1]
+    total = sum(d * (3 if i % 2 == 0 else 1) for i, d in enumerate(reversed(body)))
+    return (10 - total % 10) % 10 == check
+
+
+def _barcode_get(base, code):
+    """Один запит до бази; None — немає товару. Помилки мережі — OSError/ValueError."""
+    url = f"{base}/api/v2/product/{code}.json?fields={BARCODE_FIELDS}"
+    req = urllib.request.Request(url, headers={"User-Agent": f"CheckboxCRMKasa/{APP_VERSION} (github.com/{GITHUB_REPO})",
+                                               "Accept": "application/json"})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=12, context=net.ssl_context()) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            data = {"status": 0}
+        elif e.code == 429:
+            raise UserError("Відкрита база штрихкодів просить зачекати (забагато запитів) — спробуйте за хвилину")
+        else:
+            raise
+    log.info("Штрихкод %s у %s → %s за %d мс", code, base.split("//")[1], "є" if data.get("status") == 1 else "немає",
+             (time.time() - t0) * 1000, extra={"response": data} if data.get("status") == 1 else None)
+    return data.get("product") if data.get("status") == 1 else None
+
+
+def _barcode_name(p):
+    """Назва для чека: назва (українська, якщо є) + бренд + фасування, без повторів."""
+    name = " ".join(str(p.get("product_name_uk") or p.get("product_name") or p.get("generic_name_uk")
+                        or p.get("generic_name") or p.get("product_name_en") or "").split())
+    brand = " ".join(str(p.get("brands") or "").split(",")[0].split())
+    qty = " ".join(str(p.get("quantity") or "").split())
+    parts = [name]
+    if brand and brand.lower() not in name.lower():
+        parts.insert(0, brand) if not name else parts.append(brand)
+    if qty and qty.lower().replace(" ", "") not in name.lower().replace(" ", ""):
+        parts.append(qty)
+    return " ".join(x for x in parts if x)[:255]
 AUTO_CLOSE_MAX = "23:45"    # найпізніший час автоматичного закриття зміни
 EXCISE_MARK_LEN = 10        # акцизна марка: серія й номер — рівно 10 символів
 
@@ -1511,6 +1637,8 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.shift, bool(q.get("fresh")))
         elif u.path == "/api/goods/next-code":
             self._run(APP.next_code)
+        elif u.path == "/api/barcode/lookup":
+            self._run(APP.barcode_lookup, (q.get("code") or [""])[0])
         elif u.path == "/api/excise/check":
             self._run(APP.excise_check, (q.get("mark") or [""])[0])
         elif u.path == "/api/excise":
@@ -1551,6 +1679,8 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.group_move_goods, body)
         elif path == "/api/image/set":
             self._run(image_set, body, locked=False)
+        elif path == "/api/image/from-url":
+            self._run(APP.image_from_url, body, locked=False)
         elif path == "/api/image/delete":
             self._run(image_delete, body, locked=False)
         elif path == "/api/taxes/refresh":
@@ -2023,6 +2153,7 @@ PAGE = r"""<!DOCTYPE html>
       <div class="row">
         <input type="text" id="goodsFilter" placeholder="Фільтр…">
         <select id="goodsGroup" style="max-width:280px" title="Група товарів"></select>
+        <button class="btn sec" id="scanNewBtn" style="white-space:nowrap" title="Сканером: штрихкод → назва з відкритої бази → картка товару">▦ Сканувати новий товар</button>
         <button class="btn" id="goodAddBtn" style="white-space:nowrap">+ Додати товар</button>
       </div>
       <p class="muted" style="font-size:12px;margin:6px 0 0">Клікніть товар, щоб змінити його. Зміни одразу діють у касі, а в Checkbox ідуть під час синхронізації (⟳, відкриття або закриття зміни).</p>
@@ -2302,6 +2433,23 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn ok" id="termOpenShift" style="grid-column:1/-1">Відкрити зміну і пробити чек</button>
     <button class="btn" id="termFiscalRetry" style="grid-column:1/-1">Пробити чек ще раз</button>
   </div>
+</div></div>
+<div class="modal" id="scanNewModal"><div class="card wide">
+  <div class="row" style="justify-content:space-between">
+    <h3 style="margin:0">▦ Сканування нових товарів <span class="badge" style="font-size:11px">alpha</span></h3>
+    <button class="x" id="scanNewClose">✕</button>
+  </div>
+  <p class="muted" style="margin:6px 0 10px;font-size:13px">Відскануйте штрихкод — каса знайде назву у відкритих базах
+    (Open Food Facts, Open Products / Beauty / Pet Food Facts) і відкриє картку нового товару: лишиться вказати ціну й податок.
+    Після збереження можна сканувати наступний.</p>
+  <input type="text" id="scanNewInput" inputmode="numeric" autocomplete="off" spellcheck="false"
+         placeholder="Скануйте штрихкод або введіть і Enter" style="font-size:20px;letter-spacing:.04em">
+  <label class="chk" style="margin-top:8px;display:flex;gap:8px;align-items:center;font-size:13px">
+    <input type="checkbox" id="scanNewPhoto" checked> Брати фото товару з бази для плитки</label>
+  <div id="scanNewStatus" class="muted" style="min-height:20px;margin-top:8px;font-size:13px"></div>
+  <table style="margin-top:6px"><thead><tr><th>Штрихкод</th><th>Результат</th><th></th></tr></thead><tbody id="scanNewLog"></tbody></table>
+  <p class="muted" style="font-size:11px;margin:8px 0 0">Дані: Open Food Facts та споріднені бази, ліцензія ODbL. Наповнюються
+    користувачами — українських товарів там менше, ніж європейських.</p>
 </div></div>
 <div class="modal" id="goodModal"><div class="card wide">
   <div class="row" style="justify-content:space-between">
@@ -3238,8 +3386,94 @@ function readStock() {         // тисячні або null; виняток —
 function closeGood() {
   if ($('#goodSave').disabled) return toast('Зачекайте — зберігається в Checkbox', true);
   $('#goodModal').classList.remove('show'); editing = null;
+  scanNewBack(null);
 }
 $('#goodAddBtn').onclick = () => openGood(null);
+
+// --- alpha: сканування нових товарів (штрихкод → відкрита база → картка товару) ---
+const scanNew = { active: false, current: null, log: [] };
+function scanNewOpen() {
+  scanNew.active = true;
+  $('#scanNewModal').classList.add('show');
+  renderScanNewLog();
+  setTimeout(() => { $('#scanNewInput').focus(); $('#scanNewInput').select(); }, 30);
+}
+function scanNewClose() { scanNew.active = false; scanNew.current = null; $('#scanNewModal').classList.remove('show'); }
+function scanNewStatus(text, kind) {
+  const el = $('#scanNewStatus'); el.textContent = text || '';
+  el.style.color = kind === 'bad' ? 'var(--bad)' : kind === 'ok' ? 'var(--ok, #16a34a)' : '';
+}
+function renderScanNewLog() {
+  $('#scanNewLog').innerHTML = scanNew.log.slice(0, 15).map((r, i) => `<tr>
+    <td><code>${esc(r.barcode)}</code></td><td>${r.html}</td>
+    <td class="num">${r.goodId ? `<button class="btn sec small" data-open="${esc(r.goodId)}">✏ Відкрити</button>` : ''}</td></tr>`).join('')
+    || '<tr><td colspan="3" class="muted">Ще нічого не скановано</td></tr>';
+}
+function scanNewLogAdd(barcode, html, goodId) { scanNew.log.unshift({ barcode, html, goodId }); renderScanNewLog(); }
+$('#scanNewLog').onclick = e => {
+  const b = e.target.closest('[data-open]'); if (!b) return;
+  const g = goods.find(x => x.id === b.dataset.open); if (!g) return;
+  $('#scanNewModal').classList.remove('show'); openGood(g);
+};
+async function scanNewHandle(raw) {
+  const code = raw.replace(/\D/g, '');
+  if (code.length < 8 || code.length > 14) { beep(false); return scanNewStatus('Штрихкод — від 8 до 14 цифр', 'bad'); }
+  const own = goods.find(g => (g.barcode || '').trim() === code);
+  if (own) {
+    beep(false);
+    scanNewStatus(`Цей штрихкод уже є в касі: ${own.name}`, 'bad');
+    return scanNewLogAdd(code, `<span style="color:var(--bad)">вже є:</span> ${esc(own.name)}`, own.id);
+  }
+  scanNewStatus('Шукаю у відкритих базах…');
+  let r;
+  try { r = await api('/api/barcode/lookup?code=' + encodeURIComponent(code)); }
+  catch (e) { beep(false); scanNewStatus(e.message, 'bad'); return scanNewLogAdd(code, `<span style="color:var(--bad)">помилка:</span> ${esc(e.message)}`); }
+  if (r.exists) { beep(false); scanNewStatus(`Цей штрихкод уже є в касі: ${r.exists.name}`, 'bad'); return scanNewLogAdd(code, `вже є: ${esc(r.exists.name)}`, r.exists.id); }
+  beep(true);
+  scanNew.current = { barcode: code, info: r };
+  scanNewStatus(r.found ? `Знайдено в ${r.source}: ${r.name}` : 'У відкритих базах не знайдено — введіть назву вручну', r.found ? 'ok' : '');
+  $('#scanNewModal').classList.remove('show');
+  openGood(null);
+  $('#gBarcode').value = code;
+  $('#goodTitle').textContent = 'Новий товар · ' + code;
+  if (r.found) {
+    $('#gName').value = r.name;
+    goodStatus(`🔎 Назву взято з ${r.source}${r.cached ? ' (збережено раніше)' : ''} — перевірте її. Вкажіть ціну й податкову ставку.` +
+      (r.valid ? '' : ' ⚠ Контрольна цифра штрихкоду не збігається — перевірте його.'), r.valid ? 'ok' : 'bad');
+    setTimeout(() => $('#gPrice').focus(), 30);
+  } else {
+    goodStatus('У відкритих базах цього штрихкоду немає — введіть назву, ціну й податкову ставку.' +
+      (r.valid ? '' : ' ⚠ Контрольна цифра штрихкоду не збігається — перевірте його.'), r.valid ? '' : 'bad');
+    setTimeout(() => $('#gName').focus(), 30);
+  }
+}
+async function scanNewSaved(body) {          // збережено товар зі сканування: фото на плитку й запис у журнал
+  const cur = scanNew.current;
+  if (!scanNew.active || !cur || (body.barcode || '').trim() !== cur.barcode) return;
+  let note = '';
+  if (cur.info.found && cur.info.image_url && $('#scanNewPhoto').checked && body.code) {
+    try { const r = await api('/api/image/from-url', { kind: 'good', key: String(body.code).trim(), url: cur.info.image_url }); images = r.images || images; note = ' · 🖼 фото'; }
+    catch (e) { note = ' · фото не взято: ' + esc(e.message); }
+  }
+  scanNewLogAdd(cur.barcode, `✅ додано: ${esc(body.name)}${cur.info.found ? ` <small class="muted">(${esc(cur.info.source)})</small>` : ''}${note}`);
+}
+function scanNewBack(saved) {                 // після картки товару — назад до сканування
+  if (!scanNew.active) return;
+  const cur = scanNew.current; scanNew.current = null;
+  if (!saved && cur) scanNewLogAdd(cur.barcode, '<span class="muted">скасовано</span>');
+  scanNewOpen();
+  $('#scanNewInput').value = '';
+  scanNewStatus(saved ? 'Збережено. Скануйте наступний товар.' : 'Скануйте наступний товар.', saved ? 'ok' : '');
+}
+$('#scanNewBtn').onclick = () => { scanNew.log = []; scanNewStatus(''); $('#scanNewInput').value = ''; scanNewOpen(); };
+$('#scanNewClose').onclick = scanNewClose;
+$('#scanNewModal').onkeydown = e => { if (e.key === 'Escape') scanNewClose(); };
+$('#scanNewInput').onkeydown = e => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  const v = $('#scanNewInput').value.trim(); $('#scanNewInput').value = '';
+  if (v) scanNewHandle(v);
+};
 $('#goodDiscard').onclick = async () => {
   if (!editing) return;
   const msg = editing.pending === 'new' ? 'Видалити цей новий товар з каси?' : 'Повернути товар до стану з Checkbox?';
@@ -3277,7 +3511,9 @@ $('#goodSave').onclick = async e => {
       ' в касі. У Checkbox вони підуть під час синхронізації (⟳, відкриття або закриття зміни)' +
       (body.stock != null && body.stock !== stockCb ? ', залишок — поставкою.' : '.'));
     editing = null;
+    await scanNewSaved(body);
     await loadGoods();
+    scanNewBack(body);
   } catch (err) {
     btn.disabled = false; $('#goodCancel').disabled = false;
     goodStatus('✖ ' + err.message, 'bad');

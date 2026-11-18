@@ -46,8 +46,11 @@ def repo():
 
 def parse_version(v):
     """«1.4.6» → (1, 4, 6, 0); «1.4.6.1» → (1, 4, 6, 1). Каси до 1.4.6 бачать лише перші три числа."""
-    nums = [int(x) for x in re.findall(r"\d+", str(v))[:4]]
-    return tuple(nums + [0] * (4 - len(nums)))
+    s = str(v).strip().lstrip("vV")
+    main, _, suffix = s.partition("-")          # «1.7.1.0-alpha1»: alpha молодша за «1.7.1.0»
+    nums = [int(x) for x in re.findall(r"\d+", main)[:4]]
+    pre = (0, int((re.findall(r"\d+", suffix) or ["0"])[0])) if suffix else (1, 0)
+    return tuple(nums + [0] * (4 - len(nums))) + pre
 
 
 def install_kind():

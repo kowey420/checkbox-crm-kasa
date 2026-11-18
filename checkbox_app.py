@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.7.0.5"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.7.1.0-alpha1"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -982,6 +982,9 @@ class LocalDB:
             status TEXT,                    -- OPEN | PAID | RETURNED
             receipts TEXT,                  -- JSON: [{id, kind, value, payment_type, fiscal_code, at}]
             updated_at TEXT)""")
+        # Відповіді відкритих баз штрихкодів (Open Food Facts тощо): щоб не питати те саме двічі
+        self.con.execute("""CREATE TABLE IF NOT EXISTS barcode_cache (
+            code TEXT PRIMARY KEY, found INTEGER, data TEXT, at TEXT)""")
         # Z-звіти: зберігаються назавжди (з Checkbox — за останні дні, з цієї каси — при закритті зміни)
         self.con.execute("""CREATE TABLE IF NOT EXISTS z_reports (
             id TEXT PRIMARY KEY, shift_id TEXT, shift_serial TEXT, serial INTEGER, fiscal_code TEXT,
