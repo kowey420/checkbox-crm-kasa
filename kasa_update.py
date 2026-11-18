@@ -13,12 +13,16 @@
 
 import base64
 import hashlib
+import http.client
 import io
 import os
 import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -81,11 +85,48 @@ def _get(url, timeout=20, raw=False):
         raise UpdateError(f"Немає зв'язку з GitHub: {e}")
     if r.status_code == 404:
         raise UpdateError("Випусків ще немає або репозиторій не знайдено")
-    if r.status_code == 403:
-        raise UpdateError("GitHub тимчасово обмежив кількість запитів — спробуйте пізніше")
+    if r.status_code in (403, 429):
+        raise RateLimited("GitHub тимчасово обмежив кількість запитів — спробуйте пізніше")
     if r.status_code >= 400:
         raise UpdateError(f"GitHub: HTTP {r.status_code}")
     return r.content if raw else r.json()
+
+
+class RateLimited(UpdateError):
+    """API GitHub: вичерпано 60 запитів на годину з цієї IP-адреси (часто — спільна адреса офісу)."""
+
+
+WEB = os.environ.get("CHECKBOX_UPDATE_WEB", "https://github.com").rstrip("/")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _latest_via_web():
+    """
+    Остання версія без API: github.com/<repo>/releases/latest перенаправляє на …/releases/tag/vX.
+    Сторінки й файли випусків (releases/download/…) не підпадають під ліміт API — працює й тоді,
+    коли з офісної адреси вже вичерпано 60 запитів на годину.
+    """
+    url = f"{WEB}/{repo()}/releases/latest"
+    opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=net.ssl_context()))
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": f"checkbox-kasa/{APP_VERSION}"})
+    try:
+        opener.open(req, timeout=20)
+        raise UpdateError("GitHub не повідомив останню версію")
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location") or ""
+        if e.code not in (301, 302, 303, 307, 308) or "/releases/tag/" not in location:
+            raise UpdateError(f"GitHub: HTTP {e.code}")
+    except (OSError, http.client.HTTPException) as e:
+        raise UpdateError(f"Немає зв'язку з GitHub: {getattr(e, 'reason', e)}")
+    tag = urllib.parse.unquote(location.rsplit("/releases/tag/", 1)[1].split("?")[0].strip("/"))
+    base = f"{WEB}/{repo()}/releases/download/{urllib.parse.quote(tag)}"
+    return {"tag_name": tag, "html_url": f"{WEB}/{repo()}/releases/tag/{urllib.parse.quote(tag)}", "body": "",
+            "assets": [{"name": n, "browser_download_url": f"{base}/{n}"} for n in (EXE_ASSET, PY_ASSET, SUMS_ASSET)],
+            "_via": "web"}
 
 
 _cache = {"time": 0, "data": None}
@@ -97,7 +138,11 @@ def check(force=False):
         return {"enabled": False, "current": APP_VERSION}
     if not force and _cache["data"] and time.time() - _cache["time"] < CHECK_TTL:
         return _cache["data"]
-    rel = _get(f"{API}/repos/{repo()}/releases/latest")
+    try:
+        rel = _get(f"{API}/repos/{repo()}/releases/latest")
+    except RateLimited:
+        log.info("API GitHub обмежив запити з цієї адреси — дізнаюся версію через сторінку випусків")
+        rel = _latest_via_web()
     latest = str(rel.get("tag_name") or "").lstrip("vV")
     assets = {a["name"]: a["browser_download_url"] for a in rel.get("assets") or []}
     kind = install_kind()
