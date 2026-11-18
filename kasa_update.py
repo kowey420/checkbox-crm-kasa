@@ -86,7 +86,21 @@ def _get(url, timeout=20, raw=False):
     if r.status_code == 404:
         raise UpdateError("Випусків ще немає або репозиторій не знайдено")
     if r.status_code in (403, 429):
-        raise RateLimited("GitHub тимчасово обмежив кількість запитів — спробуйте пізніше")
+        h = r.headers
+        remaining, reset = h.get("X-RateLimit-Remaining"), h.get("X-RateLimit-Reset")
+        try:
+            msg = (r.json() or {}).get("message")
+        except ValueError:
+            msg = r.text[:200]
+        until = ""
+        if reset and str(reset).isdigit():
+            until = datetime.fromtimestamp(int(reset)).strftime("%H:%M")
+        proxies = {k: v for k, v in urllib.request.getproxies().items() if k in ("http", "https")}
+        log.warning("GitHub %s %s: %s; ліміт: лишилось %s, з %s до %s; проксі системи: %s", r.status_code,
+                    url.split("?")[0], msg, remaining or "?", h.get("X-RateLimit-Limit") or "?", until or "?",
+                    proxies or "немає")
+        raise RateLimited("GitHub тимчасово обмежив кількість запитів" + (f" (до {until})" if until else "")
+                          + " — спробуйте пізніше")
     if r.status_code >= 400:
         raise UpdateError(f"GitHub: HTTP {r.status_code}")
     return r.content if raw else r.json()
