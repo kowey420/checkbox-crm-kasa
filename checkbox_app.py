@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.7.4.0"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.7.5.0-alpha1"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -871,21 +871,37 @@ class CheckboxAPI:
     def receipt_text(self, receipt_id):
         return self._req("GET", f"/receipts/{receipt_id}/text")
 
-    def search_receipts(self, date_from, date_to, limit=100):
+    RECEIPTS_PAGE = 500          # чеків за запит; якщо Checkbox не прийме — 100
+    RECEIPTS_MAX = 300_000       # запобіжник від нескінченного циклу
+
+    def search_receipts(self, date_from, date_to, limit=None, on_page=None):
         """
         Чеки за період (datetime з поясом). GET /receipts/search з пагінацією limit/offset.
-        Повертає список чеків.
+        on_page(batch) — обробити сторінку одразу (тоді в пам'яті лише одна сторінка) і повернути кількість;
+        без on_page — повертає список чеків.
         """
-        out, offset = [], 0
+        limit = limit or self.RECEIPTS_PAGE
+        out, offset, total = [], 0, 0
         while True:
-            data = self._req("GET", "/receipts/search", params={
-                "from_date": date_from.isoformat(timespec="seconds"),
-                "to_date": date_to.isoformat(timespec="seconds"),
-                "desc": "true", "limit": limit, "offset": offset})
+            try:
+                data = self._req("GET", "/receipts/search", params={
+                    "from_date": date_from.isoformat(timespec="seconds"),
+                    "to_date": date_to.isoformat(timespec="seconds"),
+                    "desc": "true", "limit": limit, "offset": offset})
+            except CheckboxError as e:
+                if limit > 100 and offset == 0 and str(e).startswith(("HTTP 400", "HTTP 422")):
+                    log.info("Checkbox не прийняв limit=%d для /receipts/search (%s) — завантажую по 100", limit, e)
+                    CheckboxAPI.RECEIPTS_PAGE = limit = 100
+                    continue
+                raise
             batch = (data or {}).get("results", []) if isinstance(data, dict) else (data or [])
-            out.extend(batch)
-            if len(batch) < limit or offset > 20000:
-                return out
+            total += len(batch)
+            if on_page:
+                on_page(batch)
+            else:
+                out.extend(batch)
+            if len(batch) < limit or offset >= self.RECEIPTS_MAX:
+                return total if on_page else out
             offset += limit
 
     def receipt_png(self, receipt_id):
@@ -1019,6 +1035,8 @@ class LocalDB:
         if "pending" not in cols:
             self.con.execute("ALTER TABLE goods ADD COLUMN pending TEXT")    # new | change | NULL
         scols = [r["name"] for r in self.con.execute("PRAGMA table_info(sales)")]
+        # журнал за місяць — десятки тисяч чеків: вибірка за датою без перебору всієї таблиці
+        self.con.execute("CREATE INDEX IF NOT EXISTS sales_created ON sales(created_at)")
         if "payment_label" not in scols:
             self.con.execute("ALTER TABLE sales ADD COLUMN payment_label TEXT")
         if "payment_details" not in scols:   # JSON: дані ЕПЗ і сира відповідь терміналу
@@ -1427,7 +1445,7 @@ class LocalDB:
                 local_time(sh["opened_at"]) if sh.get("opened_at") else None,
                 local_time(sh["closed_at"]) if sh.get("closed_at") else None)
 
-    def set_receipt_shift(self, r):
+    def set_receipt_shift(self, r, commit=True):
         """Записати/оновити зміну чека (дані зміни, напр. час закриття, можуть з'явитися пізніше)."""
         f = self._shift_fields(r)
         if f:
@@ -1435,9 +1453,10 @@ class LocalDB:
                 "UPDATE sales SET shift_id=?, shift_serial=COALESCE(?, shift_serial), "
                 "shift_opened_at=COALESCE(?, shift_opened_at), shift_closed_at=COALESCE(?, shift_closed_at) "
                 "WHERE receipt_id=?", f + (r["id"],))
-            self.con.commit()
+            if commit:
+                self.con.commit()
 
-    def add_checkbox_receipt(self, r):
+    def add_checkbox_receipt(self, r, commit=True):
         """
         Чек, завантажений з Checkbox. Якщо такий уже є (пробитий з цієї каси) — не чіпаємо:
         у локальному записі є дані ЕПЗ і відповідь терміналу, яких немає в Checkbox.
@@ -1466,9 +1485,42 @@ class LocalDB:
         if cur.rowcount == 1:            # чек, пробитий не цією касою (або до 1.4.6.6), — марки теж враховуємо
             self._excise_apply("RETURN" if r.get("type") == "RETURN" or r.get("is_return") else r.get("type") or "SELL",
                                r, items, local_time(r.get("fiscal_date") or r.get("created_at")), commit=False)
-        self.con.commit()
-        self.set_receipt_shift(r)        # і для нових, і для вже наявних записів без зміни
+        self.set_receipt_shift(r, commit=False)   # і для нових, і для вже наявних записів без зміни
+        if commit:
+            self.con.commit()
         return cur.rowcount == 1
+
+    def add_checkbox_receipts(self, receipts):
+        """Сторінка чеків з Checkbox — однією транзакцією (тисячі чеків без тисяч записів на диск)."""
+        new = 0
+        try:
+            for r in receipts:
+                if r.get("id") and self.add_checkbox_receipt(r, commit=False):
+                    new += 1
+            self.con.commit()
+        except Exception:
+            self.con.rollback()
+            raise
+        return new
+
+    def sales_days(self, since):
+        """Підсумки журналу по днях — без самих чеків (сторінка завантажує чеки дня, коли його розгортають)."""
+        kind = "UPPER(COALESCE(receipt_type, 'SELL'))"
+        sale = f"({kind} NOT LIKE '%RETURN%' AND {kind} NOT LIKE 'SERVICE%')"
+        return [dict(r) for r in self.con.execute(f"""
+            SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS count,
+                   SUM(CASE WHEN {sale} THEN total ELSE 0 END) AS sell,
+                   SUM(CASE WHEN {sale} AND payment_type = 'CASH' THEN total ELSE 0 END) AS cash,
+                   SUM(CASE WHEN {sale} AND payment_type = 'CASHLESS' THEN total ELSE 0 END) AS cashless,
+                   SUM(CASE WHEN {kind} LIKE '%RETURN%' THEN total ELSE 0 END) AS ret,
+                   SUM(CASE WHEN {kind} = 'SERVICE_IN' THEN total ELSE 0 END) AS service_in,
+                   SUM(CASE WHEN {kind} = 'SERVICE_OUT' THEN total ELSE 0 END) AS service_out,
+                   COUNT(DISTINCT COALESCE(shift_id, '')) AS shifts
+            FROM sales WHERE created_at >= ? GROUP BY day ORDER BY day DESC""", (since,))]
+
+    def sales_of_day(self, day):
+        return self.con.execute("SELECT * FROM sales WHERE created_at >= ? AND created_at < ? ORDER BY created_at DESC",
+                                (day, day + "Z")).fetchall()     # «РРРР-ММ-ДДT…» < «РРРР-ММ-ДДZ»
 
     # --- передплати ---
     def add_prepayment(self, relation_id, note, total, paid, items, receipt):

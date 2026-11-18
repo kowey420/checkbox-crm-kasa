@@ -44,7 +44,8 @@ PORT_RANGE = range(8000, 8020)
 PORT_FILE = DATA_DIR / "port"          # останній порт: щоб адреса (і дані браузера) не змінювались без потреби
 PORT = None                            # фактичний порт після запуску
 APP_ID = "checkbox-kasa"
-JOURNAL_DAYS = 7   # скільки днів чеків тримати в касі (записи журналу і PNG)
+JOURNAL_DAYS = 30  # скільки днів чеків тримати в касі (записи журналу і PNG)
+FETCH_OVERLAP = timedelta(hours=2)   # догрузка з Checkbox — з запасом від попереднього завантаження
 # Сервер багатопотоковий: сторінка віддається одразу, навіть коли інший запит чекає на Checkbox.
 # Усі звернення до каси й бази виконуються по черзі під цим замком.
 APP_LOCK = threading.Lock()   # відповідь /api/ping: так повторний запуск упізнає вже запущену касу
@@ -1542,30 +1543,59 @@ class App:
                      len(ids), removed_png, JOURNAL_DAYS)
         return len(ids), removed_png
 
-    def sales(self):
+    def sales(self, day=None):
+        """
+        Журнал. Без day — лише підсумки по днях (за місяць десятки тисяч чеків — сторінці їх усі не треба);
+        з day («РРРР-ММ-ДД») — чеки цього дня.
+        """
+        if day:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                raise UserError("Невірна дата")
+            return {"day": day, "sales": [dict(r) for r in self.db.sales_of_day(day)]}
         self.purge_old()
         since = self._cutoff().isoformat(timespec="seconds")
-        return {"sales": [dict(r) for r in self.db.sales(5000, since)],
+        return {"days_list": self.db.sales_days(since),
                 "days": JOURNAL_DAYS, "fetched_at": self.db.meta("receipts_fetched_at")}
 
-    def fetch_receipts(self):
-        """Завантажити з Checkbox чеки за останні JOURNAL_DAYS днів (лише нові записи)."""
+    def fetch_receipts(self, full=False):
+        """
+        Чеки з Checkbox. Чеки цієї каси вже в журналі (записуються з відповіді при пробитті), тож сюди
+        потрапляють лише пробиті деінде. Перше (або повне) завантаження — за JOURNAL_DAYS днів, далі —
+        лише від попереднього завантаження (з запасом FETCH_OVERLAP). Кожна сторінка — одразу в базу.
+        """
         now = datetime.now().astimezone()
-        receipts = self.call(self.api.search_receipts, now - timedelta(days=JOURNAL_DAYS), now)
-        new = sum(1 for r in receipts if r.get("id") and self.db.add_checkbox_receipt(r))
+        start = now - timedelta(days=JOURNAL_DAYS)
+        last, full_days = self.db.meta("receipts_fetched_at"), int(self.db.meta("receipts_full_days") or 0)
+        if not full and last and full_days >= JOURNAL_DAYS:
+            try:
+                start = max(start, datetime.fromisoformat(last).astimezone() - FETCH_OVERLAP)
+            except ValueError:
+                full = True
+        else:
+            full = True
+        counts = {"new": 0}
+
+        def page(batch):
+            counts["new"] += self.db.add_checkbox_receipts(batch)
+
+        fetched = self.call(self.api.search_receipts, start, now, None, page)
         z_new, z_error = 0, None
         try:
-            for z in self.call(self.api.z_reports, now - timedelta(days=JOURNAL_DAYS), now):
+            for z in self.call(self.api.z_reports, start, now):
                 z_new += 1 if self.db.add_z_report(z) else 0
         except (CheckboxError, net.RequestException) as e:
             z_error = str(e)
             log.warning("Z-звіти з Checkbox не завантажено: %s", e)
-        stamp = datetime.now().isoformat(timespec="seconds")
+        stamp = now.replace(tzinfo=None).isoformat(timespec="seconds")   # початок запиту: нічого не пропустимо
         with self.db.con:
             self.db.con.execute("INSERT OR REPLACE INTO meta VALUES ('receipts_fetched_at', ?)", (stamp,))
+            if full:
+                self.db.con.execute("INSERT OR REPLACE INTO meta VALUES ('receipts_full_days', ?)", (str(JOURNAL_DAYS),))
         removed, _ = self.purge_old()
-        log.info("Завантаження чеків з Checkbox: отримано %d, нових %d", len(receipts), new)
-        return {"fetched": len(receipts), "new": new, "removed": removed, "fetched_at": stamp, "z_new": z_new, "z_error": z_error}
+        log.info("Завантаження чеків з Checkbox (%s, з %s): отримано %d, нових %d", "повне" if full else "нові",
+                 start.strftime("%Y-%m-%d %H:%M"), fetched, counts["new"])
+        return {"fetched": fetched, "new": counts["new"], "removed": removed, "fetched_at": stamp, "full": full,
+                "z_new": z_new, "z_error": z_error}
 
     def receipt_text(self, receipt_id):
         if not receipt_id:
@@ -1810,7 +1840,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._run(update_check, bool(q.get("force")), locked=False)
         routes = {
             "/api/goods": APP.goods,
-            "/api/sales": APP.sales,
         }
         if u.path == "/":
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
@@ -1822,6 +1851,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, {"error": "not found"})
             else:
                 self._send(200, data, ctype, "private, max-age=31536000, immutable")
+        elif u.path == "/api/sales":
+            self._run(APP.sales, (q.get("day") or [""])[0] or None)
         elif u.path == "/api/receipt_text":
             self._run(APP.receipt_text, (q.get("id") or [""])[0])
         elif u.path == "/api/receipt_png":
@@ -1909,7 +1940,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/goods/save":
             self._run(APP.save_good, body)
         elif path == "/api/sales/fetch":
-            self._run(APP.fetch_receipts)
+            self._run(APP.fetch_receipts, bool((body or {}).get("full")))
         elif path == "/api/goods/discard":
             self._run(APP.discard_good, body)
         elif path == "/api/terminal/save":
@@ -2521,9 +2552,10 @@ PAGE = r"""<!DOCTYPE html>
   <section id="sales" class="tab">
     <div class="card">
       <div class="row" style="justify-content:space-between;flex-wrap:wrap">
-        <p class="muted" style="margin:0">Чеки за останні 7 днів. Клікніть чек, щоб побачити його. Старші записи й зображення каса видаляє сама.</p>
+        <p class="muted" style="margin:0">Чеки за останні <span class="jdays">30</span> днів. Клікніть чек, щоб побачити його. Старші записи й зображення каса видаляє сама.</p>
         <span class="row"><small class="muted" id="fetchedAt"></small>
-          <button class="btn sec small" id="fetchReceipts">⟳ Завантажити з Checkbox</button></span>
+          <button class="btn sec small" id="fetchReceipts" title="Чеки цієї каси вже в журналі; з Checkbox догружаються лише пробиті деінде — від попереднього завантаження">⟳ Завантажити з Checkbox</button>
+          <button class="btn sec small" id="fetchReceiptsFull" title="Заново перевірити всі чеки за період у Checkbox (довше — для великої кількості чеків до кількох хвилин)">⟳ Повністю</button></span>
       </div>
       <div id="salesDays" style="margin-top:12px"></div>
     </div>
@@ -2532,7 +2564,7 @@ PAGE = r"""<!DOCTYPE html>
         <h3 style="margin:0">Z-звіти</h3>
         <small class="muted" id="zStat"></small>
       </div>
-      <p class="muted" style="font-size:12px;margin:6px 0 0">Звіти зберігаються в касі: закриті з цієї каси — одразу, з Checkbox — за останні 7 днів
+      <p class="muted" style="font-size:12px;margin:6px 0 0">Звіти зберігаються в касі: закриті з цієї каси — одразу, з Checkbox — за останні 30 днів
         кнопкою «⟳ Завантажити з Checkbox». Клікніть звіт, щоб побачити його.</p>
       <table style="margin-top:12px" class="zrep">
         <thead><tr><th>Дата</th><th>Зміна</th><th>Z №</th><th>ФН</th><th class="num">Продажі</th><th class="num">Повернення</th><th class="num">Чеків</th><th class="num">Готівка в касі</th><th></th></tr></thead>
@@ -5195,7 +5227,7 @@ $('#svcOut').onclick = e => service(-1, e.target);
 $('#svcSum').onkeydown = e => { if (e.key === 'Enter') $('#svcIn').click(); };
 
 // --- журнал ---
-// Журнал: чеки за 7 днів, згруповані по днях у розгортуваних списках
+// Журнал: чеки за JOURNAL_DAYS днів, згруповані по днях; чеки дня підвантажуються, коли день розгортають
 const WEEKDAYS = ['неділя', 'понеділок', 'вівторок', 'середа', 'четвер', "п'ятниця", 'субота'];
 function dayTitle(day) {           // day — «РРРР-ММ-ДД»
   const d = new Date(day + 'T00:00:00'), today = new Date(); today.setHours(0, 0, 0, 0);
@@ -5267,42 +5299,63 @@ $('#zTable').onclick = e => {
   const tr = e.target.closest('tr[data-z]'); if (!tr) return;
   showReceipt(tr.dataset.z, { report: true, title: `Z-звіт · зміна №${tr.dataset.no || ''}` });
 };
+const dayCache = {};      // день → чеки (завантажуються, коли день розгорнуто)
+let journalDays = [];
+function daySum(d) {      // підсумок дня з сервера — у тому ж вигляді, що й totals()
+  return `чеків: ${d.count} · продажі ${uah(d.sell)} ₴
+    <small class="muted">(готівка ${uah(d.cash)}, безготівка ${uah(d.cashless)})</small>${d.ret ? ` · повернення ${uah(d.ret)} ₴` : ''}` +
+    (d.service_in || d.service_out ? ` <small class="muted">· внесено ${uah(d.service_in)} · винесено ${uah(d.service_out)}</small>` : '');
+}
+function renderDay(day) {
+  const box = document.querySelector(`#salesDays details.day[data-key="${day}"] .shifts`); if (!box) return;
+  const list = dayCache[day];
+  if (!list) { box.innerHTML = '<p class="muted" style="margin:8px 0">Завантаження…</p>'; return; }
+  // зміни дня в порядку останнього чека (список чеків уже відсортований від нових)
+  const shifts = [];
+  for (const s of list) {
+    let sh = shifts.find(x => x.id === (s.shift_id || ''));
+    if (!sh) shifts.push(sh = { id: s.shift_id || '', serial: s.shift_serial, opened: s.shift_opened_at, closed: s.shift_closed_at, list: [] });
+    sh.list.push(s);
+  }
+  if (openDays.has(day) && openDays.firstDay === day && shifts.length) {   // спершу — найсвіжіша зміна розгорнута
+    openDays.add(day + '|' + shifts[0].id); openDays.firstDay = null;
+  }
+  box.innerHTML = shifts.map(sh => {
+    const key = day + '|' + sh.id;
+    return `<details class="shift" data-key="${esc(key)}" ${openDays.has(key) ? 'open' : ''}>
+      <summary><span>${shiftTitle(sh, day)}</span><span class="daysum">${totals(sh.list)}</span></summary>
+      ${receiptRows(sh.list)}</details>`;
+  }).join('') || '<p class="muted" style="margin:8px 0">Чеків немає</p>';
+}
+async function loadDay(day, force) {
+  if (dayCache[day] && !force) return renderDay(day);
+  renderDay(day);
+  try { dayCache[day] = (await api('/api/sales?day=' + day)).sales; } catch (e) { return toast(e.message, true); }
+  renderDay(day);
+}
 async function loadSales() {
   await loadZ();
   try {
     const r = await api('/api/sales');
+    document.querySelectorAll('.jdays').forEach(x => x.textContent = r.days);
     $('#fetchedAt').textContent = r.fetched_at ? 'Завантажено з Checkbox: ' + r.fetched_at.replace('T', ' ').slice(0, 16) : '';
-    const byDay = {};
-    for (const s of r.sales) (byDay[s.created_at.slice(0, 10)] = byDay[s.created_at.slice(0, 10)] || []).push(s);
-    const days = Object.keys(byDay).sort().reverse();
+    journalDays = r.days_list;
+    for (const k of Object.keys(dayCache)) delete dayCache[k];          // чеки могли змінитися — дні перезавантажимо
     if (openDays === null) {           // спершу розгорнуто найсвіжіший день і його найсвіжішу зміну
-      openDays = new Set(days.slice(0, 1));
-      if (days.length) openDays.add(days[0] + '|' + (byDay[days[0]][0].shift_id || ''));
+      openDays = new Set(journalDays.slice(0, 1).map(d => d.day));
+      openDays.firstDay = journalDays.length ? journalDays[0].day : null;
     }
-    $('#salesDays').innerHTML = days.map(day => {
-      const list = byDay[day];
-      // зміни дня в порядку останнього чека (список чеків уже відсортований від нових)
-      const shifts = [];
-      for (const s of list) {
-        let sh = shifts.find(x => x.id === (s.shift_id || ''));
-        if (!sh) shifts.push(sh = { id: s.shift_id || '', serial: s.shift_serial, opened: s.shift_opened_at, closed: s.shift_closed_at, list: [] });
-        sh.list.push(s);
-      }
-      const inner = shifts.map(sh => {
-        const key = day + '|' + sh.id;
-        return `<details class="shift" data-key="${esc(key)}" ${openDays.has(key) ? 'open' : ''}>
-          <summary><span>${shiftTitle(sh, day)}</span><span class="daysum">${totals(sh.list)}</span></summary>
-          ${receiptRows(sh.list)}</details>`;
-      }).join('');
-      return `<details class="day" data-key="${day}" ${openDays.has(day) ? 'open' : ''}>
-        <summary><b>${dayTitle(day)}</b><span class="daysum">${shifts.length > 1 ? `змін: ${shifts.length} · ` : ''}${totals(list)}</span></summary>
-        <div class="shifts">${inner}</div></details>`;
-    }).join('') || '<p class="muted">За останні 7 днів чеків немає. Натисніть «Завантажити з Checkbox».</p>';
+    $('#salesDays').innerHTML = journalDays.map(d => `<details class="day" data-key="${d.day}" ${openDays.has(d.day) ? 'open' : ''}>
+        <summary><b>${dayTitle(d.day)}</b><span class="daysum">${d.shifts > 1 ? `змін: ${d.shifts} · ` : ''}${daySum(d)}</span></summary>
+        <div class="shifts"></div></details>`).join('')
+      || `<p class="muted">За останні ${r.days} днів чеків немає. Натисніть «Завантажити з Checkbox».</p>`;
+    await Promise.all(journalDays.filter(d => openDays.has(d.day)).map(d => loadDay(d.day)));
   } catch (e) { toast(e.message, true); }
 }
 $('#salesDays').addEventListener('toggle', e => {
   const d = e.target; if (!d.dataset || !d.dataset.key || !openDays) return;
   d.open ? openDays.add(d.dataset.key) : openDays.delete(d.dataset.key);
+  if (d.open && d.classList.contains('day')) loadDay(d.dataset.key);
 }, true);
 $('#salesDays').onclick = e => {
   const zl = e.target.closest('.zlink');
@@ -5311,12 +5364,18 @@ $('#salesDays').onclick = e => {
   const k = KINDS[tr.dataset.type];
   showReceipt(tr.dataset.id, { returnable: tr.dataset.type === 'SELL', title: k ? `Чек · ${k[1].toLowerCase()}` : 'Чек' });
 };
-$('#fetchReceipts').onclick = e => busy(e.target, async () => {
-  const r = await api('/api/sales/fetch', {});
-  toast(`З Checkbox отримано чеків: ${r.fetched}, нових у журналі: ${r.new}` + (r.removed ? ` · видалено старих: ${r.removed}` : '')
-    + (r.z_error ? ` · Z-звіти не завантажено: ${r.z_error}` : r.z_new ? ` · нових Z-звітів: ${r.z_new}` : ''), !!r.z_error);
-  await loadSales();
-});
+async function fetchReceipts(btn, full) {
+  return busy(btn, async () => {
+    if (full && !(await ask('Заново перевірити в Checkbox усі чеки за останні 30 днів? Для каси з тисячами чеків на день це може тривати кілька хвилин; касу можна використовувати далі.', { title: 'Повне завантаження', ok: 'Завантажити' }))) return;
+    const r = await api('/api/sales/fetch', { full });
+    toast((r.full ? 'Повне завантаження: ' : 'Нові з Checkbox: ') + `отримано чеків ${r.fetched}, нових у журналі ${r.new}`
+      + (r.removed ? ` · видалено старих: ${r.removed}` : '')
+      + (r.z_error ? ` · Z-звіти не завантажено: ${r.z_error}` : r.z_new ? ` · нових Z-звітів: ${r.z_new}` : ''), !!r.z_error);
+    await loadSales();
+  });
+}
+$('#fetchReceipts').onclick = e => fetchReceipts(e.target, false);
+$('#fetchReceiptsFull').onclick = e => fetchReceipts(e.target, true);
 
 // --- повернення за чеком продажу (ті самі правила суми, що й return_amount() у checkbox_app.py) ---
 let ret = null;    // { info, qty: {line: тисячні}, on: Set }
