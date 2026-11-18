@@ -572,11 +572,30 @@ class App:
         """fresh — для вкладки «Зміна» (там потрібен актуальний баланс); інакше — з кешу."""
         return {"shift": self.shift_state(force=fresh), "last_z": self.last_z()}
 
-    def _sync_quietly(self):
-        """Синхронізація при відкритті/закритті зміни: помилка не зриває саму операцію зі зміною."""
+    def _synced_today(self):
+        at = self.db.meta("synced_at") or ""
+        return at[:10] == datetime.now().strftime("%Y-%m-%d")
+
+    def _sync_quietly(self, opening=False):
+        """
+        Синхронізація при відкритті/закритті зміни: помилка не зриває саму операцію зі зміною.
+        Локальні правки відправляються завжди. Товари з порталу (звірка зі змінами, зробленими в кабінеті
+        Checkbox) — раз на день, перед першим відкриттям зміни; далі — лише кнопкою «Синхронізувати».
+        """
         try:
-            r = self.full_sync(groups=False)
-            return {"pushed": r["pushed"], "push_error": r["push_error"], "pending": r["pending"]}
+            if opening and not self._synced_today():
+                log.info("Перше відкриття зміни сьогодні — звіряю товари з Checkbox")
+                r = self.full_sync(groups=False)
+                return {"pushed": r["pushed"], "push_error": r["push_error"], "pending": r["pending"], "goods": r["count"]}
+            pushed, push_error = 0, None
+            if self.db.pending_count():
+                try:
+                    pushed = self.push_pending()
+                except (CheckboxError, net.RequestException) as e:
+                    push_error = str(e)
+                if pushed:          # відправлені правки — у локальну копію товарів (без груп і ставок)
+                    self.sync(groups=False)
+            return {"pushed": pushed, "push_error": push_error, "pending": self.db.pending_count()}
         except (CheckboxError, net.RequestException, UserError) as e:
             log.warning("Синхронізація при зміні не вдалася: %s", e)
             return {"sync_error": str(e), "pending": self.db.pending_count()}
@@ -584,9 +603,10 @@ class App:
     def open_shift(self):
         if self.shift_state(force=True):
             raise UserError("Зміна вже відкрита")
+        sync = self._sync_quietly(opening=True)    # товари звіряємо до відкриття: продаж — уже з актуальними
         shift = self.call(self.api.open_shift)
         self._set_shift(shift)
-        return {"shift": shift, "sync": self._sync_quietly()}
+        return {"shift": shift, "sync": sync}
 
     def close_shift(self):
         if not self.shift_state(force=True):

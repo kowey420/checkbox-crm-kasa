@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.4.6.15"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.4.6.16"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -709,15 +709,15 @@ class CheckboxAPI:
 
     @staticmethod
     def _poll_delays():
-        """Паузи між опитуваннями статусу: перша — до першого запиту (мить після створення результату
-        ще немає), далі зростають до 2 с."""
-        yield 0.8
-        yield 0.7
+        """
+        Паузи опитування статусу чека чи зміни. Checkbox дозволяє 2 запити на секунду: перший — через
+        0,3 с після створення, далі кожні 0,5 с; якщо за ~10 с ще не готово — раз на секунду.
+        """
+        yield 0.3
+        for _ in range(20):
+            yield 0.5
         while True:
             yield 1.0
-            yield 1.5
-            while True:
-                yield 2.0
 
     def _wait_shift(self, shift_id, target, timeout=60):
         start, delays = time.time(), self._poll_delays()
