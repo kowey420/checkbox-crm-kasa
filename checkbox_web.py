@@ -2035,6 +2035,18 @@ PAGE = r"""<!DOCTYPE html>
   .termrow { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 16px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
   button.btn.small { padding: 6px 12px; font-size: 13px; white-space: nowrap; }
   .modal .card.wide { max-width: 640px; }
+  .modal .card.settings { max-width: 760px; overflow-x: hidden; padding-bottom: 0; }
+  .card.settings h4.sect { margin: 18px 0 8px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--muted); padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+  .verbox { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 14px;
+    padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
+  .verbox .vertext { display: flex; flex-direction: column; gap: 2px; min-width: 180px; }
+  .verbox .vertext .muted { font-size: 12px; }
+  .verbox .verbtns { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+  .card.settings .logpath { font-size: 12px; margin: 8px 0 0; overflow-wrap: anywhere; }
+  .card.settings .settings-foot { position: sticky; bottom: 0; background: var(--card); margin: 16px -16px 0; padding: 12px 16px 16px;
+    border-top: 1px solid var(--line); z-index: 1; }
+  @media (max-width: 640px) { .card.settings .form { grid-template-columns: 1fr; } }
   label.chk { display: flex; align-items: center; gap: 8px; cursor: pointer; }
   .form label .row input { flex: 1; }
   details summary { cursor: pointer; }
@@ -2498,16 +2510,17 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn" id="cardSubmit">Пробити з даними ЕПЗ</button>
   </div>
 </div></div>
-<div class="modal" id="settingsModal"><div class="card">
+<div class="modal" id="settingsModal"><div class="card settings">
   <div class="row" style="justify-content:space-between">
     <h3 style="margin:0">Налаштування каси</h3>
     <button class="x" id="settingsClose">✕</button>
   </div>
   <div id="settingsStatus" class="status"></div>
-  <div class="form one">
+  <h4 class="sect">🔑 Підключення до Checkbox</h4>
+  <div class="form one" style="margin-top:0">
     <label>Ключ ліцензії каси<input type="text" id="cfgLicense" autocomplete="off" spellcheck="false"></label>
   </div>
-  <p class="muted" style="margin:14px 0 6px">Авторизація касира:</p>
+  <p class="muted" style="margin:12px 0 6px;font-size:12px">Авторизація касира</p>
   <div class="seg">
     <label><input type="radio" name="authMode" value="password" checked> Логін і пароль</label>
     <label><input type="radio" name="authMode" value="pin"> Пін-код</label>
@@ -2524,7 +2537,8 @@ PAGE = r"""<!DOCTYPE html>
     </label>
   </div>
   <p class="muted" style="font-size:12px;margin:6px 0 0" id="secretHint"></p>
-  <div class="form" style="margin-top:14px">
+  <h4 class="sect">🧾 Зміна і оплата</h4>
+  <div class="form" style="margin-top:0">
     <label>Заокруглення готівки
       <select id="cfgRounding">
         <option value="ROUND_50">До 50 копійок (ROUND_50)</option>
@@ -2546,21 +2560,23 @@ PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
   </div>
-  <div class="termrow">
+  <h4 class="sect">🔌 Обладнання</h4>
+  <div class="termrow" style="margin-top:0">
     <span>💳 Платіжний термінал: <b id="termSummary">не налаштовано</b></span>
     <button class="btn sec small" id="termCfgOpen">Налаштувати</button>
   </div>
-  <p class="muted" style="font-size:12px;margin:12px 0 0">Журнал роботи: <code id="logPath"></code></p>
-  <div class="row" style="justify-content:space-between;margin-top:8px;font-size:13px">
-    <span id="verInfo" class="muted">Версія…</span>
-    <span class="row" style="gap:8px;flex-wrap:nowrap">
+  <h4 class="sect">⬆ Оновлення</h4>
+  <div class="verbox">
+    <div class="vertext"><b id="verNum">Версія…</b><span id="verInfo" class="muted"></span></div>
+    <div class="verbtns">
       <button class="btn small" id="updNowBtn" style="display:none">⬆ Оновити</button>
       <button class="btn sec small" id="updAlphaBtn" style="display:none">🧪 Alpha</button>
       <button class="btn sec small" id="updBackBtn" style="display:none">↩ На стабільну</button>
       <button class="btn sec small" id="checkUpdBtn">Перевірити оновлення</button>
-    </span>
+    </div>
   </div>
-  <div class="pay" style="margin-top:18px">
+  <p class="muted logpath">Журнал роботи: <code id="logPath"></code></p>
+  <div class="pay settings-foot">
     <button class="btn sec" id="settingsCancel">Скасувати</button>
     <button class="btn" id="settingsSave">Зберегти і підключитися</button>
   </div>
@@ -5640,9 +5656,15 @@ function renderUpdate(r) {
   const back = r.stable_back || {}, bb = $('#updBackBtn');
   bb.style.display = back.available && !r.available ? '' : 'none';
   if (back.latest) bb.textContent = `↩ На стабільну ${back.latest}`;
-  v.textContent = `Версія каси ${r.current}` + (r.enabled === false ? ' · оновлення не налаштовано'
-    : r.error ? ` · ⚠ ${r.error}` : r.newer ? ` · доступна ${r.latest}` : r.latest ? ' · це остання версія' : '')
-    + (r.channel === 'alpha' ? (a.error ? ` · alpha: ⚠ ${a.error}` : a.latest && !a.newer ? ` · alpha ${a.latest} — встановлено` : '') : '');
+  const isAlpha = /-/.test(r.current);
+  $('#verNum').textContent = `Версія каси ${r.current}` + (isAlpha ? ' (тестова)' : '');
+  const parts = [];
+  if (r.enabled === false) parts.push('оновлення не налаштовано');
+  else if (r.error) parts.push(`⚠ ${r.error}`);
+  else if (r.newer) parts.push(`доступна ${r.latest}`);
+  else if (r.latest) parts.push(isAlpha ? `стабільна — ${r.latest}` : 'це остання версія');
+  if (r.channel === 'alpha') parts.push(a.error ? `alpha: ⚠ ${a.error}` : a.newer ? `доступна alpha ${a.latest}` : a.latest ? 'це остання alpha' : '');
+  v.textContent = parts.filter(Boolean).join(' · ');
   const link = r.url ? ` · <a href="${esc(r.url)}" target="_blank" rel="noopener">що нового</a>` : '';
   if (r.available) {
     b.innerHTML = `<span>🎉 Доступна нова версія каси <b>${esc(r.latest)}</b> (у вас ${esc(r.current)})${link}</span>
