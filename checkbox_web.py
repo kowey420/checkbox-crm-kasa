@@ -2106,6 +2106,9 @@ PAGE = r"""<!DOCTYPE html>
   .termrow { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 16px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; font-size: 13px; }
   button.btn.small { padding: 6px 12px; font-size: 13px; white-space: nowrap; }
   .modal .card.wide { max-width: 640px; }
+  th.sortable { cursor: pointer; user-select: none; } th.sortable:hover { color: var(--text); }
+  th.sortable[data-dir]:not([data-dir=""])::after { content: ' ' attr(data-dir); font-size: 10px; color: var(--accent); }
+  #spDocs tr[data-id] { cursor: pointer; } #spDocs tr[data-id]:hover { background: var(--hover); }
   .modal .card.settings { max-width: 760px; overflow-x: hidden; padding-bottom: 0; }
   .card.settings h4.sect { margin: 18px 0 8px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
     color: var(--muted); padding-bottom: 6px; border-bottom: 1px solid var(--line); }
@@ -2135,11 +2138,16 @@ PAGE = r"""<!DOCTYPE html>
   .seg label { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 9px; cursor: pointer; font-weight: 600; }
   .seg input { display: none; }
   .seg label:has(input:checked) { background: var(--accent-btn); color: #fff; }
-  .autoclose { grid-column: 1 / -1; }
+  .autoclose { min-width: 0; }
   .form .autoclose label.check { display: flex; flex-direction: row; align-items: center; justify-content: flex-start;
     gap: 8px; cursor: pointer; font-weight: 500; text-align: left; color: var(--text); }
   .form .autoclose label.check input { width: 18px; height: 18px; margin: 0; flex: 0 0 auto; }
   .form .autoclose small { display: block; margin-top: 4px; }
+  .form .autoclose .aclabel { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .form .autoclose .acrow { display: flex; align-items: center; gap: 10px; flex-wrap: nowrap; }
+  .form .autoclose .acrow label.check { white-space: nowrap; margin: 0; }
+  .form .autoclose .acrow input[type=text] { width: 96px; flex: 0 0 auto; }
+  .form .autoclose .acrow input:disabled { opacity: .45; cursor: not-allowed; }
   .autoclose #cfgAcTime { width: 110px; font-variant-numeric: tabular-nums; letter-spacing: .04em; font-size: 16px; text-align: center; }
   .warnbox { margin-top: 10px; padding: 10px 12px; border-radius: 10px; font-size: 13px; line-height: 1.45;
              border: 1px solid rgba(217, 119, 6, .45); background: rgba(245, 158, 11, .12); color: var(--text); }
@@ -2623,14 +2631,14 @@ PAGE = r"""<!DOCTYPE html>
       </select>
     </label>
     <div class="autoclose">
-      <label class="check"><input type="checkbox" id="cfgAutoCloseOn"> Закривати зміну автоматично</label>
+      <span class="aclabel">Автоматичне закриття зміни</span>
+      <div class="acrow">
+        <label class="check"><input type="checkbox" id="cfgAutoCloseOn"> Закривати зміну о</label>
+        <input type="text" id="cfgAcTime" list="cfgAcList" inputmode="numeric" maxlength="5" placeholder="ГГ:ХХ" disabled
+               autocomplete="off" spellcheck="false" aria-label="Час автоматичного закриття зміни">
+        <datalist id="cfgAcList"></datalist>
+      </div>
       <div id="cfgAutoCloseBox" style="display:none">
-        <span class="row" style="flex-wrap:nowrap;gap:6px;align-items:center;margin-top:6px">
-          <span class="muted">о</span>
-          <input type="text" id="cfgAcTime" list="cfgAcList" inputmode="numeric" maxlength="5" placeholder="ГГ:ХХ"
-                 autocomplete="off" spellcheck="false" aria-label="Час автоматичного закриття зміни">
-          <datalist id="cfgAcList"></datalist>
-        </span>
         <small class="muted" id="cfgAcHint">Введіть час (24-годинний формат, напр. 21:30) або оберіть зі списку.
           Не пізніше 23:45. Checkbox сам закриє зміну з Z-звітом; діє з наступного відкриття зміни.</small>
       </div>
@@ -2709,6 +2717,21 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn" id="termFiscalRetry" style="grid-column:1/-1">Пробити чек ще раз</button>
   </div>
 </div></div>
+<div class="modal" id="stockDocModal" tabindex="-1"><div class="card wide" style="max-width:820px">
+  <div class="row" style="justify-content:space-between">
+    <h3 style="margin:0" id="sdTitle">Документ</h3>
+    <button class="x" id="sdX">✕</button>
+  </div>
+  <div id="sdMeta" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:12px 0;font-size:13px"></div>
+  <div style="max-height:55vh;overflow:auto">
+    <table class="sptable"><thead><tr><th>Товар</th><th class="num">Було</th><th class="num">Кількість</th><th class="num">Стало</th>
+      <th class="num">Собівартість, ₴</th><th class="num">Сума, ₴</th></tr></thead><tbody id="sdLines"></tbody></table>
+  </div>
+  <div class="row" style="justify-content:space-between;margin-top:12px">
+    <span class="muted" id="sdTotal" style="font-size:13px"></span>
+    <button class="btn" id="sdClose">Закрити</button>
+  </div>
+</div></div>
 <div class="modal" id="spPickModal"><div class="card wide">
   <div class="row" style="justify-content:space-between">
     <h3 style="margin:0" id="spPickTitle">📋 Додати товари зі списку</h3>
@@ -2718,7 +2741,7 @@ PAGE = r"""<!DOCTYPE html>
     Кількість і собівартість потім можна змінити в таблиці.</p>
   <input type="text" id="spPickQ" autocomplete="off" spellcheck="false" placeholder="🔍 Назва, код або штрихкод">
   <div style="max-height:52vh;overflow:auto;margin-top:8px">
-    <table class="sptable"><thead><tr><th>Товар</th><th class="num">Залишок</th><th class="num">У документі</th></tr></thead>
+    <table class="sptable"><thead id="spPickHead"><tr><th data-s="name" class="sortable">Товар</th><th data-s="count" class="num sortable">Залишок</th><th data-s="doc" class="num sortable">У документі</th></tr></thead>
       <tbody id="spPickList"></tbody></table>
   </div>
   <div id="spPickMore" class="muted" style="font-size:12px;margin-top:6px"></div>
@@ -3846,12 +3869,33 @@ async function supplyBack(saved) {         // після картки новог
 }
 // без сканера: вибір товарів зі списку
 const SP_PICK_MAX = 200;
+let spPickSort = { key: 'name', dir: 1 };
+function spPickCmp(inDoc) {
+  const { key, dir } = spPickSort;
+  const val = g => key === 'count' ? g.count : key === 'doc' ? inDoc.get(g.id) : null;
+  return (a, b) => {
+    if (key !== 'name') {                                          // порожні («не ведеться», не в документі) — завжди внизу
+      const x = val(a), y = val(b);
+      if (x == null || y == null) { if (x != null) return -1; if (y != null) return 1; }
+      else if (x !== y) return (x - y) * dir;
+      return a.name.localeCompare(b.name, 'uk');
+    }
+    return a.name.localeCompare(b.name, 'uk') * dir;
+  };
+}
+$('#spPickHead').onclick = e => {
+  const th = e.target.closest('th[data-s]'); if (!th) return;
+  const k = th.dataset.s;
+  spPickSort = spPickSort.key === k ? { key: k, dir: -spPickSort.dir } : { key: k, dir: k === 'name' ? 1 : -1 };
+  spPickRender(); $('#spPickQ').focus();
+};
 function spPickRender() {
   const q = $('#spPickQ').value.trim();
   const out = stockMode === 'out';                                 // списати можна лише те, що є в Checkbox і з залишком
-  const list = goods.filter(g => (!q || match(g, q)) && (!out || (g.count != null && g.pending !== 'new')))
-    .sort((a, b) => a.name.localeCompare(b.name, 'uk'));
+  const list = goods.filter(g => (!q || match(g, q)) && (!out || (g.count != null && g.pending !== 'new')));
   const inDoc = new Map(curDoc().lines.map(l => [l.id, l.qty]));
+  list.sort(spPickCmp(inDoc));
+  $('#spPickHead').querySelectorAll('th[data-s]').forEach(th => th.dataset.dir = th.dataset.s === spPickSort.key ? (spPickSort.dir > 0 ? '▲' : '▼') : '');
   $('#spPickList').innerHTML = list.slice(0, SP_PICK_MAX).map(g => {
     const n = inDoc.get(g.id), w = g.is_weight;
     return `<tr data-id="${esc(g.id)}" style="cursor:pointer" class="${n != null ? 'hot' : ''}">
@@ -3962,17 +4006,47 @@ async function loadStockDocs() {
   try {
     const { docs, writeoff_reasons } = await api('/api/stock-docs');
     if (writeoff_reasons && writeoff_reasons.length) writeoffReasons = writeoff_reasons;
-    const st = { SENT: '✅ відправлено', PENDING: '⏳ не відправлено', FAILED: '❌ не прийнято', LOCAL: '…' };
-    $('#spDocs').innerHTML = docs.map(d => {
-      const out = d.kind === 'OUT';
-      return `<tr title="${esc(d.lines.map(l => `${l.name} ${out ? '−' : '+'}${l.qty / 1000}`).join('\n'))}">
-      <td>${esc(d.created_at.replace('T', ' ').slice(0, 16))}</td><td>${out ? '📤 списання' : '📥 поставка'}</td>
+    stockDocs = docs;
+    $('#spDocs').innerHTML = docs.map(d => `<tr data-id="${d.id}" title="Клацніть, щоб переглянути документ">
+      <td>${esc(d.created_at.replace('T', ' ').slice(0, 16))}</td><td>${DOC_KIND[d.kind] || esc(d.kind)}</td>
       <td>${esc(d.supplier || '—')}</td><td>${esc(d.doc_no || '—')}</td>
       <td class="num">${d.positions}</td><td class="num">${uah(d.total_cost || 0)}</td>
-      <td>${st[d.status] || esc(d.status)}${d.error ? ` <small class="muted" title="${esc(d.error)}">ⓘ</small>` : ''}</td></tr>`;
-    }).join('') || '<tr><td colspan="7" class="muted">Документів ще не було</td></tr>';
+      <td>${DOC_STATUS[d.status] || esc(d.status)}${d.error ? ` <small class="muted" title="${esc(d.error)}">ⓘ</small>` : ''}</td></tr>`).join('')
+      || '<tr><td colspan="7" class="muted">Документів ще не було</td></tr>';
   } catch (e) { toast(e.message, true); }
 }
+// перегляд проведеного документа
+const DOC_STATUS = { SENT: '✅ Відправлено', PENDING: '⏳ Не відправлено', FAILED: '❌ Не прийнято', LOCAL: '…' };
+const DOC_KIND = { IN: '📥 Поставка', OUT: '📤 Списання' };
+let stockDocs = [];
+$('#spDocs').onclick = e => {
+  const tr = e.target.closest('tr[data-id]'); if (!tr) return;
+  const d = stockDocs.find(x => String(x.id) === tr.dataset.id); if (d) openStockDoc(d);
+};
+function openStockDoc(d) {
+  const out = d.kind === 'OUT';
+  $('#sdTitle').textContent = `${DOC_KIND[d.kind] || d.kind} №${d.id}`;
+  const meta = [['Дата', d.created_at.replace('T', ' ').slice(0, 16)],
+    [out ? 'Причина' : 'Постачальник', d.supplier || '—']];
+  if (!out) meta.push(['№ накладної', d.doc_no || '—']);
+  meta.push(['Checkbox', (DOC_STATUS[d.status] || d.status) + (d.error ? ` — ${d.error}` : '')]);
+  $('#sdMeta').innerHTML = meta.map(([k, v]) => `<div><small class="muted">${k}</small><br><b>${esc(v)}</b></div>`).join('');
+  const sign = out ? '−' : '+';
+  $('#sdLines').innerHTML = d.lines.map(l => `<tr>
+      <td>${esc(l.name)}<br><small class="muted">код ${esc(String(l.code || '').trim())}</small></td>
+      <td class="num">${l.before != null ? qtyStr(l.before, l.is_weight) : '—'}</td>
+      <td class="num"><b>${sign}${qtyStr(l.qty, l.is_weight)}</b></td>
+      <td class="num">${l.after != null ? qtyStr(l.after, l.is_weight) : '—'}</td>
+      <td class="num">${l.cost != null ? uah(l.cost) : '—'}</td>
+      <td class="num">${l.sum != null ? uah(l.sum) : '—'}</td></tr>`).join('')
+    || '<tr><td colspan="6" class="muted">Позицій немає</td></tr>';
+  $('#sdTotal').textContent = `Позицій: ${d.positions} · сума${out ? ' за собівартістю' : ' закупівлі'}: ${uah(d.total_cost || 0)} ₴`;
+  $('#stockDocModal').classList.add('show'); setTimeout(() => $('#sdClose').focus(), 30);
+}
+const closeStockDoc = () => $('#stockDocModal').classList.remove('show');
+$('#sdX').onclick = $('#sdClose').onclick = closeStockDoc;
+$('#stockDocModal').onclick = e => { if (e.target.id === 'stockDocModal') closeStockDoc(); };
+$('#stockDocModal').onkeydown = e => { if (e.key === 'Escape') closeStockDoc(); };
 
 if (goodsPane === 'gpSupply') { renderSupply(); loadStockDocs(); }
 
@@ -5633,10 +5707,12 @@ function setAutoClose(hhmm) {
   $('#cfgAcTime').value = hhmm || AUTO_CLOSE_MAX;
   acHint();
   $('#cfgAutoCloseBox').style.display = hhmm ? '' : 'none';
+  $('#cfgAcTime').disabled = !hhmm;
 }
 $('#cfgAutoCloseOn').onchange = () => {
   const on = $('#cfgAutoCloseOn').checked;
   $('#cfgAutoCloseBox').style.display = on ? '' : 'none';
+  $('#cfgAcTime').disabled = !on;
   if (on) { if (!$('#cfgAcTime').value) $('#cfgAcTime').value = AUTO_CLOSE_MAX; $('#cfgAcTime').focus(); $('#cfgAcTime').select(); }
 };
 $('#settingsBtn').onclick = () => openSettings().catch(e => toast(e.message, true));
