@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.3.5"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.3.6"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -130,7 +130,9 @@ def setup_logging():
 # ───────── Що пишемо в журнал із запитів: без паролів, пін-кодів і токенів ─────────
 _SECRET_KEYS = {"password", "pin_code", "pin", "access_token", "refresh_token", "token", "license_key",
                 "secret", "authorization", "x-license-key"}
-LOG_BODY_TEXT_MAX = 4000        # скільки символів тіла показувати в тексті рядка журналу
+LOG_BODY_TEXT_MAX = 4000        # скільки символів тіла запиту показувати в тексті рядка журналу
+LOG_RESPONSE_TEXT_MAX = 2000    # … і відповіді (повністю — у record.extra.response)
+LOG_RESPONSE_MAX = 300000       # відповідь довша за це в extra обрізається (напр. великий список товарів)
 
 
 def redact(obj):
@@ -377,14 +379,26 @@ class CheckboxAPI:
             log.warning("Checkbox %s %s → %s за %d мс: %s%s", method, path, r.status_code, ms, str(msg)[:1000], tail,
                         extra={"data": dict(info, status=r.status_code, ms=ms, response=answer)})
             raise CheckboxError(f"HTTP {r.status_code}: {msg}")
-        # тіло запиту — без паролів, пін-кодів і токенів; відповідь на зміни (POST тощо) — у extra
+        # тіло запиту — без паролів, пін-кодів і токенів; відповідь — у extra.response (до LOG_RESPONSE_MAX),
+        # її початок — у тексті рядка; зображення й файли — лише розмір
         done = dict(info, status=r.status_code, ms=ms)
-        if method != "GET" and not raw and r.content and "json" in r.headers.get("Content-Type", ""):
-            try:
-                done["response"] = redact(r.json())
-            except ValueError:
-                pass
-        log.info("Checkbox %s %s → %s за %d мс%s", method, path, r.status_code, ms, tail, extra={"data": done})
+        answer_tail = ""
+        if r.content:
+            if not raw and "json" in r.headers.get("Content-Type", ""):
+                try:
+                    answer = redact(r.json())
+                    text = json.dumps(answer, ensure_ascii=False, default=str)
+                    done["response"] = answer if len(text) <= LOG_RESPONSE_MAX else log_json(text, LOG_RESPONSE_MAX)
+                    answer_tail = f" | відповідь: {log_json(text, LOG_RESPONSE_TEXT_MAX)}"
+                except ValueError:
+                    pass
+            elif not raw and "text" in r.headers.get("Content-Type", ""):
+                done["response"] = log_json(r.text, LOG_RESPONSE_MAX)
+                answer_tail = f" | відповідь: {log_json(r.text, LOG_RESPONSE_TEXT_MAX)}"
+            else:
+                done["response"] = f"<{r.headers.get('Content-Type') or 'дані'}, {len(r.content)} байт>"
+        log.info("Checkbox %s %s → %s за %d мс%s%s", method, path, r.status_code, ms, tail, answer_tail,
+                 extra={"data": done})
         if raw:
             return r.content
         if not r.content:
@@ -438,17 +452,47 @@ class CheckboxAPI:
         parent = g.get("parent_id") or g.get("parent_group_id") or g.get("parent")
         if isinstance(parent, dict):
             parent = parent.get("id")
-        return {"id": str(g["id"]), "name": g.get("name") or g.get("title"), "parent_id": str(parent) if parent else None}
+        return {"id": str(g["id"]), "name": g.get("name") or g.get("title"), "parent_id": str(parent) if parent else None,
+                "description": g.get("description")}
 
-    def get_groups(self, limit=100):
+    def get_groups(self, want=None, limit=1000):
         """
         Групи й підгрупи товарів (GET /goods/groups). None — метод недоступний
         (тоді назви беремо з товарів чи вивантаження).
+        want — id груп, на які посилаються товари: якщо якихось немає в списку (метод віддав лише
+        верхній рівень), підгрупи дозапитуються через parent_id, рівень за рівнем.
         """
-        offset, result = 0, []
         try:
+            result = self._groups_page({}, limit)
+            have = {g["id"] for g in result}
+            missing = set(want or ()) - have
+            asked = set()
+            while missing:
+                todo = [g["id"] for g in result if g["id"] not in asked]
+                if not todo or len(asked) > 500:
+                    break
+                for pid in todo:
+                    asked.add(pid)
+                    for g in self._groups_page({"parent_id": pid}, limit):
+                        if g["id"] not in have:
+                            g["parent_id"] = g["parent_id"] or pid
+                            result.append(g)
+                            have.add(g["id"])
+                missing -= have
+            if want and set(want) - have:
+                log.info("Групи товарів: не знайдено в довіднику %d груп(и): %s", len(set(want) - have),
+                         ", ".join(sorted(set(want) - have)))
+            return result
+        except (CheckboxError, net.RequestException) as e:
+            log.info("Групи товарів через /goods/groups недоступні (%s) — назви з товарів", e)
+            return None
+
+    def _groups_page(self, params, limit):
+        """Усі сторінки GET /goods/groups з параметрами; групи з children розгортаються в плаский список."""
+        offset, result = 0, []
+        if True:
             while True:
-                data = self._req("GET", "/goods/groups", params={"limit": limit, "offset": offset})
+                data = self._req("GET", "/goods/groups", params=dict(params, limit=limit, offset=offset))
                 batch = data.get("results", []) if isinstance(data, dict) else (data or [])
                 for g in batch:
                     flat = [g]
@@ -457,16 +501,30 @@ class CheckboxAPI:
                         parsed = self._parse_group(item)
                         if parsed:
                             result.append(parsed)
-                        for child in item.get("children") or [] if isinstance(item, dict) else []:
+                        for child in (item.get("children") or []) if isinstance(item, dict) else []:
                             if isinstance(child, dict):
-                                child.setdefault("parent_id", item.get("id"))
+                                if not child.get("parent_id"):
+                                    child = dict(child, parent_id=item.get("id"))
                                 flat.append(child)
+                            elif isinstance(child, str) and parsed:     # дочірня група лише як id
+                                result.append({"id": child, "name": None, "parent_id": parsed["id"]})
                 if not isinstance(data, dict) or len(batch) < limit:
                     return result
                 offset += limit
-        except (CheckboxError, net.RequestException) as e:
-            log.info("Групи товарів через /goods/groups недоступні (%s) — назви з товарів", e)
-            return None
+
+    def create_group(self, name, description=None, parent_id=None):
+        return self._req("POST", "/goods/groups", json={"name": name, "description": description, "parent_id": parent_id})
+
+    def update_group(self, group_id, name, description=None, parent_id=None):
+        return self._req("PUT", f"/goods/groups/{group_id}",
+                         json={"name": name, "description": description, "parent_id": parent_id})
+
+    def delete_group(self, group_id):
+        return self._req("DELETE", f"/goods/groups/{group_id}")
+
+    def move_group_goods(self, group_id, to_group):
+        """Перенести всі товари групи в іншу групу."""
+        return self._req("PUT", f"/goods/groups/{group_id}/move-goods", json={"to_group": to_group})
 
     def group_names_from_export(self):
         """{group_id: назва} з вивантаження номенклатури (колонка «група товарів») — запасний варіант."""
@@ -815,6 +873,8 @@ class LocalDB:
             self.con.execute("ALTER TABLE goods ADD COLUMN group_id TEXT")
         # групи й підгрупи товарів (parent_id — батьківська група)
         self.con.execute("CREATE TABLE IF NOT EXISTS goods_groups (id TEXT PRIMARY KEY, name TEXT, parent_id TEXT)")
+        if "description" not in [r["name"] for r in self.con.execute("PRAGMA table_info(goods_groups)")]:
+            self.con.execute("ALTER TABLE goods_groups ADD COLUMN description TEXT")
         if "tax_codes" not in cols:
             self.con.execute("ALTER TABLE goods ADD COLUMN tax_codes TEXT")  # JSON-список кодів
         if "pending" not in cols:
@@ -852,13 +912,23 @@ class LocalDB:
             self._overlay_pending()        # невідправлені правки не губляться при синхронізації
 
     # --- групи товарів ---
+    def group_rows(self):
+        return [dict(r) for r in self.con.execute("SELECT id, name, parent_id, description FROM goods_groups")]
+
     def replace_groups(self, groups):
         """groups — [{id, name, parent_id}] з Checkbox; назви, відомі раніше, не губимо, якщо нових немає."""
         with self.con:
             known = {r["id"]: r["name"] for r in self.con.execute("SELECT id, name FROM goods_groups")}
             self.con.execute("DELETE FROM goods_groups")
-            self.con.executemany("INSERT OR REPLACE INTO goods_groups (id, name, parent_id) VALUES (?,?,?)",
-                                 [(g["id"], g.get("name") or known.get(g["id"]), g.get("parent_id")) for g in groups])
+            merged = {}
+            for g in groups:              # та сама група може прийти і в списку, і в children батьківської
+                m = merged.setdefault(g["id"], {"name": None, "parent_id": None, "description": None})
+                m["name"] = m["name"] or g.get("name")
+                m["parent_id"] = m["parent_id"] or g.get("parent_id")
+                m["description"] = m["description"] or g.get("description")
+            self.con.executemany("INSERT OR REPLACE INTO goods_groups (id, name, parent_id, description) VALUES (?,?,?,?)",
+                                 [(gid, m["name"] or known.get(gid), m["parent_id"], m["description"])
+                                  for gid, m in merged.items()])
 
     def set_group_names(self, names):
         """Назви груп з іншого джерела (group_name товару, вивантаження) — лише для груп без назви."""
@@ -870,10 +940,11 @@ class LocalDB:
 
     def groups(self):
         """Групи з повним шляхом: [{id, name, parent_id, path: [назви від кореня]}]."""
-        rows = {r["id"]: dict(r) for r in self.con.execute("SELECT id, name, parent_id FROM goods_groups")}
+        rows = {r["id"]: dict(r) for r in self.con.execute("SELECT id, name, parent_id, description FROM goods_groups")}
+        counts = dict(self.con.execute("SELECT group_id, COUNT(*) FROM goods WHERE group_id IS NOT NULL GROUP BY group_id").fetchall())
         used = {r["group_id"] for r in self.con.execute("SELECT DISTINCT group_id FROM goods WHERE group_id IS NOT NULL")}
         for gid in used - rows.keys():       # група товару, якої немає в довіднику
-            rows[gid] = {"id": gid, "name": None, "parent_id": None}
+            rows[gid] = {"id": gid, "name": None, "parent_id": None, "description": None}
 
         def path(gid, seen=()):
             g = rows.get(gid)
@@ -884,6 +955,7 @@ class LocalDB:
 
         for g in rows.values():
             g["path"] = path(g["id"])
+            g["goods"] = counts.get(g["id"], 0)          # товарів саме в цій групі (без підгруп)
         return sorted(rows.values(), key=lambda g: [p.lower() for p in g["path"]])
 
     def groups_without_names(self):
@@ -1505,7 +1577,7 @@ def print_goods(rows, db=None):
 
 def sync_groups(api, db, goods):
     """Групи товарів: довідник Checkbox, а для груп без назви — group_name товарів чи вивантаження."""
-    groups = api.get_groups()
+    groups = api.get_groups({good_group_id(g) for g in goods} - {None})
     if groups is not None:
         db.replace_groups(groups)
     names = {}

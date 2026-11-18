@@ -626,6 +626,69 @@ class App:
                 "round_sum": receipt.get("round_sum"),
                 "rest": receipt.get("rest")}
 
+    # ---- групи товарів (одразу в Checkbox: POST/PUT/DELETE /goods/groups) ----
+    GROUP_NAME_MAX = 100
+
+    def _refresh_groups(self):
+        groups = self.call(self.api.get_groups)
+        if groups is not None:
+            self.db.replace_groups(groups)
+
+    def group_save(self, body):
+        name = " ".join(str(body.get("name") or "").split())
+        if not name:
+            raise UserError("Вкажіть назву групи")
+        if len(name) > self.GROUP_NAME_MAX:
+            raise UserError(f"Назва групи — до {self.GROUP_NAME_MAX} символів")
+        description = " ".join(str(body.get("description") or "").split()) or None
+        gid, parent = body.get("id") or None, body.get("parent_id") or None
+        rows = {g["id"]: g for g in self.db.group_rows()}
+        if parent and parent not in rows:
+            raise UserError("Батьківську групу не знайдено — синхронізуйте товари")
+        if gid:
+            if gid not in rows:
+                raise UserError("Групу не знайдено — синхронізуйте товари")
+            x, n = parent, 0               # не можна вкласти групу саму в себе чи у власну підгрупу
+            while x and n < 50:
+                if x == gid:
+                    raise UserError("Групу не можна перенести в неї саму чи в її підгрупу")
+                x, n = (rows.get(x) or {}).get("parent_id"), n + 1
+            self.call(self.api.update_group, gid, name, description, parent)
+            log.info("Групу «%s» змінено", name)
+        else:
+            created = self.call(self.api.create_group, name, description, parent)
+            gid = (created or {}).get("id")
+            log.info("Створено групу «%s» (%s)", name, gid)
+        self._refresh_groups()
+        return {"id": gid}
+
+    def group_delete(self, body):
+        gid = body.get("id")
+        g = next((x for x in self.db.group_rows() if x["id"] == gid), None)
+        if not g:
+            raise UserError("Групу не знайдено")
+        n = self.db.con.execute("SELECT COUNT(*) FROM goods WHERE group_id=?", (gid,)).fetchone()[0]
+        kids = [x for x in self.db.group_rows() if x["parent_id"] == gid]
+        if n or kids:
+            raise UserError(f"У групі є {'товари (' + str(n) + ')' if n else ''}{' і ' if n and kids else ''}"
+                            f"{'підгрупи (' + str(len(kids)) + ')' if kids else ''} — спершу перенесіть їх")
+        self.call(self.api.delete_group, gid)
+        log.info("Групу «%s» видалено", g["name"])
+        self._refresh_groups()
+        return {"ok": True}
+
+    def group_move_goods(self, body):
+        gid, to = body.get("id"), body.get("to_group")
+        rows = {g["id"]: g for g in self.db.group_rows()}
+        if gid not in rows or to not in rows or gid == to:
+            raise UserError("Оберіть іншу групу")
+        res = self.call(self.api.move_group_goods, gid, to)
+        goods, use_leftovers = self.call(self.api.get_all_goods)     # group_id товарів змінився
+        self.db.replace_goods(goods, use_leftovers)
+        self._refresh_groups()
+        log.info("Товари групи «%s» перенесено в «%s»: %s", rows[gid]["name"], rows[to]["name"], res)
+        return {"moved": (res or {}).get("update")}
+
     # ---- передплата / післяплата ----
     NOTE_MAX = 120
 
@@ -1103,6 +1166,12 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.sell, body)
         elif path == "/api/return":
             self._run(APP.return_receipt, body)
+        elif path == "/api/groups/save":
+            self._run(APP.group_save, body)
+        elif path == "/api/groups/delete":
+            self._run(APP.group_delete, body)
+        elif path == "/api/groups/move-goods":
+            self._run(APP.group_move_goods, body)
         elif path == "/api/termlog":
             self._run(termlog, body, locked=False)
         elif path == "/api/prepay":
@@ -1352,6 +1421,16 @@ PAGE = r"""<!DOCTYPE html>
   .ghead:first-child { margin-top: 4px; }
   tr.grouprow td { background: var(--subtle); font-weight: 700; font-size: 13px; color: var(--muted); cursor: default; }
   tr.grouprow td small { font-weight: 400; }
+  .ghead { cursor: pointer; user-select: none; } .ghead:hover { color: var(--text); }
+  tr.grouprow td { cursor: pointer; user-select: none; } tr.grouprow:hover td { color: var(--text); }
+  .tw { display: inline-block; width: 14px; color: var(--muted); }
+  .gtree { margin-top: 8px; }
+  .gnode { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  .gnode:hover { background: var(--hover); }
+  .gnode .gname { flex: 1; min-width: 0; }
+  .gnode .gname small { color: var(--muted); margin-left: 6px; }
+  .gnode .gacts { display: flex; gap: 4px; opacity: .55; } .gnode:hover .gacts { opacity: 1; }
+  .gnode .tog { width: 22px; border: 0; background: none; color: var(--muted); cursor: pointer; font: inherit; padding: 0; }
   .stockbox { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
   #askModal { z-index: 60; }
   #scanModal .card { max-width: 620px; }
@@ -1470,6 +1549,14 @@ PAGE = r"""<!DOCTYPE html>
         <thead><tr><th>Назва</th><th>Код</th><th>Штрихкод</th><th>УКТЗЕД</th><th>Податок</th><th class="num">Ціна, ₴</th><th class="num">Залишок</th></tr></thead>
         <tbody id="goodsTable"></tbody>
       </table>
+    </div>
+    <div class="card" style="margin-top:20px">
+      <div class="row" style="justify-content:space-between">
+        <h3 style="margin:0">Групи товарів</h3>
+        <button class="btn" id="grpAdd">+ Група</button>
+      </div>
+      <p class="muted" style="font-size:12px;margin:6px 0 0">Групи й підгрупи — як у Checkbox. Зміни груп ідуть у Checkbox одразу. Клік по ▸ / ▾ — згорнути чи розгорнути.</p>
+      <div class="gtree" id="grpTree"></div>
     </div>
     <div class="card" style="margin-top:20px">
       <div class="row" style="justify-content:space-between">
@@ -1865,6 +1952,33 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn danger" id="clsOut">Винести й закрити</button>
   </div>
 </div></div>
+<div class="modal" id="grpModal"><div class="card">
+  <div class="row" style="justify-content:space-between">
+    <h3 style="margin:0" id="grpTitle">Група</h3>
+    <button class="x" id="grpX">✕</button>
+  </div>
+  <div class="form one" style="margin-top:12px">
+    <label>Назва<input type="text" id="grpName" maxlength="100"></label>
+    <label>Опис (необов'язково)<input type="text" id="grpDesc" maxlength="250"></label>
+    <label>Входить у групу<select id="grpParent"></select></label>
+  </div>
+  <div class="pay" style="margin-top:16px">
+    <button class="btn sec" id="grpCancel">Скасувати</button>
+    <button class="btn" id="grpSave">Зберегти</button>
+  </div>
+</div></div>
+<div class="modal" id="grpMoveModal"><div class="card">
+  <div class="row" style="justify-content:space-between">
+    <h3 style="margin:0">Перенести товари</h3>
+    <button class="x" id="gmX">✕</button>
+  </div>
+  <p style="margin:10px 0" id="gmText"></p>
+  <div class="form one"><label>У групу<select id="gmTo"></select></label></div>
+  <div class="pay" style="margin-top:16px">
+    <button class="btn sec" id="gmCancel">Скасувати</button>
+    <button class="btn" id="gmOk">Перенести</button>
+  </div>
+</div></div>
 <div class="modal" id="askModal" role="dialog" aria-modal="true"><div class="card">
   <div class="row" style="gap:10px"><span class="askicon" id="askIcon">❓</span><h3 style="margin:0" id="askTitle">Підтвердження</h3></div>
   <p id="askText"></p>
@@ -1907,7 +2021,13 @@ let goods = [], cart = [], useLeftovers = false, roundingMode = null, cartTotal 
 let cartDisc = null;
 // групи товарів: groupList — [{id, name, parent_id, path}], posGroup — обрана група в касі (null — усі)
 let groupList = [], groupById = {}, groupChildren = {}, posGroup = null;
-const NO_GROUP = '__none__';   // знижка/надбавка на весь чек: { type, mode, value, name }
+const NO_GROUP = '__none__';
+// згорнуті групи (ключ — повний шлях групи), окремо — у дереві груп
+function loadSet(key) { try { return new Set(JSON.parse(localStorage.getItem(key) || '[]')); } catch (e) { return new Set(); } }
+function saveSet(key, set) { try { localStorage.setItem(key, JSON.stringify([...set])); } catch (e) {} }
+const collapsed = loadSet('kasa_groups_collapsed'), treeCollapsed = loadSet('kasa_tree_collapsed');
+const fullKey = g => g.group_path && g.group_path.length ? g.group_path.join(' / ') : 'Без групи';
+function toggleCollapsed(key) { collapsed.has(key) ? collapsed.delete(key) : collapsed.add(key); saveSet('kasa_groups_collapsed', collapsed); }   // знижка/надбавка на весь чек: { type, mode, value, name }
 
 const taxBadges = codes => {
   if (!codes || !codes.length) return '<span class="tax none" title="Товар без податкової ставки — чек буде без податку">—</span>';
@@ -2054,7 +2174,7 @@ async function loadGoods() {
   renderPending(d.pending);
   renderTaxes(d.taxes_source);
   $('#synced').textContent = d.synced_at ? d.synced_at.replace('T', ' ') : '—';
-  renderSearch(); renderGoodsTable(); renderCart();
+  renderSearch(); renderGoodsTable(); renderCart(); renderGroupTree();
 }
 const match = (g, q) => {
   q = q.trim().toLowerCase();
@@ -2107,12 +2227,19 @@ function renderSearch() {
   const list = sortByGroup(goods.filter(g => q.trim() ? match(g, q) : inGroup(g, posGroup))).slice(0, 300);
   const depth = posGroup && posGroup !== NO_GROUP && groupById[posGroup] ? groupById[posGroup].path.length : 0;
   let lastHead = null;
+  const searching = !!q.trim(), sizes = {};
+  list.forEach(g => { const k = fullKey(g); sizes[k] = (sizes[k] || 0) + 1; });
   $('#results').innerHTML = list.map(g => {
     let head = '';
+    const key = fullKey(g), shut = !searching && collapsed.has(key);
     if (groupList.length) {
       const t = groupTitle(g, depth);
-      if (t !== lastHead) { head = t ? `<div class="ghead">${esc(t)}</div>` : ''; lastHead = t; }
+      if (key !== lastHead) {
+        head = `<div class="ghead" data-gkey="${esc(key)}"><span class="tw">${shut ? '▸' : '▾'}</span>${esc(t || 'Без групи')} <small style="font-weight:400">· ${sizes[key]}</small></div>`;
+        lastHead = key;
+      }
     }
+    if (shut) return head;
     return head + `
     <div class="item" data-id="${esc(g.id)}">
       <div><b>${esc(g.name)}</b>${pendingBadge(g)}<small>${esc(g.barcode || g.code)}</small></div>
@@ -2135,15 +2262,17 @@ function renderGoodsTable() {
   $('#stLeft').textContent = useLeftovers ? 'увімкнено' : 'вимкнено';
   const noTax = goods.filter(g => !(g.tax_codes || []).length).length;
   $('#stNoTax').textContent = noTax; $('#stNoTax').className = noTax ? 'zero' : '';
-  const sizes = {};
-  list.forEach(g => { const t = groupTitle(g, 0); sizes[t] = (sizes[t] || 0) + 1; });
+  const sizes = {}, filtering = !!$('#goodsFilter').value.trim();
+  list.forEach(g => { const k = fullKey(g); sizes[k] = (sizes[k] || 0) + 1; });
   let lastHead = null;
   $('#goodsTable').innerHTML = list.map(g => {
     let head = '';
-    if (groupList.length) {
-      const t = groupTitle(g, 0);
-      if (t !== lastHead) { head = `<tr class="grouprow"><td colspan="7">${esc(t)} <small>· ${sizes[t]}</small></td></tr>`; lastHead = t; }
+    const key = fullKey(g), shut = !filtering && collapsed.has(key);
+    if (groupList.length && key !== lastHead) {
+      head = `<tr class="grouprow" data-gkey="${esc(key)}"><td colspan="7"><span class="tw">${shut ? '▸' : '▾'}</span>${esc(key)} <small>· ${sizes[key]}</small></td></tr>`;
+      lastHead = key;
     }
+    if (shut) return head;
     return head + `
     <tr data-id="${esc(g.id)}"><td>${esc(g.name)}${pendingBadge(g)}</td>
       <td>${g.code !== g.code.trim() ? '<span class="zero" title="Код містить пробіли">⚠ </span>' : ''}${esc(g.code)}</td>
@@ -2155,6 +2284,80 @@ function renderGoodsTable() {
 $('#goodsGroup').onchange = renderGoodsTable;
 $('#search').oninput = renderSearch;
 $('#goodsFilter').oninput = renderGoodsTable;
+
+// --- дерево груп і їх редагування (одразу в Checkbox) ---
+function subtreeCount(id) { return goods.filter(g => inGroup(g, id)).length; }
+function renderGroupTree() {
+  const box = $('#grpTree');
+  if (!groupList.length) { box.innerHTML = '<p class="muted">Груп ще немає.</p>'; return; }
+  const row = (g, depth) => {
+    const kids = groupChildren[g.id] || [], shut = treeCollapsed.has(g.id), total = subtreeCount(g.id);
+    const name = g.path[g.path.length - 1];
+    const counts = g.goods === total ? `товарів: ${total}` : `товарів: ${g.goods}, з підгрупами ${total}`;
+    return `<div class="gnode" style="padding-left:${8 + depth * 22}px">
+        <button class="tog" data-tog="${esc(g.id)}" ${kids.length ? '' : 'disabled style="visibility:hidden"'}>${shut ? '▸' : '▾'}</button>
+        <div class="gname"><b>${esc(name)}</b><small>${counts}${kids.length ? ` · підгруп: ${kids.length}` : ''}</small>
+          ${g.description ? `<br><small style="margin:0">${esc(g.description)}</small>` : ''}</div>
+        <div class="gacts">
+          <button class="btn small sec" data-gedit="${esc(g.id)}" title="Перейменувати, опис, батьківська група">✎</button>
+          <button class="btn small sec" data-gsub="${esc(g.id)}" title="Додати підгрупу">＋</button>
+          ${g.goods ? `<button class="btn small sec" data-gmove="${esc(g.id)}" title="Перенести товари в іншу групу">⇄</button>` : ''}
+          <button class="btn small sec" data-gdel="${esc(g.id)}" title="Видалити групу">🗑</button>
+        </div></div>` + (shut ? '' : kids.map(k => row(k, depth + 1)).join(''));
+  };
+  box.innerHTML = (groupChildren[''] || []).map(g => row(g, 0)).join('');
+}
+let grpEdit = null;     // { id? } — група, що редагується; parent — для нової
+function descendants(id) { const out = new Set([id]); let added = true; while (added) { added = false; groupList.forEach(g => { if (g.parent_id && out.has(g.parent_id) && !out.has(g.id)) { out.add(g.id); added = true; } }); } return out; }
+function groupOptions(exclude, current, rootLabel) {
+  return (rootLabel ? `<option value="">${esc(rootLabel)}</option>` : '') + groupList.filter(g => !exclude.has(g.id)).map(g =>
+    `<option value="${esc(g.id)}" ${g.id === current ? 'selected' : ''}>${'  '.repeat(g.path.length - 1)}${esc(g.path[g.path.length - 1])}</option>`).join('');
+}
+function openGroup(id, parentId) {
+  const g = id ? groupById[id] : null;
+  grpEdit = { id: id || null };
+  $('#grpTitle').textContent = g ? 'Група · ' + g.path[g.path.length - 1] : (parentId ? 'Нова підгрупа' : 'Нова група');
+  $('#grpName').value = g ? (g.name || '') : '';
+  $('#grpDesc').value = g ? (g.description || '') : '';
+  $('#grpParent').innerHTML = groupOptions(g ? descendants(g.id) : new Set(), g ? g.parent_id : parentId, '— коренева група —');
+  $('#grpModal').classList.add('show'); $('#grpName').focus();
+}
+const closeGroup = () => $('#grpModal').classList.remove('show');
+$('#grpAdd').onclick = () => openGroup(null, null);
+$('#grpX').onclick = closeGroup; $('#grpCancel').onclick = closeGroup;
+$('#grpModal').onkeydown = e => { if (e.key === 'Enter') $('#grpSave').click(); if (e.key === 'Escape') closeGroup(); };
+$('#grpSave').onclick = e => busy(e.target, async () => {
+  const name = $('#grpName').value.trim();
+  if (!name) { $('#grpName').focus(); throw new Error('Вкажіть назву групи'); }
+  await api('/api/groups/save', { id: grpEdit.id, name, description: $('#grpDesc').value.trim(), parent_id: $('#grpParent').value || null });
+  closeGroup(); toast(grpEdit.id ? 'Групу збережено в Checkbox' : 'Групу створено в Checkbox');
+  await loadGoods();
+});
+let gmFrom = null;
+$('#grpTree').onclick = async e => {
+  const b = e.target.closest('button'); if (!b) return;
+  const d = b.dataset;
+  if (d.tog) { treeCollapsed.has(d.tog) ? treeCollapsed.delete(d.tog) : treeCollapsed.add(d.tog); saveSet('kasa_tree_collapsed', treeCollapsed); return renderGroupTree(); }
+  if (d.gedit) return openGroup(d.gedit);
+  if (d.gsub) return openGroup(null, d.gsub);
+  if (d.gmove) {
+    const g = groupById[d.gmove]; gmFrom = g.id;
+    $('#gmText').textContent = `Усі товари групи «${g.path.join(' / ')}» (${g.goods}) буде перенесено в обрану групу.`;
+    $('#gmTo').innerHTML = groupOptions(new Set([g.id]), null, '');
+    $('#grpMoveModal').classList.add('show'); return;
+  }
+  if (d.gdel) {
+    const g = groupById[d.gdel];
+    if (!(await ask(`Видалити групу «${g.path.join(' / ')}» у Checkbox?`, { title: 'Видалення групи', ok: 'Видалити', danger: true, icon: '🗑' }))) return;
+    await busy(b, async () => { await api('/api/groups/delete', { id: g.id }); toast('Групу видалено'); await loadGoods(); });
+  }
+};
+const closeGm = () => $('#grpMoveModal').classList.remove('show');
+$('#gmX').onclick = closeGm; $('#gmCancel').onclick = closeGm;
+$('#gmOk').onclick = e => busy(e.target, async () => {
+  const r = await api('/api/groups/move-goods', { id: gmFrom, to_group: $('#gmTo').value });
+  closeGm(); toast(`Товари перенесено${r.moved != null ? ': ' + r.moved : ''}`); await loadGoods();
+});
 
 // --- додавання й редагування товару ---
 let editing = null;   // товар, що редагується; null — новий
@@ -2227,7 +2430,10 @@ $('#goodDiscard').onclick = async () => {
     toast('Невідправлені зміни скасовано'); await loadGoods();
   } catch (err) { goodStatus('✖ ' + err.message, 'bad'); }
 };
-$('#goodsTable').onclick = e => { const tr = e.target.closest('tr[data-id]'); if (tr) openGood(goods.find(g => g.id === tr.dataset.id)); };
+$('#goodsTable').onclick = e => {
+  const gr = e.target.closest('tr.grouprow'); if (gr) { toggleCollapsed(gr.dataset.gkey); renderGoodsTable(); renderSearch(); return; }
+  const tr = e.target.closest('tr[data-id]'); if (tr) openGood(goods.find(g => g.id === tr.dataset.id));
+};
 $('#goodClose').onclick = closeGood; $('#goodCancel').onclick = closeGood;
 $('#goodModal').onkeydown = e => { if (e.key === 'Escape') closeGood(); };
 $('#goodSave').onclick = async e => {
@@ -2256,7 +2462,10 @@ $('#goodSave').onclick = async e => {
     goodStatus('✖ ' + err.message, 'bad');
   }
 };
-$('#results').onclick = e => { const it = e.target.closest('.item'); if (it) addToCart(it.dataset.id); };
+$('#results').onclick = e => {
+  const h = e.target.closest('.ghead'); if (h) { toggleCollapsed(h.dataset.gkey); renderSearch(); return; }
+  const it = e.target.closest('.item'); if (it) addToCart(it.dataset.id);
+};
 $('#search').onkeydown = e => {
   if (e.key !== 'Enter') return;
   const q = $('#search').value.trim();
