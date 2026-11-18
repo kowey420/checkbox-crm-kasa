@@ -18,7 +18,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import threading
 import urllib.parse
 import urllib.request
@@ -236,6 +236,13 @@ class App:
 
     def shift_state(self, force=False):
         c = self._shift
+        ac = (c["data"] or {}).get("auto_close_at") if c["data"] else None
+        if ac:                           # Checkbox мав закрити зміну сам — перечитаємо стан
+            try:
+                if datetime.now(timezone.utc) >= datetime.fromisoformat(ac.replace("Z", "+00:00")):
+                    force = True
+            except ValueError:
+                pass
         if force or time.time() - c["at"] > self.SHIFT_TTL:
             c["data"], c["at"] = self.call(self.api.current_shift), time.time()
         return c["data"]
@@ -254,6 +261,7 @@ class App:
             "has_pin": bool(cfg.get("pin_code")),
             # новий конфіг — 50 копійок за замовчуванням; явне null — без заокруглення
             "cash_rounding": (cfg.get("cash_rounding") or "") if "cash_rounding" in cfg else "ROUND_50",
+            "auto_close_time": cfg.get("auto_close_time") or "",
             "auth_ok": self.auth_ok,
             "connecting": self.connecting,
             "auth_error": self.auth_error,
@@ -316,6 +324,11 @@ class App:
         if rounding not in (None,) + ROUNDING_MODES:
             raise UserError("Невірний режим заокруглення")
         new["cash_rounding"] = rounding
+        if "auto_close_time" in body:
+            ac = str(body.get("auto_close_time") or "").strip()
+            if ac and not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", ac):
+                raise UserError("Час автоматичного закриття зміни — у форматі ГГ:ХХ, напр. 23:50")
+            new["auto_close_time"] = ac or None
         # у вікні їх немає: вшиті значення дописуються в config.json, щоб було видно, де їх змінити
 
         # Спершу перевіряємо, що з новими даними можна увійти, і лише потім зберігаємо
@@ -547,8 +560,8 @@ class App:
     def rounding_mode(self):
         return self.api.cfg.get("cash_rounding") or None
 
-    def refresh_taxes(self):
-        """Кнопка «Оновити ставки»: довідник податкових ставок з Checkbox (GET /tax)."""
+    def refresh_taxes(self, quiet=False):
+        """Кнопка «Оновити ставки» і відкриття зміни: довідник податкових ставок з Checkbox (GET /tax)."""
         taxes, source = self.call(self.api.get_taxes, [])
         if not taxes:
             raise UserError("Checkbox не повернув податкових ставок")
@@ -559,7 +572,10 @@ class App:
             self.db.con.execute("INSERT OR REPLACE INTO meta VALUES ('taxes_fetched_at', ?)",
                                 (datetime.now().isoformat(timespec="seconds"),))
         log.info("Податкові ставки оновлено: %d (%s)", len(taxes), source)
-        return {"taxes": len(taxes), "source": source}
+        diff = None if quiet else self.shift_tax_diff(self.shift_state(force=True))
+        if diff:
+            log.warning("Ставки в Checkbox відрізняються від ставок відкритої зміни: %s — діятимуть з наступної зміни", diff)
+        return {"taxes": len(taxes), "source": source, "shift_diff": diff}
 
     def sync(self, groups=True):
         goods, use_leftovers, taxes, source = self.call(sync_all, self.api, self.db, False, groups)
@@ -570,7 +586,9 @@ class App:
     # ---- зміна ----
     def shift(self, fresh=False):
         """fresh — для вкладки «Зміна» (там потрібен актуальний баланс); інакше — з кешу."""
-        return {"shift": self.shift_state(force=fresh), "last_z": self.last_z()}
+        sh = self.shift_state(force=fresh)
+        return {"shift": sh, "last_z": self.last_z(), "tax_diff": self.shift_tax_diff(sh),
+                "auto_close_time": self.api.cfg.get("auto_close_time")}
 
     def _synced_today(self):
         at = self.db.meta("synced_at") or ""
@@ -600,13 +618,54 @@ class App:
             log.warning("Синхронізація при зміні не вдалася: %s", e)
             return {"sync_error": str(e), "pending": self.db.pending_count()}
 
+    def auto_close_at(self):
+        """Найближчий момент «ГГ:ХХ» з налаштувань (місцевий час) — у UTC для auto_close_at; None — вимкнено."""
+        hhmm = self.api.cfg.get("auto_close_time")
+        if not hhmm:
+            return None
+        h, m = map(int, hhmm.split(":"))
+        now = datetime.now().astimezone()
+        at = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if at <= now + timedelta(minutes=5):          # уже минуло (або от-от) — завтра
+            at += timedelta(days=1)
+        u = at.astimezone(timezone.utc)
+        return u.strftime("%Y-%m-%dT%H:%M:%S.") + f"{u.microsecond // 1000:03d}Z"
+
     def open_shift(self):
         if self.shift_state(force=True):
             raise UserError("Зміна вже відкрита")
         sync = self._sync_quietly(opening=True)    # товари звіряємо до відкриття: продаж — уже з актуальними
-        shift = self.call(self.api.open_shift)
+        # Зміни ставок у кабінеті Checkbox діють з наступного відкриття зміни: довідник — саме перед ним
+        try:
+            sync["taxes"] = self.refresh_taxes(quiet=True)["taxes"]
+        except (CheckboxError, net.RequestException, UserError) as e:
+            log.warning("Податкові ставки перед відкриттям зміни не оновлено: %s", e)
+        auto = self.auto_close_at()
+        shift = self.call(self.api.open_shift, auto)
+        if auto:
+            shift.setdefault("auto_close_at", auto)
+            log.info("Зміну відкрито з автоматичним закриттям о %s (UTC %s)", self.api.cfg.get("auto_close_time"), auto)
         self._set_shift(shift)
         return {"shift": shift, "sync": sync}
+
+    def shift_tax_diff(self, shift=None):
+        """
+        Ставки, що діють у відкритій зміні (shift.taxes), проти довідника каси. Зміни, зроблені в кабінеті
+        Checkbox після відкриття зміни, діятимуть лише з наступної. None — зміна закрита або Checkbox не дав ставок.
+        """
+        shift = shift if shift is not None else self.shift_state()
+        active = (shift or {}).get("taxes")
+        if not shift or not isinstance(active, list) or not active:
+            return None
+        sig = lambda t: (t.get("symbol"), t.get("label"), float(t.get("rate") or 0), float(t.get("extra_rate") or 0))
+        act = {int(t["code"]): t for t in active if t.get("code") is not None}
+        cur = {int(t["code"]): dict(t) for t in self.db.taxes()}
+        added = sorted(c for c in cur if c not in act)
+        removed = sorted(c for c in act if c not in cur)
+        changed = sorted(c for c in cur if c in act and sig(cur[c]) != sig(act[c]))
+        if not (added or removed or changed):
+            return None
+        return {"added": added, "removed": removed, "changed": changed, "active": sorted(act)}
 
     def close_shift(self):
         if not self.shift_state(force=True):
@@ -721,6 +780,16 @@ class App:
             all_marks.update(marks)
 
             cart.append((row, qty, marks))
+        active = (self._shift.get("data") or {}).get("taxes") if self._shift.get("data") else None
+        if isinstance(active, list) and active:
+            act = {int(t["code"]) for t in active if t.get("code") is not None}
+            for row, _, _ in cart:
+                missing = [c for c in good_tax_codes(row) if c not in act]
+                if missing:
+                    raise UserError(f"«{row['name']}»: податкова ставка з кодом {', '.join(map(str, missing))} у цій зміні "
+                                    "ще не діє — зміни ставок у кабінеті Checkbox набувають чинності з наступного "
+                                    "відкриття зміни. Закрийте й відкрийте зміну або оберіть товару чинну ставку.",
+                                    code="TAX_NOT_ACTIVE")
         sold = self.db.excise_sold(all_marks)
         if sold:
             m, r = next(iter(sold.items()))
@@ -1715,6 +1784,8 @@ PAGE = r"""<!DOCTYPE html>
   .seg label { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 9px; cursor: pointer; font-weight: 600; }
   .seg input { display: none; }
   .seg label:has(input:checked) { background: var(--accent-btn); color: #fff; }
+  .warnbox { margin-top: 10px; padding: 10px 12px; border-radius: 10px; font-size: 13px; line-height: 1.45;
+             border: 1px solid rgba(217, 119, 6, .45); background: rgba(245, 158, 11, .12); color: var(--text); }
   .btn.zbtn { padding: 3px 10px; font-size: 12px; line-height: 1.4; margin-left: 8px; vertical-align: middle; white-space: nowrap; }
   td .btn.zbtn { margin-left: 0; }
   .codebox { display: flex; gap: 6px; } .codebox input { flex: 1; min-width: 0; }
@@ -1967,6 +2038,9 @@ PAGE = r"""<!DOCTYPE html>
         <span class="row" style="gap:10px;flex-wrap:nowrap"><small class="muted">Джерело: <span id="taxSource">—</span></small>
           <button class="btn sec small" id="taxRefresh" title="Завантажити довідник ставок з Checkbox (GET /tax)">⟳ Оновити ставки</button></span>
       </div>
+      <p class="muted" style="font-size:12px;margin:6px 0 0">Зміни ставок у кабінеті Checkbox набувають чинності лише з наступного
+        відкриття зміни — каса сама оновлює довідник ставок перед кожним відкриттям зміни.</p>
+      <div class="warnbox" id="taxDiffBox" style="display:none"></div>
       <table style="margin-top:12px">
         <thead><tr><th>Код</th><th>Літера</th><th>Назва</th><th class="num">Ставка</th><th class="num">Акциз</th><th>Тип</th><th class="num">Товарів</th></tr></thead>
         <tbody id="taxTable"></tbody>
@@ -1993,6 +2067,7 @@ PAGE = r"""<!DOCTYPE html>
   <section id="shift" class="tab">
     <div class="card">
       <div id="shiftInfo" class="muted">Завантаження…</div>
+      <div class="warnbox" id="shiftTaxWarn" style="display:none"></div>
       <div id="cashNow" class="cashnow"></div>
       <div class="row" style="margin-top:14px">
         <button class="btn ok" id="openShift">Відкрити зміну</button>
@@ -2134,6 +2209,12 @@ PAGE = r"""<!DOCTYPE html>
         <option value="ROUND_10">До 10 копійок (ROUND_10)</option>
         <option value="">Без заокруглення</option>
       </select>
+    </label>
+    <label>Автоматичне закриття зміни
+      <span class="row" style="flex-wrap:nowrap;gap:6px"><input type="time" id="cfgAutoClose" style="flex:1">
+        <button type="button" class="btn sec small" id="cfgAutoCloseOff" title="Вимкнути">✕</button></span>
+      <small class="muted">Checkbox сам закриє зміну (з Z-звітом) о цій годині; порожньо — вимкнено.
+        Діє з наступного відкриття зміни.</small>
     </label>
   </div>
   <div class="termrow">
@@ -2783,10 +2864,25 @@ function renderGoodsNav() {
   $('#navTaxesN').textContent = taxes.length;
   if (window.exciseTotal != null) $('#navExciseN').textContent = window.exciseTotal;
 }
+function taxDiffText(d) {
+  if (!d) return '';
+  const nm = c => { const t = taxes.find(x => x.code === c); return t ? `${t.symbol || c} — ${t.label}` : `код ${c}`; };
+  const parts = [];
+  if (d.added.length) parts.push('нові: ' + d.added.map(nm).join(', '));
+  if (d.changed.length) parts.push('змінені: ' + d.changed.map(nm).join(', '));
+  if (d.removed.length) parts.push('прибрані: ' + d.removed.map(c => 'код ' + c).join(', '));
+  return `⚠️ Податкові ставки в кабінеті Checkbox змінились після відкриття зміни (${parts.join('; ')}). ` +
+    'Вони діятимуть лише з наступного відкриття зміни — до того товари з новими ставками пробити не вийде. ' +
+    'Закрийте зміну й відкрийте знову, щоб застосувати їх.';
+}
+function showTaxDiff(d) {
+  ['#taxDiffBox', '#shiftTaxWarn'].forEach(s => { const el = $(s); el.textContent = taxDiffText(d); el.style.display = d ? '' : 'none'; });
+}
 $('#taxRefresh').onclick = e => busy(e.target, async () => {
   const r = await api('/api/taxes/refresh', {});
-  toast(`Податкові ставки оновлено: ${r.taxes}`);
   await loadGoods();
+  showTaxDiff(r.shift_diff);
+  toast(`Податкові ставки оновлено: ${r.taxes}` + (r.shift_diff ? ' · у відкритій зміні діють попередні — див. попередження' : ''), !!r.shift_diff);
 });
 $('#goodsNav').onclick = e => { const b = e.target.closest('button[data-pane]'); if (b) showGoodsPane(b.dataset.pane); };
 let exciseTimer = null;
@@ -4045,19 +4141,22 @@ async function loadShift(fresh) {
   try {
     // актуальний баланс потрібен лише на вкладці «Зміна»; для шапки досить стану з кешу каси
     if (fresh === undefined) fresh = !!document.querySelector('#shift.tab.active');
-    const { shift, last_z } = await api('/api/shift' + (fresh ? '?fresh=1' : ''));
+    const { shift, last_z, tax_diff, auto_close_time } = await api('/api/shift' + (fresh ? '?fresh=1' : ''));
+    showTaxDiff(shift ? tax_diff : null);
     const b = $('#shiftBadge');
     shiftOpen = !!shift;
     if (shift) {
       b.textContent = `Зміна №${shift.serial ?? ''} відкрита`; b.className = 'badge open';
-      $('#shiftInfo').innerHTML = `Зміна <b>№${esc(shift.serial)}</b> · статус <b>${esc(shift.status)}</b> · відкрита ${esc((shift.opened_at || '').replace('T', ' ').slice(0, 19))}`;
+      const ac = shift.auto_close_at ? new Date(shift.auto_close_at) : null;
+      const acText = ac && !isNaN(ac) ? ` · автозакриття <b>${ac.toLocaleString('uk-UA', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}</b>` : '';
+      $('#shiftInfo').innerHTML = `Зміна <b>№${esc(shift.serial)}</b> · статус <b>${esc(shift.status)}</b> · відкрита ${esc((shift.opened_at || '').replace('T', ' ').slice(0, 19))}${acText}`;
       const bal = shift.balance || {};
       $('#cashNow').innerHTML = bal.balance != null ? `Готівка в касі: <b>${uah(bal.balance)} ₴</b>` +
         `<small class="muted"> · на початку ${uah(bal.initial || 0)} · продажі ${uah(bal.cash_sales || 0)} · повернення ${uah(bal.cash_returns || 0)}` +
         ` · внесено ${uah(bal.service_in || 0)} · винесено ${uah(bal.service_out || 0)}</small>` : '';
     } else {
       b.textContent = 'Зміна закрита'; b.className = 'badge';
-      $('#shiftInfo').textContent = 'Зміна не відкрита.';
+      $('#shiftInfo').textContent = 'Зміна не відкрита.' + (auto_close_time ? ` Після відкриття Checkbox закриє її автоматично о ${auto_close_time}.` : '');
       $('#cashNow').textContent = '';
     }
     $('#openShift').style.display = shift ? 'none' : '';
@@ -4631,6 +4730,7 @@ async function openSettings() {
   $('#cfgPassword').placeholder = c.has_password ? '•••••••• (збережено)' : '';
   $('#cfgPin').placeholder = c.has_pin ? '•••• (збережено)' : '';
   $('#cfgRounding').value = c.cash_rounding;
+  $('#cfgAutoClose').value = c.auto_close_time || '';
   document.querySelector(`input[name="authMode"][value="${c.auth_mode}"]`).checked = true;
   renderAuthMode();
   $('#settingsModal').classList.add('show');
@@ -4641,6 +4741,7 @@ document.querySelectorAll('input[name="authMode"]').forEach(r => r.onchange = re
 document.querySelectorAll('.eye').forEach(b => b.onclick = () => {
   const i = document.getElementById(b.dataset.for); i.type = i.type === 'password' ? 'text' : 'password';
 });
+$('#cfgAutoCloseOff').onclick = () => { $('#cfgAutoClose').value = ''; };
 $('#settingsBtn').onclick = () => openSettings().catch(e => toast(e.message, true));
 $('#settingsClose').onclick = closeSettings; $('#settingsCancel').onclick = closeSettings;
 $('#settingsModal').onclick = e => { if (e.target.id === 'settingsModal') closeSettings(); };
@@ -4651,6 +4752,7 @@ $('#settingsSave').onclick = e => busy(e.target, async () => {
     auth_mode: mode,
     license_key: $('#cfgLicense').value, login: $('#cfgLogin').value,
     cash_rounding: $('#cfgRounding').value,
+    auto_close_time: $('#cfgAutoClose').value,
   };
   if (mode === 'password' && $('#cfgPassword').value) body.password = $('#cfgPassword').value;
   if (mode === 'pin' && $('#cfgPin').value) body.pin_code = $('#cfgPin').value;

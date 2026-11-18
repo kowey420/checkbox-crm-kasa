@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.7.0.2"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.7.0.3"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -728,8 +728,10 @@ class CheckboxAPI:
                 return shift
         raise CheckboxError(f"Зміна не перейшла в статус {target} за {timeout} с")
 
-    def open_shift(self):
-        shift = self._req("POST", "/shifts")
+    def open_shift(self, auto_close_at=None):
+        """auto_close_at — час автоматичного закриття зміни Checkbox (UTC, «2026-11-18T21:50:00.000Z»)."""
+        kw = {"json": {"auto_close_at": auto_close_at}} if auto_close_at else {}
+        shift = self._req("POST", "/shifts", **kw)
         return self._wait_shift(shift["id"], "OPENED")
 
     def close_shift(self):
