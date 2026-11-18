@@ -40,8 +40,9 @@ def repo():
 
 
 def parse_version(v):
-    nums = [int(x) for x in re.findall(r"\d+", str(v))[:3]]
-    return tuple(nums + [0] * (3 - len(nums)))
+    """«1.4.6» → (1, 4, 6, 0); «1.4.6.1» → (1, 4, 6, 1). Каси до 1.4.6 бачать лише перші три числа."""
+    nums = [int(x) for x in re.findall(r"\d+", str(v))[:4]]
+    return tuple(nums + [0] * (4 - len(nums)))
 
 
 def install_kind():

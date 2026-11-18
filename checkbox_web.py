@@ -1908,7 +1908,10 @@ PAGE = r"""<!DOCTYPE html>
   <p class="muted" style="font-size:12px;margin:12px 0 0">Журнал роботи: <code id="logPath"></code></p>
   <div class="row" style="justify-content:space-between;margin-top:8px;font-size:13px">
     <span id="verInfo" class="muted">Версія…</span>
-    <button class="btn sec small" id="checkUpdBtn">Перевірити оновлення</button>
+    <span class="row" style="gap:8px;flex-wrap:nowrap">
+      <button class="btn small" id="updNowBtn" style="display:none">⬆ Оновити</button>
+      <button class="btn sec small" id="checkUpdBtn">Перевірити оновлення</button>
+    </span>
   </div>
   <div class="pay" style="margin-top:18px">
     <button class="btn sec" id="settingsCancel">Скасувати</button>
@@ -4395,6 +4398,7 @@ let updateInfo = null;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function renderUpdate(r) {
   const v = $('#verInfo'), b = $('#updateBanner');
+  $('#updNowBtn').style.display = r.available ? '' : 'none';
   v.textContent = `Версія каси ${r.current}` + (r.enabled === false ? ' · оновлення не налаштовано'
     : r.error ? ` · ⚠ ${r.error}` : r.newer ? ` · доступна ${r.latest}` : r.latest ? ' · це остання версія' : '');
   const link = r.url ? ` · <a href="${esc(r.url)}" target="_blank" rel="noopener">що нового</a>` : '';
@@ -4402,6 +4406,7 @@ function renderUpdate(r) {
     b.innerHTML = `<span>🎉 Доступна нова версія каси <b>${esc(r.latest)}</b> (у вас ${esc(r.current)})${link}</span>
       <button class="btn small" id="updateBtn">Оновити</button>`;
     b.style.display = ''; $('#updateBtn').onclick = runUpdate;
+    $('#updNowBtn').textContent = `⬆ Оновити до ${r.latest}`;
   } else if (r.newer && r.problem) {
     b.innerHTML = `<span>ℹ Доступна версія <b>${esc(r.latest)}</b>: ${esc(r.problem)}${link}</span>`; b.style.display = '';
   } else b.style.display = 'none';
@@ -4415,6 +4420,7 @@ $('#checkUpdBtn').onclick = e => busy(e.target, async () => {
   if (r && !r.error && r.enabled !== false && !r.newer) toast(`У вас остання версія (${r.current})`);
   if (r && r.error) throw new Error(r.error);
 });
+$('#updNowBtn').onclick = () => runUpdate();
 async function runUpdate() {
   const warn = cart.length ? 'У кошику є товари — після оновлення кошик буде порожній.\n\n' : '';
   if (!(await ask(`${warn}Оновити касу до версії ${updateInfo.latest}? Каса перезапуститься — це до хвилини.`, { title: 'Оновлення', ok: 'Оновити', icon: '⬆️' }))) return;
