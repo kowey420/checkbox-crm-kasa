@@ -185,25 +185,51 @@ def _install_py(data):
     return backup
 
 
+_pending_swap = None        # (Kasa.new.exe, Kasa.exe): замінити після виходу каси
+
+
+def _exe_paths():
+    exe = Path(sys.executable)
+    return exe, exe.with_name(exe.stem + ".new.exe"), exe.with_name(exe.stem + ".old.exe")
+
+
 def _install_exe(data):
+    """
+    Нову версію кладемо поруч як Kasa.new.exe, а запущений Kasa.exe не чіпаємо: заміну робить помічник
+    уже після виходу каси. Перейменування запущеного Kasa.exe (як було до 1.4.6.5) заважало
+    завантажувачу onefile прибрати свою папку _MEI… — «Failed to remove temporary directory».
+    """
+    global _pending_swap
     if data[:2] != b"MZ":
         raise UpdateError(f"{EXE_ASSET} — не програма Windows")
-    exe = Path(sys.executable)
-    new, old = exe.with_name(exe.stem + ".new.exe"), exe.with_name(exe.stem + ".old.exe")
+    exe, new, _ = _exe_paths()
     try:
-        new.write_bytes(data)
-        if old.exists():
-            try:
-                old.unlink()
-            except OSError:
-                # попередня версія ще зайнята (не встигла закритися) — беремо інше ім'я, приберемо пізніше
-                old = exe.with_name(f"{exe.stem}.old-{int(time.time())}.exe")
-        os.replace(exe, old)        # запущений exe у Windows не можна перезаписати, але можна перейменувати
-        os.replace(new, exe)
+        tmp = new.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, new)
     except OSError as e:
-        raise UpdateError(f"Немає прав на заміну {exe.name} ({exe.parent}): {e}")
+        raise UpdateError(f"Немає прав на запис у папку каси ({exe.parent}): {e}")
+    _pending_swap = (new, exe)
+    log.info("Нову версію збережено як %s; Kasa.exe буде замінено після виходу каси", new.name)
+    return new
+
+
+def _swap_now():
+    """Замінити Kasa.exe одразу (запасний шлях, коли помічника запустити не вдалося): як до 1.4.6.5."""
+    global _pending_swap
+    if not _pending_swap:
+        return
+    new, exe = _pending_swap
+    old = exe.with_name(exe.stem + ".old.exe")
+    if old.exists():
+        try:
+            old.unlink()
+        except OSError:
+            old = exe.with_name(f"{exe.stem}.old-{int(time.time())}.exe")
+    os.replace(exe, old)        # запущений exe не можна перезаписати, але можна перейменувати
+    os.replace(new, exe)
+    _pending_swap = None
     log.info("Kasa.exe оновлено; попередня версія — %s", old.name)
-    return old
 
 
 def install():
@@ -269,10 +295,41 @@ def _spawn_via_wmi(pids, relaunch):
     envs = {"CHECKBOX_NO_BROWSER": "1", "CHECKBOX_RESTARTED": "1", "CHECKBOX_CLEAN_SPAWN": "1"}
     if relaunch:
         envs["CHECKBOX_RELAUNCHED"] = "1"
-    inner = (f"Wait-Process -Id {','.join(map(str, pids))} -Timeout 120 -ErrorAction SilentlyContinue; "
-             "Start-Sleep -Milliseconds 500; "
-             + "".join(f"$env:{k}={_ps_quote(v)}; " for k, v in envs.items())
-             + f"Start-Process -FilePath {_ps_quote(sys.executable)} -WorkingDirectory {_ps_quote(APP_DIR)}")
+    exe, new, old = _exe_paths()
+    swap = bool(_pending_swap)
+    hlog = DATA_DIR / "logs" / "update-helper.log"
+    inner = r"""
+$log = @LOG@
+function L($m) { try { Add-Content -LiteralPath $log -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff') + '  ' + $m) -Encoding UTF8 } catch {} }
+L ('---- помічник оновлення: чекаю завершення PID @PIDS@')
+Wait-Process -Id @PIDS@ -Timeout 120 -ErrorAction SilentlyContinue
+L 'стара копія завершилась'
+Start-Sleep -Milliseconds 500
+$exe = @EXE@; $new = @NEW@; $old = @OLD@
+if (@SWAP@ -and (Test-Path -LiteralPath $new)) {
+  $ok = $false
+  for ($i = 1; $i -le 40 -and -not $ok; $i++) {
+    try {
+      $o = $old
+      if (Test-Path -LiteralPath $o) {
+        try { Remove-Item -LiteralPath $o -Force -ErrorAction Stop }
+        catch { $o = $old.Substring(0, $old.Length - 4) + '-' + [DateTime]::Now.Ticks + '.exe' }
+      }
+      Move-Item -LiteralPath $exe -Destination $o -Force -ErrorAction Stop
+      try { Move-Item -LiteralPath $new -Destination $exe -Force -ErrorAction Stop; $ok = $true; L ('Kasa.exe замінено новою версією; попередня — ' + (Split-Path $o -Leaf)) }
+      catch { Move-Item -LiteralPath $o -Destination $exe -Force -ErrorAction SilentlyContinue; throw }
+    } catch { L ('спроба ' + $i + ' замінити Kasa.exe: ' + $_.Exception.Message); Start-Sleep -Milliseconds 500 }
+  }
+  if (-not $ok) { L 'не вдалося замінити Kasa.exe — запускаю попередню версію' }
+}
+""" + "".join(f"$env:{k}={_ps_quote(v)}\n" for k, v in envs.items()) + r"""
+try { Start-Process -FilePath $exe -WorkingDirectory @DIR@ -ErrorAction Stop; L 'нову копію каси запущено' }
+catch { L ('не вдалося запустити касу: ' + $_.Exception.Message) }
+"""
+    for k, v in (("@LOG@", _ps_quote(hlog)), ("@PIDS@", ",".join(map(str, pids))), ("@EXE@", _ps_quote(exe)),
+                 ("@NEW@", _ps_quote(new)), ("@OLD@", _ps_quote(old)), ("@SWAP@", "$true" if swap else "$false"),
+                 ("@DIR@", _ps_quote(APP_DIR))):
+        inner = inner.replace(k, v)
     cmd = f'"{_powershell()}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {_ps_encoded(inner)}'
     outer = ("$si = ([wmiclass]'root\\cimv2:Win32_ProcessStartup').CreateInstance(); $si.ShowWindow = 0; "
              f"$r = ([wmiclass]'root\\cimv2:Win32_Process').Create({_ps_quote(cmd)}, {_ps_quote(APP_DIR)}, $si); "
@@ -317,6 +374,10 @@ def spawn_restarted(relaunch=False):
             return
         except (OSError, subprocess.SubprocessError) as e:
             log.warning("Перезапуск через WMI не вдався (%s) — запускаю нову копію напряму", e)
+    try:
+        _swap_now()
+    except OSError as e:
+        log.error("Не вдалося замінити Kasa.exe новою версією: %s", e)
     kw = {"env": env, "cwd": str(APP_DIR), "close_fds": True}
     if os.name == "nt":
         flags = 0x00000200                                  # CREATE_NEW_PROCESS_GROUP
@@ -416,3 +477,10 @@ def cleanup_after_update():
                 old.unlink()
             except OSError:
                 pass                     # ще зайнятий — спробуємо при наступному запуску
+        stale = exe.with_name(exe.stem + ".new.exe")
+        if stale.exists():               # помічник не зміг замінити — деталі в logs/update-helper.log
+            log.warning("Знайдено незастосоване оновлення %s — видаляю (подробиці в update-helper.log)", stale.name)
+            try:
+                stale.unlink()
+            except OSError:
+                pass
