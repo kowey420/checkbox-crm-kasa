@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.3.6"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.3.7"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -512,6 +512,16 @@ class CheckboxAPI:
                     return result
                 offset += limit
 
+    # --- товар напряму (без імпорту файлу) ---
+    def get_good(self, good_id):
+        return self._req("GET", f"/goods/{good_id}")
+
+    def update_good(self, good_id, body):
+        return self._req("PUT", f"/goods/{good_id}", json=body)
+
+    def create_good(self, body):
+        return self._req("POST", "/goods", json=body)
+
     def create_group(self, name, description=None, parent_id=None):
         return self._req("POST", "/goods/groups", json={"name": name, "description": description, "parent_id": parent_id})
 
@@ -979,6 +989,9 @@ class LocalDB:
             self.con.execute(
                 "UPDATE goods SET name=?, code=?, barcode=?, price=?, is_weight=?, uktzed=?, tax_codes=?, "
                 "count=COALESCE(?, count), pending='change' WHERE TRIM(code)=?", fields + (stock, code))
+        if "group_id" in data:             # група — лише якщо правка її задає (старі правки без групи не чіпають)
+            self.con.execute("UPDATE goods SET group_id=? WHERE TRIM(code)=? OR id=?",
+                             (data["group_id"], code, self.LOCAL_ID_PREFIX + code))
 
     def _overlay_pending(self):
         for p in self.con.execute("SELECT * FROM goods_pending").fetchall():
@@ -990,6 +1003,8 @@ class LocalDB:
         Повторні правки одного товару зливаються; оригінал зберігається з першої правки.
         """
         data = {k: good.get(k) for k in ("name", "code", "price", "barcode", "uktzed", "is_weight", "tax_codes", "stock")}
+        if "group_id" in good:
+            data["group_id"] = good["group_id"]
         now = datetime.now().isoformat(timespec="seconds")
         with self.con:
             if existing is not None and existing["pending"] == "new":
@@ -1029,9 +1044,12 @@ class LocalDB:
         with self.con:
             self.con.executemany("DELETE FROM goods_pending WHERE code=?", [(c,) for c in codes])
 
-    def set_pending_error(self, error):
+    def set_pending_error(self, error, code=None):
         with self.con:
-            self.con.execute("UPDATE goods_pending SET error=?", (error,))
+            if code is None:
+                self.con.execute("UPDATE goods_pending SET error=?", (error,))
+            else:
+                self.con.execute("UPDATE goods_pending SET error=? WHERE code=?", (error, code))
 
     def discard_pending(self, code):
         """Скасувати правку: новий товар прибрати, змінений — повернути до стану Checkbox."""
@@ -1248,6 +1266,52 @@ def good_tax_codes(row):
 def is_excise_tax(t):
     """Ставка містить акциз (окремий акциз або «ПДВ + Акцизний податок»)."""
     return bool(t.get("extra_rate")) or "акциз" in (t.get("label") or "").lower()
+
+
+# поля тіла PUT /goods/{id}, які переносимо з поточного товару Checkbox, щоб їх не затерти
+_GOOD_KEEP = ("name", "short_name", "type", "code", "is_weight", "barcode", "uktzed", "price", "position",
+              "external_id", "source")
+
+
+def good_put_body(current, data):
+    """
+    Тіло PUT /goods/{id} (або POST /goods, якщо current = None): поточний стан товару в Checkbox
+    + локальні правки data (name, code, price, barcode, uktzed, is_weight, tax_codes, group_id).
+    """
+    body = {}
+    if current:
+        for k in _GOOD_KEEP:
+            if current.get(k) is not None:
+                body[k] = current[k]
+        bc = current.get("barcodes")
+        if not isinstance(bc, list):
+            rel = current.get("related_barcodes")
+            bc = [x for x in re.split(r"[,;\s]+", rel) if x] if isinstance(rel, str) else None
+        if bc:
+            body["barcodes"] = bc
+        if good_group_id(current):
+            body["group"] = good_group_id(current)
+        body["tax_codes"] = ordered_tax_codes(current.get("taxes") or [])
+        kids = [c.get("id") if isinstance(c, dict) else c for c in current.get("children") or []]
+        if kids:
+            body["children"] = [k for k in kids if k]
+        if isinstance(current.get("branches_info"), list):
+            body["branches_info"] = current["branches_info"]
+    body.setdefault("type", "good")
+    for k in ("name", "code", "price", "barcode", "uktzed"):
+        if k in data:
+            body[k] = data[k] if data[k] not in ("",) else None
+    if "is_weight" in data:
+        body["is_weight"] = bool(data["is_weight"])
+    if "tax_codes" in data:
+        body["tax_codes"] = list(data["tax_codes"] or [])
+    if "group_id" in data:
+        body["group"] = data["group_id"] or None
+    if body.get("barcode") and body.get("barcodes") is not None and current and current.get("barcode") \
+            and current["barcode"] != body["barcode"]:
+        # основний штрихкод змінено — старий прибираємо зі списку, новий додаємо
+        body["barcodes"] = [b for b in body["barcodes"] if b != current["barcode"]]
+    return body
 
 
 def good_group_id(g):

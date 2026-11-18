@@ -31,7 +31,8 @@ from checkbox_app import (APP_VERSION, AUTH_MODES, DATA_DIR, LOG_PATH, log, setu
                           CheckboxError, LocalDB, auth_mode, load_config, save_config,
                           build_goods_payload, clean_payment_label, good_tax_codes, new_receipt_id,
                           no_tax_goods, round_cash, sync_all, apply_discounts, return_lines,
-                          return_good_payload, local_time, line_sum, clean_phone, mask_phone, redact, log_json)
+                          return_good_payload, local_time, line_sum, clean_phone, mask_phone, redact, log_json,
+                          good_put_body)
 
 # Порти, які пробує каса: спершу той, що був минулого разу, далі по черзі від 8000
 PORT_RANGE = range(8000, 8020)
@@ -335,6 +336,11 @@ class App:
                 errors.append(f"зменшити залишок (у Checkbox {cb_count / 1000:g}) можна лише списанням у кабінеті Checkbox")
             elif stock == (cb_count or 0):
                 stock = None
+        if "group_id" in body:                        # група товару: id групи або None — без групи
+            gid = body.get("group_id") or None
+            if gid and not self.db.con.execute("SELECT 1 FROM goods_groups WHERE id=?", (gid,)).fetchone():
+                errors.append("групу не знайдено — синхронізуйте товари")
+            good["group_id"] = gid
         if errors:
             raise UserError("; ".join(errors))
         good["stock"] = stock
@@ -345,6 +351,8 @@ class App:
             changes = goods_csv.diff(existing, good)
             if stock != prev_stock:
                 changes.append(f"залишок → {stock / 1000:g}" if stock is not None else "залишок — як у Checkbox")
+            if "group_id" in good and good["group_id"] != existing["group_id"]:
+                changes.append("група → " + (good["group_id"] or "без групи"))
             if not changes:
                 return {"unchanged": True, "pending": self.db.pending_count()}
             log.info("Локальна правка товару %s: %s", good["code"], "; ".join(changes))
@@ -366,30 +374,75 @@ class App:
 
     def push_pending(self):
         """
-        Відправити всі локальні правки в Checkbox одним імпортом, потім залишки — окремим імпортом
-        з автоматичною поставкою (auto_supply). Повертає кількість відправлених правок.
+        Відправити локальні правки в Checkbox: змінені товари — PUT /goods/{id} (поточний стан товару
+        з Checkbox + правки), нові — POST /goods; якщо прямий метод недоступний — одним імпортом файлу.
+        Залишки — окремо, поставкою (auto_supply). Помилка одного товару не зупиняє решту.
+        Повертає кількість відправлених правок.
         """
         pending = self.db.pending()
         if not pending:
             return 0
-        goods = [dict(p["data"], match_code=None if p["action"] == "new" else p["code"]) for p in pending]
-        try:
-            saved = self.call(goods_csv.save_goods_to_checkbox, self.api, self.db, goods, None, False, False)
-        except (CheckboxError, net.RequestException) as e:
-            self.db.set_pending_error(str(e))
-            log.warning("Невідправлені правки товарів (%d): %s", len(pending), e)
-            raise
-        self.db.clear_pending([p["code"] for p in pending])
+        done, failed, via_import = [], {}, []
+        for p in pending:
+            data = p["data"]
+            try:
+                if p["action"] == "new":
+                    try:
+                        self.call(self.api.create_good, good_put_body(None, data))
+                    except CheckboxError as e:
+                        if not re.search(r"HTTP (404|405)\b", str(e)):
+                            raise
+                        via_import.append(p)          # POST /goods недоступний — імпортом
+                        continue
+                else:
+                    row = self.db.con.execute("SELECT id FROM goods WHERE TRIM(code)=? AND id NOT LIKE 'local-%'",
+                                              (p["code"],)).fetchone()
+                    if not row:
+                        raise CheckboxError("товару немає в Checkbox — синхронізуйте товари")
+                    current = self.call(self.api.get_good, row["id"])
+                    self.call(self.api.update_good, row["id"], good_put_body(current, data))
+                done.append(p)
+                log.info("Товар %s збережено в Checkbox (%s)", p["code"], "новий" if p["action"] == "new" else "зміни")
+            except (CheckboxError, net.RequestException) as e:
+                failed[p["code"]] = str(e)
+                self.db.set_pending_error(str(e), p["code"])
+                log.warning("Товар %s не збережено в Checkbox: %s", p["code"], e)
+        saved = {}
+        if via_import:
+            goods = [dict(p["data"], match_code=None) for p in via_import]
+            try:
+                saved = self.call(goods_csv.save_goods_to_checkbox, self.api, self.db, goods, None, False, False)
+                done.extend(via_import)
+                grouped = {p["code"]: p["data"]["group_id"] for p in via_import if p["data"].get("group_id")}
+                if grouped:                           # файл імпорту групу не передає — ставимо її через PUT
+                    ids = {str(g["code"]).strip(): g["id"] for g in self.call(self.api.get_all_goods)[0]}
+                    for code, gid in grouped.items():
+                        try:
+                            if ids.get(code):
+                                current = self.call(self.api.get_good, ids[code])
+                                self.call(self.api.update_good, ids[code], good_put_body(current, {"group_id": gid}))
+                        except (CheckboxError, net.RequestException) as e:
+                            log.warning("Групу товару %s не встановлено: %s", code, e)
+            except (CheckboxError, net.RequestException) as e:
+                for p in via_import:
+                    failed[p["code"]] = str(e)
+                    self.db.set_pending_error(str(e), p["code"])
+                log.warning("Нові товари (%d) не збережено імпортом: %s", len(via_import), e)
+        self.db.clear_pending([p["code"] for p in done])
+        pending = done
         stock = {p["data"]["code"]: (p["data"]["stock"], bool(p["data"].get("is_weight")))
                  for p in pending if p["data"].get("stock") is not None}
         if stock:
             # правки товарів уже в Checkbox; поставку не повторюємо автоматично — лише повідомляємо
             try:
-                failed = self.call(goods_csv.supply_stock, self.api, stock, None, saved.get("file"))
+                failed_stock = self.call(goods_csv.supply_stock, self.api, stock, None, saved.get("file"))
             except (CheckboxError, net.RequestException) as e:
                 raise CheckboxError(f"товари збережено, але залишки не внесено: {e}")
-            if failed:
-                raise CheckboxError("товари збережено, але Checkbox не прийняв залишки: " + "; ".join(failed))
+            if failed_stock:
+                raise CheckboxError("товари збережено, але Checkbox не прийняв залишки: " + "; ".join(failed_stock))
+        if failed:
+            raise CheckboxError(f"не збережено товарів: {len(failed)} — "
+                                + "; ".join(f"{c}: {e}" for c, e in list(failed.items())[:3]))
         return len(pending)
 
     def full_sync(self):
@@ -1782,6 +1835,7 @@ PAGE = r"""<!DOCTYPE html>
     <label>Ціна, ₴<input type="text" id="gPrice" inputmode="decimal" placeholder="0.00"></label>
     <label>Штрихкод<input type="text" id="gBarcode" inputmode="numeric" spellcheck="false"></label>
     <label>УКТЗЕД<input type="text" id="gUktzed" placeholder="2202 10 00 00" spellcheck="false"></label>
+    <label class="wide" id="gGroupWrap">Група<select id="gGroup"></select></label>
     <label class="wide chk"><input type="checkbox" id="gWeight"> Ваговий товар (продається в кілограмах)</label>
   </div>
   <p class="muted" style="margin:12px 0 6px">Податкові ставки:</p>
@@ -2381,8 +2435,10 @@ function openGood(g) {
       <span class="tax">${esc(t.symbol || t.code)}</span> ${esc(t.label)}</label>`).join('')
     : '<span class="muted">Довідник ставок порожній — синхронізуйте касу</span>';
   $('#gNote').textContent = (g && g.pending !== 'new')
-    ? 'Код змінити не можна: Checkbox розпізнає товари за кодом.'
+    ? 'Код змінити не можна: Checkbox розпізнає товари за кодом. Зміни підуть у Checkbox під час синхронізації (PUT /goods).'
     : 'Товар одразу можна продавати; у Checkbox він з\'явиться під час синхронізації.';
+  $('#gGroupWrap').style.display = groupList.length ? '' : 'none';
+  $('#gGroup').innerHTML = groupOptions(new Set(), g ? g.group_id : null, '— без групи —');
   // залишок: cb — залишок у Checkbox (без локальної правки), g.count — у касі (з правкою)
   const cb = g ? (g.pending ? g.cb_count : g.count) : null;
   stockCb = cb;
@@ -2445,6 +2501,7 @@ $('#goodSave').onclick = async e => {
     tax_codes: [...document.querySelectorAll('#gTaxes input:checked')].map(i => +i.value),
   };
   try { body.stock = readStock(); } catch (err) { goodStatus('✖ ' + err.message, 'bad'); return $('#gStock').focus(); }
+  if (groupList.length) body.group_id = $('#gGroup').value || null;   // без довідника груп групу не чіпаємо
   if (!body.tax_codes.length && taxes.length && !(await ask('Товар без податкової ставки — чек з ним буде без податку. Зберегти так?', { title: 'Без податку', ok: 'Зберегти', icon: '⚠️' }))) return;
   btn.disabled = true; $('#goodCancel').disabled = true;
   try {
