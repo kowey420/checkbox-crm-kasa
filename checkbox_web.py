@@ -31,7 +31,7 @@ from urllib.parse import parse_qs, urlparse
 
 import goods_csv
 import kasa_update
-from checkbox_app import (APP_VERSION, GITHUB_REPO, AUTH_MODES, DATA_DIR, LOG_PATH, log, setup_logging, net, CONFIG_PATH, DEFAULT_CLIENT_NAME, DEFAULT_CLIENT_VERSION,
+from checkbox_app import (APP_VERSION, GITHUB_REPO, vat_first, AUTH_MODES, DATA_DIR, LOG_PATH, log, setup_logging, net, CONFIG_PATH, DEFAULT_CLIENT_NAME, DEFAULT_CLIENT_VERSION,
                           ROUNDING_MODES, CheckboxAPI,
                           CheckboxError, LocalDB, auth_mode, load_config, save_config,
                           build_goods_payload, clean_payment_label, good_tax_codes, new_receipt_id,
@@ -471,6 +471,25 @@ class App:
         log.info("Скасовано локальну правку товару %s", code)
         return {"pending": self.db.pending_count()}
 
+    @staticmethod
+    def _stock_only(p):
+        """Правка змінює лише залишок (напр. поставка з каси): товар у Checkbox оновлювати не треба."""
+        try:
+            orig = json.loads(p.get("original") or "null")
+        except ValueError:
+            return False
+        if not orig:
+            return False
+        d = p["data"]
+        same = (d.get("name") == orig.get("name") and (d.get("code") or "").strip() == (orig.get("code") or "").strip()
+                and int(d.get("price") or 0) == int(orig.get("price") or 0)
+                and (d.get("barcode") or "") == (orig.get("barcode") or "")
+                and (d.get("uktzed") or "") == (orig.get("uktzed") or "")
+                and bool(d.get("is_weight")) == bool(orig.get("is_weight"))
+                and vat_first(d.get("tax_codes")) == vat_first(json.loads(orig.get("tax_codes") or "[]"))
+                and ("group_id" not in d or d.get("group_id") == orig.get("group_id")))
+        return same
+
     def push_pending(self):
         """
         Відправити локальні правки в Checkbox: змінені товари — PUT /goods/{id} (поточний стан товару
@@ -493,6 +512,8 @@ class App:
                             raise
                         via_import.append(p)          # POST /goods недоступний — імпортом
                         continue
+                elif self._stock_only(p):
+                    log.info("Товар %s: змінено лише залишок — без PUT, поставкою", p["code"])
                 else:
                     row = self.db.con.execute("SELECT id FROM goods WHERE TRIM(code)=? AND id NOT LIKE 'local-%'",
                                               (p["code"],)).fetchone()
@@ -910,6 +931,83 @@ class App:
                 "total_sum": receipt.get("total_sum", total),
                 "round_sum": receipt.get("round_sum"),
                 "rest": receipt.get("rest")}
+
+    # ---- поставка товару з каси (сканером) ----
+    def supply_post(self, body):
+        """
+        Провести поставку: кожному товару залишок += кількість (локальна правка залишку, у Checkbox —
+        поставкою через імпорт з автопоставкою, одразу). Собівартість і постачальник — у картку товару (лише каса).
+        """
+        lines_in = (body or {}).get("lines") or []
+        supplier = " ".join(str(body.get("supplier") or "").split())[:120] or None
+        doc_no = " ".join(str(body.get("doc_no") or "").split())[:60] or None
+        if not lines_in:
+            raise UserError("Поставка порожня — відскануйте товари")
+        merged, errors = {}, []
+        for ln in lines_in:
+            gid, qty = str(ln.get("id") or ""), ln.get("qty")
+            if not isinstance(qty, int) or isinstance(qty, bool) or qty <= 0 or qty > 10 ** 9:
+                errors.append(f"невірна кількість ({ln.get('name') or gid})")
+                continue
+            cost = ln.get("cost")
+            if cost is not None and (not isinstance(cost, int) or isinstance(cost, bool) or cost < 0 or cost > 10 ** 10):
+                errors.append(f"невірна собівартість ({ln.get('name') or gid})")
+                continue
+            m = merged.setdefault(gid, {"qty": 0, "cost": None})
+            m["qty"] += qty
+            if cost is not None:
+                m["cost"] = cost
+        rows = {}
+        for gid in merged:
+            row = self.db.con.execute("SELECT * FROM goods WHERE id=?", (gid,)).fetchone()
+            if not row:
+                errors.append("товар не знайдено — оновіть сторінку")
+                continue
+            if not row["is_weight"] and merged[gid]["qty"] % 1000:
+                errors.append(f"«{row['name']}»: кількість штучного товару — ціле число")
+            rows[gid] = row
+        if errors:
+            raise UserError("; ".join(errors))
+        out_lines, total = [], 0
+        for gid, m in merged.items():
+            row = rows[gid]
+            before = row["count"] if row["count"] is not None else 0
+            good = {"name": row["name"], "code": (row["code"] or "").strip(), "price": row["price"],
+                    "barcode": row["barcode"], "uktzed": row["uktzed"], "is_weight": bool(row["is_weight"]),
+                    "tax_codes": good_tax_codes(row), "stock": before + m["qty"]}
+            if row["group_id"]:
+                good["group_id"] = row["group_id"]
+            self.db.put_pending(good, row)
+            x = self.db.extras().get(good["code"]) or {}
+            cost = m["cost"] if m["cost"] is not None else x.get("cost")
+            if m["cost"] is not None or supplier:
+                self.db.set_extra(good["code"], cost, supplier or x.get("supplier"))
+            line_sum = (cost * m["qty"] + 500) // 1000 if cost is not None else None
+            total += line_sum or 0
+            out_lines.append({"code": good["code"], "name": row["name"], "qty": m["qty"], "is_weight": bool(row["is_weight"]),
+                              "cost": cost, "sum": line_sum, "before": row["count"], "after": good["stock"]})
+        doc_id = self.db.add_stock_doc("IN", supplier, doc_no, out_lines, total)
+        log.info("Поставка №%d%s%s: %d позицій на %.2f ₴ — %s", doc_id, f" від {supplier}" if supplier else "",
+                 f" (док. {doc_no})" if doc_no else "", len(out_lines), total / 100,
+                 "; ".join(f"{ln['code']} +{ln['qty'] / 1000:g}" for ln in out_lines))
+        result = {"doc_id": doc_id, "positions": len(out_lines), "total_cost": total, "sent": False}
+        try:
+            result["pushed"] = self.push_pending()
+            self.db.set_stock_doc(doc_id, "SENT")
+            result["sent"] = True
+        except (CheckboxError, net.RequestException) as e:
+            self.db.set_stock_doc(doc_id, "PENDING", str(e))
+            result["error"] = str(e)
+            log.warning("Поставку №%d проведено в касі, але в Checkbox не відправлено: %s", doc_id, e)
+        if result["sent"]:
+            try:
+                self.sync(groups=False)              # локальна копія — з підтвердженими залишками Checkbox
+            except (CheckboxError, net.RequestException, UserError) as e:
+                log.warning("Після поставки товари не оновлено: %s", e)
+        return result
+
+    def stock_docs(self):
+        return {"docs": self.db.stock_docs()}
 
     # ---- пошук товару за штрихкодом у відкритих базах ----
     def barcode_lookup(self, code):
@@ -1664,6 +1762,8 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.shift, bool(q.get("fresh")))
         elif u.path == "/api/goods/next-code":
             self._run(APP.next_code)
+        elif u.path == "/api/stock-docs":
+            self._run(APP.stock_docs)
         elif u.path == "/api/barcode/lookup":
             self._run(APP.barcode_lookup, (q.get("code") or [""])[0])
         elif u.path == "/api/excise/check":
@@ -1706,6 +1806,8 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.group_move_goods, body)
         elif path == "/api/image/set":
             self._run(image_set, body, locked=False)
+        elif path == "/api/supply/post":
+            self._run(APP.supply_post, body)
         elif path == "/api/image/from-url":
             self._run(APP.image_from_url, body, locked=False)
         elif path == "/api/image/delete":
@@ -1955,6 +2057,12 @@ PAGE = r"""<!DOCTYPE html>
              border: 1px solid rgba(217, 119, 6, .45); background: rgba(245, 158, 11, .12); color: var(--text); }
   .btn.zbtn { padding: 3px 10px; font-size: 12px; line-height: 1.4; margin-left: 8px; vertical-align: middle; white-space: nowrap; }
   td .btn.zbtn { margin-left: 0; }
+  .spscan { width: 100%; margin-top: 12px; font-size: 20px; padding: 12px 14px; letter-spacing: .02em; }
+  .sptable input { width: 110px; text-align: right; padding: 6px 8px; }
+  .sptable .qty { display: inline-flex; align-items: center; gap: 4px; }
+  .sptable .qty button { width: 30px; height: 30px; padding: 0; }
+  .sptable tr.hot td { background: var(--hover); transition: background .6s; }
+  .sptable .after { color: var(--ok, #16a34a); font-weight: 600; }
   .form .margin { grid-column: 1 / -1; font-size: 12px; color: var(--muted); margin-top: -4px; min-height: 16px; }
   .form .margin b { color: var(--text); }
   .form .margin .neg { color: var(--bad); }
@@ -2176,6 +2284,7 @@ PAGE = r"""<!DOCTYPE html>
       <button data-pane="gpGoods"><span class="si">📦</span><span class="st">Товари</span><span class="sc" id="navGoodsN"></span></button>
       <button data-pane="gpGroups"><span class="si">📁</span><span class="st">Групи товарів</span><span class="sc" id="navGroupsN"></span></button>
       <button data-pane="gpTaxes"><span class="si">％</span><span class="st">Податкові ставки</span><span class="sc" id="navTaxesN"></span></button>
+      <button data-pane="gpSupply"><span class="si">📥</span><span class="st">Поставка</span><span class="sc" id="navSupplyN"></span></button>
       <button data-pane="gpExcise"><span class="si">🏷</span><span class="st">Акцизні марки</span><span class="sc" id="navExciseN"></span></button>
     </aside>
     <div class="subpanes">
@@ -2222,6 +2331,34 @@ PAGE = r"""<!DOCTYPE html>
         <thead><tr><th>Код</th><th>Літера</th><th>Назва</th><th class="num">Ставка</th><th class="num">Акциз</th><th>Тип</th><th class="num">Товарів</th></tr></thead>
         <tbody id="taxTable"></tbody>
       </table>
+    </div>
+    <div class="card subpane" id="gpSupply">
+      <div class="row" style="justify-content:space-between">
+        <h3 style="margin:0">📥 Поставка товару</h3>
+        <small class="muted">Скануйте товари підряд; кількість і собівартість можна змінити</small>
+      </div>
+      <div class="form" style="margin-top:12px">
+        <label>Постачальник<input type="text" id="spSupplier" list="spSupplierList" maxlength="120" autocomplete="off"></label>
+        <datalist id="spSupplierList"></datalist>
+        <label>№ накладної (необов'язково)<input type="text" id="spDoc" maxlength="60" autocomplete="off"></label>
+      </div>
+      <input type="text" id="spScan" class="spscan" autocomplete="off" spellcheck="false"
+             placeholder="▦ Скануйте штрихкод (або код / назва і Enter)">
+      <div id="spHint" class="muted" style="min-height:18px;font-size:13px;margin-top:6px"></div>
+      <table class="sptable" style="margin-top:6px">
+        <thead><tr><th>Товар</th><th class="num">Залишок</th><th class="num">Кількість</th><th class="num">Собівартість, ₴</th><th class="num">Сума, ₴</th><th></th></tr></thead>
+        <tbody id="spLines"></tbody>
+      </table>
+      <div class="row" style="justify-content:space-between;margin-top:12px;flex-wrap:wrap;gap:10px">
+        <b id="spTotal"></b>
+        <span class="row" style="gap:8px">
+          <button class="btn sec" id="spClear">Очистити</button>
+          <button class="btn ok" id="spPost">✔ Провести поставку</button>
+        </span>
+      </div>
+      <h4 style="margin:22px 0 6px">Проведені поставки</h4>
+      <table><thead><tr><th>Дата</th><th>Постачальник</th><th>№ накладної</th><th class="num">Позицій</th><th class="num">Сума, ₴</th><th>Checkbox</th></tr></thead>
+        <tbody id="spDocs"></tbody></table>
     </div>
     <div class="card subpane" id="gpExcise">
       <div class="row" style="justify-content:space-between">
@@ -3088,12 +3225,17 @@ function showGoodsPane(id) {
   document.querySelectorAll('#goods .subpane').forEach(p => p.classList.toggle('on', p.id === id));
   document.querySelectorAll('#goodsNav button').forEach(b => b.classList.toggle('on', b.dataset.pane === id));
   if (id === 'gpExcise') loadExcise();
+  if (id === 'gpSupply' && typeof supply !== 'undefined' && supply) { renderSupply(); loadStockDocs(); setTimeout(() => $('#spScan').focus(), 30); }
 }
 function renderGoodsNav() {
   $('#navGoodsN').textContent = goods.length;
   $('#navGroupsN').textContent = groupList.length;
   $('#navTaxesN').textContent = taxes.length;
   if (window.exciseTotal != null) $('#navExciseN').textContent = window.exciseTotal;
+  if (typeof supply !== 'undefined' && supply) {        // поставка оголошена нижче за кодом
+    $('#navSupplyN').textContent = supply.lines.length || '';
+    if (goodsPane === 'gpSupply' && !document.activeElement.closest('#spLines')) renderSupply();
+  }
 }
 function taxDiffText(d) {
   if (!d) return '';
@@ -3467,8 +3609,162 @@ function closeGood() {
   if ($('#goodSave').disabled) return toast('Зачекайте — зберігається в Checkbox', true);
   $('#goodModal').classList.remove('show'); editing = null;
   scanNewBack(null);
+  supplyBack(null);
 }
 $('#goodAddBtn').onclick = () => openGood(null);
+
+// --- поставка: нескінченний сканер, кількість і собівартість редагуються, новий товар — одразу картка ---
+var SUPPLY_KEY = 'kasa_supply_draft';
+var supply = (() => { try { return JSON.parse(localStorage.getItem(SUPPLY_KEY)) || null; } catch (e) { return null; } })()
+  || { supplier: '', doc: '', lines: [] };
+var supplyNew = null;           // штрихкод нового товару, картку якого відкрито зі сканера поставки
+function saveSupply() { try { localStorage.setItem(SUPPLY_KEY, JSON.stringify(supply)); } catch (e) {} }
+const qtyIn = (q, w) => w ? (q / 1000).toFixed(3).replace(/\.?0+$/, '') : String(Math.round(q / 1000));
+function spHint(text, kind) { const el = $('#spHint'); el.textContent = text || ''; el.style.color = kind === 'bad' ? 'var(--bad)' : kind === 'ok' ? 'var(--ok, #16a34a)' : ''; }
+function renderSupply(hotId) {
+  $('#spSupplier').value = supply.supplier || ''; $('#spDoc').value = supply.doc || '';
+  $('#spSupplierList').innerHTML = (window.suppliers || []).map(s => `<option value="${esc(s)}">`).join('');
+  const byId = Object.fromEntries(goods.map(g => [g.id, g]));
+  if (goods.length) supply.lines = supply.lines.filter(l => byId[l.id]);   // товар зник із бази — рядок прибираємо
+  const shown = supply.lines.filter(l => byId[l.id]);
+  let total = 0, units = 0;
+  $('#spLines').innerHTML = shown.map(l => {
+    const i = supply.lines.indexOf(l), g = byId[l.id], w = !!g.is_weight, sum = l.cost != null && l.qty ? Math.round(l.cost * l.qty / 1000) : null;
+    total += sum || 0; units += l.qty || 0;
+    const before = g.count, after = (before || 0) + (l.qty || 0);
+    return `<tr data-i="${i}" class="${l.id === hotId ? 'hot' : ''}">
+      <td>${esc(g.name)}<br><small class="muted">${esc(g.barcode || '')} · код ${esc(g.code.trim())}${g.pending === 'new' ? ' · новий' : ''}</small></td>
+      <td class="num"><small class="muted">${before != null ? qtyStr(before, w) : 'не ведеться'}</small><br><span class="after">→ ${qtyStr(after, w)}</span></td>
+      <td class="num"><span class="qty"><button class="btn sec small" data-a="minus">−</button>
+        <input type="text" data-f="qty" inputmode="decimal" value="${l.qty ? qtyIn(l.qty, w) : ''}" placeholder="${w ? 'кг' : 'шт'}">
+        <button class="btn sec small" data-a="plus">+</button></span></td>
+      <td class="num"><input type="text" data-f="cost" inputmode="decimal" value="${l.cost != null ? (l.cost / 100).toFixed(2) : ''}" placeholder="0.00"></td>
+      <td class="num">${sum != null ? uah(sum) : '<span class="muted">—</span>'}</td>
+      <td><button class="x" data-a="del" title="Прибрати">✕</button></td></tr>`;
+  }).join('') || '<tr><td colspan="6" class="muted">Відскануйте перший товар</td></tr>';
+  $('#spTotal').textContent = supply.lines.length ? `Позицій: ${supply.lines.length} · сума закупівлі: ${uah(total)} ₴` : '';
+  $('#navSupplyN').textContent = supply.lines.length || '';
+  $('#spPost').disabled = !supply.lines.length;
+}
+function supplyAdd(g, opts) {
+  let l = supply.lines.find(x => x.id === g.id);
+  if (l) {
+    if (!g.is_weight) l.qty = (l.qty || 0) + 1000;
+    supply.lines.splice(supply.lines.indexOf(l), 1);
+  } else {
+    l = { id: g.id, qty: g.is_weight ? 0 : 1000, cost: g.cost != null ? g.cost : null };
+  }
+  supply.lines.unshift(l);                                        // останній скан — зверху
+  saveSupply(); renderSupply(g.id); beep(true);
+  if (g.is_weight || (opts && opts.focusQty)) {                    // вага — одразу ввести кількість
+    const inp = $('#spLines tr[data-i="0"] input[data-f="qty"]'); if (inp) { inp.focus(); inp.select(); }
+    spHint(`${g.name}: введіть вагу, кг, і Enter`);
+  } else {
+    spHint(`+1 ${g.name} — разом ${qtyIn(l.qty, false)} шт`, 'ok');
+    $('#spScan').focus();
+  }
+}
+async function supplyScan(raw) {
+  const q = raw.trim(); if (!q) return;
+  const digits = q.replace(/\D/g, '');
+  let g = goods.find(x => (x.barcode || '').trim() === q || x.code.trim() === q);
+  if (!g) { const list = goods.filter(x => match(x, q)); if (list.length === 1) g = list[0];
+    else if (list.length > 1 && !/^\d{8,14}$/.test(q)) { beep(false); return spHint(`Знайдено ${list.length} товари — уточніть або скануйте штрихкод`, 'bad'); } }
+  if (g) return supplyAdd(g);
+  if (!/^\d{8,14}$/.test(digits) || digits !== q) { beep(false); return spHint(`«${q}» не знайдено`, 'bad'); }
+  // такого товару немає — одразу картка нового товару (назва — з відкритих баз, якщо знайдеться)
+  spHint('Нового товару немає в касі — шукаю назву у відкритих базах…');
+  let r = { found: false };
+  try { r = await api('/api/barcode/lookup?code=' + encodeURIComponent(q)); } catch (e) { /* без назви — введуть вручну */ }
+  if (r.exists) { const ex = goods.find(x => x.id === r.exists.id); if (ex) return supplyAdd(ex); }
+  supplyNew = { barcode: q, info: r };
+  openGood(null);
+  $('#gBarcode').value = q;
+  $('#goodTitle').textContent = 'Новий товар у поставці · ' + q;
+  $('#gSupplier').value = $('#spSupplier').value;
+  if (r.found) { $('#gName').value = r.name; goodStatus(`🔎 Назва з ${r.source} — перевірте. Вкажіть ціну продажу, собівартість і податок; після збереження товар додасться в поставку.`, 'ok'); setTimeout(() => $('#gPrice').focus(), 30); }
+  else { goodStatus('Нового товару немає в касі — заповніть картку; після збереження він додасться в поставку.', ''); setTimeout(() => $('#gName').focus(), 30); }
+}
+async function supplyBack(saved) {         // після картки нового товару — назад у поставку
+  if (!supplyNew) return;
+  const cur = supplyNew; supplyNew = null;
+  showGoodsPane('gpSupply');
+  if (!saved) { spHint('Картку не збережено — товар у поставку не додано', 'bad'); return $('#spScan').focus(); }
+  const g = goods.find(x => (x.barcode || '').trim() === cur.barcode);
+  if (!g) { spHint('Товар збережено, але не знайдено за штрихкодом — відскануйте ще раз', 'bad'); return $('#spScan').focus(); }
+  if (cur.info.found && cur.info.image_url) {
+    try { const r = await api('/api/image/from-url', { kind: 'good', key: g.code.trim(), url: cur.info.image_url }); images = r.images || images; } catch (e) {}
+  }
+  supplyAdd(g, { focusQty: true });
+  spHint(`Новий товар «${g.name}» додано в поставку — вкажіть кількість`, 'ok');
+}
+$('#spScan').onkeydown = e => { if (e.key !== 'Enter') return; e.preventDefault(); const v = $('#spScan').value; $('#spScan').value = ''; supplyScan(v); };
+$('#spSupplier').oninput = () => { supply.supplier = $('#spSupplier').value; saveSupply(); };
+$('#spDoc').oninput = () => { supply.doc = $('#spDoc').value; saveSupply(); };
+function spParse(v, w) {
+  const s = String(v || '').replace(',', '.').replace(/\s/g, '');
+  if (!s) return null;
+  if (!/^\d+(\.\d{1,3})?$/.test(s)) return NaN;
+  return Math.round(parseFloat(s) * 1000);
+}
+$('#spLines').addEventListener('change', e => {
+  const tr = e.target.closest('tr[data-i]'); if (!tr) return;
+  const l = supply.lines[+tr.dataset.i], g = goods.find(x => x.id === l.id); if (!g) return;
+  if (e.target.dataset.f === 'qty') {
+    const q = spParse(e.target.value, g.is_weight);
+    if (q == null || isNaN(q) || q <= 0) { toast('Невірна кількість', true); return renderSupply(); }
+    if (!g.is_weight && q % 1000) { toast('Кількість штучного товару — ціле число', true); return renderSupply(); }
+    l.qty = q;
+  }
+  if (e.target.dataset.f === 'cost') {
+    const s = String(e.target.value || '').replace(',', '.').replace(/\s/g, '');
+    if (!s) l.cost = null;
+    else if (!/^\d+(\.\d{1,2})?$/.test(s)) { toast('Невірна собівартість — напр. 18.50', true); return renderSupply(); }
+    else l.cost = Math.round(parseFloat(s) * 100);
+  }
+  saveSupply(); renderSupply();
+});
+$('#spLines').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.target.matches('input')) { e.preventDefault(); e.target.blur(); setTimeout(() => $('#spScan').focus(), 0); }
+});
+$('#spLines').onclick = e => {
+  const b = e.target.closest('[data-a]'); if (!b) return;
+  const tr = b.closest('tr[data-i]'), i = +tr.dataset.i, l = supply.lines[i], g = goods.find(x => x.id === l.id);
+  const step = g && g.is_weight ? 100 : 1000;                       // вага — по 0.1 кг
+  if (b.dataset.a === 'del') supply.lines.splice(i, 1);
+  if (b.dataset.a === 'plus') l.qty = (l.qty || 0) + step;
+  if (b.dataset.a === 'minus') l.qty = Math.max(step, (l.qty || 0) - step);
+  saveSupply(); renderSupply(); $('#spScan').focus();
+};
+$('#spClear').onclick = async () => {
+  if (supply.lines.length && !(await ask('Очистити поточну поставку?', { title: 'Очистити', ok: 'Очистити', danger: true }))) return;
+  supply = { supplier: supply.supplier, doc: '', lines: [] }; saveSupply(); renderSupply(); spHint(''); $('#spScan').focus();
+};
+$('#spPost').onclick = e => busy(e.target, async () => {
+  const bad = supply.lines.find(l => !l.qty);
+  if (bad) { const g = goods.find(x => x.id === bad.id); toast(`Вкажіть кількість: ${g ? g.name : ''}`, true); return; }
+  const n = supply.lines.length;
+  if (!(await ask(`Провести поставку: ${n} позицій? Залишки збільшаться в касі й одразу підуть у Checkbox.`, { title: 'Провести поставку', ok: 'Провести' }))) return;
+  const r = await api('/api/supply/post', { supplier: supply.supplier, doc_no: supply.doc,
+    lines: supply.lines.map(l => ({ id: l.id, qty: l.qty, cost: l.cost })) });
+  supply = { supplier: supply.supplier, doc: '', lines: [] }; saveSupply();
+  toast(r.sent ? `Поставку проведено: ${r.positions} позицій на ${uah(r.total_cost)} ₴ — залишки в Checkbox оновлено`
+               : `Поставку проведено в касі (${r.positions} позицій), але в Checkbox не відправлено: ${r.error}. Каса повторить під час синхронізації.`, !r.sent);
+  await loadGoods(); renderSupply(); loadStockDocs(); $('#spScan').focus();
+});
+async function loadStockDocs() {
+  try {
+    const { docs } = await api('/api/stock-docs');
+    const st = { SENT: '✅ відправлено', PENDING: '⏳ не відправлено', LOCAL: '…' };
+    $('#spDocs').innerHTML = docs.filter(d => d.kind === 'IN').map(d => `<tr title="${esc(d.lines.map(l => `${l.name} +${l.qty / 1000}`).join('\n'))}">
+      <td>${esc(d.created_at.replace('T', ' ').slice(0, 16))}</td><td>${esc(d.supplier || '—')}</td><td>${esc(d.doc_no || '—')}</td>
+      <td class="num">${d.positions}</td><td class="num">${uah(d.total_cost || 0)}</td>
+      <td>${st[d.status] || esc(d.status)}${d.error ? ` <small class="muted" title="${esc(d.error)}">ⓘ</small>` : ''}</td></tr>`).join('')
+      || '<tr><td colspan="6" class="muted">Поставок ще не було</td></tr>';
+  } catch (e) { toast(e.message, true); }
+}
+
+if (goodsPane === 'gpSupply') { renderSupply(); loadStockDocs(); }
 
 // --- сканування нових товарів (штрихкод → відкрита база → картка товару) ---
 const scanNew = { active: false, current: null, log: [] };
@@ -3600,6 +3896,7 @@ $('#goodSave').onclick = async e => {
     await scanNewSaved(body);
     await loadGoods();
     scanNewBack(body);
+    supplyBack(body);
   } catch (err) {
     btn.disabled = false; $('#goodCancel').disabled = false;
     goodStatus('✖ ' + err.message, 'bad');

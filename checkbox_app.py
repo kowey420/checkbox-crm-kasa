@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.7.2.0"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.7.3.0"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -986,6 +986,10 @@ class LocalDB:
         # За кодом товару: переживає синхронізації, що перезаписують таблицю goods.
         self.con.execute("""CREATE TABLE IF NOT EXISTS goods_extra (
             code TEXT PRIMARY KEY, cost INTEGER, supplier TEXT, updated_at TEXT)""")
+        # Документи руху товару: поставка (IN) і списання (OUT), проведені з каси
+        self.con.execute("""CREATE TABLE IF NOT EXISTS stock_docs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, created_at TEXT, supplier TEXT, doc_no TEXT,
+            lines TEXT, positions INTEGER, total_cost INTEGER, status TEXT, error TEXT)""")
         # Відповіді відкритих баз штрихкодів (Open Food Facts тощо): щоб не питати те саме двічі
         self.con.execute("""CREATE TABLE IF NOT EXISTS barcode_cache (
             code TEXT PRIMARY KEY, found INTEGER, data TEXT, at TEXT)""")
@@ -1245,6 +1249,23 @@ class LocalDB:
                  receipt_type, related_id))
             self._excise_apply(receipt_type, receipt, items, datetime.now().isoformat(timespec="milliseconds"), commit=False)
         self.set_receipt_shift(receipt)
+
+    # --- документи поставки / списання ---
+    def add_stock_doc(self, kind, supplier, doc_no, lines, total_cost):
+        with self.con:
+            cur = self.con.execute(
+                "INSERT INTO stock_docs (kind, created_at, supplier, doc_no, lines, positions, total_cost, status) "
+                "VALUES (?,?,?,?,?,?,?,'LOCAL')", (kind, datetime.now().isoformat(timespec="seconds"), supplier, doc_no,
+                                                   json.dumps(lines, ensure_ascii=False), len(lines), total_cost))
+        return cur.lastrowid
+
+    def set_stock_doc(self, doc_id, status, error=None):
+        with self.con:
+            self.con.execute("UPDATE stock_docs SET status=?, error=? WHERE id=?", (status, error, doc_id))
+
+    def stock_docs(self, limit=50):
+        return [dict(r, lines=json.loads(r["lines"] or "[]")) for r in
+                self.con.execute("SELECT * FROM stock_docs ORDER BY id DESC LIMIT ?", (limit,))]
 
     # --- собівартість і постачальник ---
     def extras(self):
