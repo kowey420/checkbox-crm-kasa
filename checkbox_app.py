@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.4.6.14"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.4.6.15"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -474,6 +474,10 @@ class CheckboxAPI:
         self.s.headers["Authorization"] = f"Bearer {data['access_token']}"
         self._save_token(data["access_token"])       # наступні запуски — без повторного входу
 
+    def cash_register_info(self):
+        """Каса за ключем ліцензії (GET /cash-registers/info): фіскальний номер, назва, адреса."""
+        return self._req("GET", "/cash-registers/info") or {}
+
     def me(self):
         """GET /cashier/me — перевіряє токен (401, якщо недійсний) і дає ім'я касира."""
         return self._req("GET", "/cashier/me") or {}
@@ -486,11 +490,21 @@ class CheckboxAPI:
             return None
 
     # --- товари ---
-    def get_all_goods(self, limit=100):
+    GOODS_PAGE = 1000            # товарів за запит; якщо Checkbox не прийме — 100
+
+    def get_all_goods(self, limit=None):
+        limit = limit or self.GOODS_PAGE
         offset, result, use_leftovers = 0, [], None
         while True:
-            data = self._req("GET", "/goods",
-                             params={"limit": limit, "offset": offset})
+            try:
+                data = self._req("GET", "/goods", params={"limit": limit, "offset": offset})
+            except CheckboxError as e:
+                if limit > 100 and str(e).startswith(("HTTP 400", "HTTP 422")):
+                    log.info("Checkbox не прийняв limit=%d для /goods (%s) — завантажую по 100", limit, e)
+                    CheckboxAPI.GOODS_PAGE = limit = 100
+                    offset, result = 0, []
+                    continue
+                raise
             batch = data.get("results", [])
             result.extend(batch)
             use_leftovers = data.get("use_leftovers", use_leftovers)
@@ -693,13 +707,25 @@ class CheckboxAPI:
     def current_shift(self):
         return self._req("GET", "/cashier/shift")  # None, якщо зміни немає
 
+    @staticmethod
+    def _poll_delays():
+        """Паузи між опитуваннями статусу: перша — до першого запиту (мить після створення результату
+        ще немає), далі зростають до 2 с."""
+        yield 0.8
+        yield 0.7
+        while True:
+            yield 1.0
+            yield 1.5
+            while True:
+                yield 2.0
+
     def _wait_shift(self, shift_id, target, timeout=60):
-        start = time.time()
+        start, delays = time.time(), self._poll_delays()
         while time.time() - start < timeout:
+            time.sleep(next(delays))
             shift = self._req("GET", f"/shifts/{shift_id}")
             if shift["status"] == target:
                 return shift
-            time.sleep(1)
         raise CheckboxError(f"Зміна не перейшла в статус {target} за {timeout} с")
 
     def open_shift(self):
@@ -828,14 +854,14 @@ class CheckboxAPI:
                     "Перевірте в кабінеті перед повторною спробою.")
 
     def _wait_receipt(self, receipt_id, timeout=60):
-        start = time.time()
+        start, delays = time.time(), self._poll_delays()
         while time.time() - start < timeout:
+            time.sleep(next(delays))
             r = self._req("GET", f"/receipts/{receipt_id}")
             if r["status"] == "DONE":
                 return r
             if r["status"] == "ERROR":
                 raise CheckboxError(f"Чек {receipt_id} у статусі ERROR")
-            time.sleep(1)
         raise CheckboxError(f"Чек {receipt_id} не фіскалізовано за {timeout} с")
 
     def receipt_text(self, receipt_id):
@@ -1787,11 +1813,18 @@ def print_goods(rows, db=None):
 
 # ───────────────────────── Дії меню ─────────────────────────
 
-def sync_groups(api, db, goods):
-    """Групи товарів: довідник Checkbox, а для груп без назви — group_name товарів чи вивантаження."""
-    groups = api.get_groups({good_group_id(g) for g in goods} - {None})
-    if groups is not None:
-        db.replace_groups(groups)
+def sync_groups(api, db, goods, force=True):
+    """
+    Групи товарів: довідник Checkbox, а для груп без назви — group_name товарів чи вивантаження.
+    force=False (автоматична синхронізація — відкриття/закриття зміни): GET /goods/groups лише якщо
+    товари посилаються на групу, якої ще немає в касі; кнопка «Синхронізувати» оновлює завжди.
+    """
+    want = {good_group_id(g) for g in goods} - {None}
+    known = {r["id"] for r in db.con.execute("SELECT id FROM goods_groups")}
+    if force or (want - known) or not known and want:
+        groups = api.get_groups(want)
+        if groups is not None:
+            db.replace_groups(groups)
     names = {}
     for g in goods:
         grp = g.get("group") if isinstance(g.get("group"), dict) else {}
@@ -1815,7 +1848,7 @@ def sync_groups(api, db, goods):
             log.info("Назви груп з вивантаження недоступні: %s", e)
 
 
-def sync_all(api, db, refresh_taxes=False):
+def sync_all(api, db, refresh_taxes=False, groups=True):
     """
     Синхронізує товари, групи і податкові ставки. Повертає (goods, use_leftovers, taxes, source).
     Ставки організації змінюються рідко, тож GET /tax — лише коли довідник порожній або на вимогу
@@ -1824,7 +1857,7 @@ def sync_all(api, db, refresh_taxes=False):
     """
     goods, use_leftovers = api.get_all_goods()
     db.replace_goods(goods, use_leftovers)
-    sync_groups(api, db, goods)
+    sync_groups(api, db, goods, force=groups)
     known = {t["code"]: dict(t) for t in db.taxes()}
     source = db.meta("taxes_source") or "товари"
     if refresh_taxes or not known:

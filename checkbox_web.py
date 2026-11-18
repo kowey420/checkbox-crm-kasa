@@ -10,6 +10,7 @@
 """
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -205,6 +206,31 @@ class App:
             self._shift["at"] = 0.0          # помилка Checkbox (напр. зміну закрито деінде) — стан зміни перечитаємо
             raise
 
+    # ---- каса (пРРО): фіскальний номер — не змінюється, тож запитуємо раз на ключ ліцензії ----
+    def register_info(self, refresh=False):
+        lic = (self.api.cfg.get("license_key") or "")
+        tag = hashlib.sha256(lic.encode("utf-8")).hexdigest()[:16]
+        try:
+            saved = json.loads(self.db.meta("cash_register") or "null")
+        except ValueError:
+            saved = None
+        if saved and saved.get("tag") == tag and not refresh:
+            return saved
+        if not self.auth_ok and not refresh:
+            return saved if saved and saved.get("tag") == tag else None
+        try:
+            info = self.api.cash_register_info()
+        except (CheckboxError, net.RequestException) as e:
+            log.info("Дані каси (GET /cash-registers/info) недоступні: %s", e)
+            return saved if saved and saved.get("tag") == tag else None
+        data = {"tag": tag, "fiscal_number": info.get("fiscal_number"), "number": info.get("number"),
+                "title": info.get("title"), "address": info.get("address")}
+        with self.db.con:
+            self.db.con.execute("INSERT OR REPLACE INTO meta VALUES ('cash_register', ?)",
+                                (json.dumps(data, ensure_ascii=False),))
+        log.info("Каса: ФН %s%s", data["fiscal_number"], f" ({data['title']})" if data.get("title") else "")
+        return data
+
     # ---- стан зміни: кешуємо, щоб не питати GET /cashier/shift перед кожною дією ----
     SHIFT_TTL = 600                       # с; відкриття/закриття з цієї каси оновлюють кеш одразу
 
@@ -232,6 +258,7 @@ class App:
             "connecting": self.connecting,
             "auth_error": self.auth_error,
             "cashier": self.cashier,
+            "register": self.register_info() if self.auth_ok else None,
             "config_exists": CONFIG_PATH.exists(),
             "terminal": self.terminal_settings(),
             "log_path": str(LOG_PATH),
@@ -304,6 +331,7 @@ class App:
         log.info("Налаштування збережено: авторизація %s, ключ ліцензії …%s", mode, (new.get("license_key") or "")[-4:])
         self.api, self.auth_ok, self.auth_error = api, True, None
         self.cashier = api.cashier_name()
+        self.register_info(refresh=True)
         result = {"saved": True, "cashier": self.cashier}
 
         # Інша каса — інша база товарів: синхронізуємо одразу
@@ -475,14 +503,15 @@ class App:
                                 + "; ".join(f"{c}: {e}" for c, e in list(failed.items())[:3]))
         return len(pending)
 
-    def full_sync(self):
-        """Спершу відправити локальні правки, потім оновити товари з Checkbox (правки, що не пішли, лишаються)."""
+    def full_sync(self, groups=True):
+        """Спершу відправити локальні правки, потім оновити товари з Checkbox (правки, що не пішли, лишаються).
+        groups=False — автоматична синхронізація: групи лише якщо з'явилась невідома."""
         pushed, push_error = 0, None
         try:
             pushed = self.push_pending()
         except (CheckboxError, net.RequestException) as e:
             push_error = str(e)
-        r = self.sync()
+        r = self.sync(groups)
         r.update(pushed=pushed, push_error=push_error, pending=self.db.pending_count())
         return r
 
@@ -532,8 +561,8 @@ class App:
         log.info("Податкові ставки оновлено: %d (%s)", len(taxes), source)
         return {"taxes": len(taxes), "source": source}
 
-    def sync(self):
-        goods, use_leftovers, taxes, source = self.call(sync_all, self.api, self.db)
+    def sync(self, groups=True):
+        goods, use_leftovers, taxes, source = self.call(sync_all, self.api, self.db, False, groups)
         bad = [g["name"] for g in goods if g["code"] != g["code"].strip()]
         return {"count": len(goods), "use_leftovers": use_leftovers, "bad_codes": bad,
                 "taxes": len(taxes), "taxes_source": source, "no_tax": no_tax_goods(self.db)}
@@ -546,7 +575,7 @@ class App:
     def _sync_quietly(self):
         """Синхронізація при відкритті/закритті зміни: помилка не зриває саму операцію зі зміною."""
         try:
-            r = self.full_sync()
+            r = self.full_sync(groups=False)
             return {"pushed": r["pushed"], "push_error": r["push_error"], "pending": r["pending"]}
         except (CheckboxError, net.RequestException, UserError) as e:
             log.warning("Синхронізація при зміні не вдалася: %s", e)
@@ -1590,6 +1619,8 @@ PAGE = r"""<!DOCTYPE html>
   .status.bad { background: var(--bad-bg); color: var(--bad-fg); }
   .status.wait { background: var(--info-bg); color: var(--accent-2); }
   header .who { color: var(--header-muted); font-size: 12px; }
+  header .who.reg { font-family: ui-monospace, Consolas, monospace; letter-spacing: .02em; }
+  header .who.reg:empty { display: none; }
   details.day { border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; }
   details.day > summary { padding: 10px 14px; cursor: pointer; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; list-style-position: inside; }
   details.day[open] > summary { border-bottom: 1px solid var(--line); }
@@ -1772,6 +1803,7 @@ PAGE = r"""<!DOCTYPE html>
 <header>
   <h1>Checkbox облік</h1>
   <span id="shiftBadge" class="badge">Зміна: …</span>
+  <span id="regInfo" class="who reg"></span>
   <span id="cashierName" class="who"></span>
   <span class="spacer"></span>
   <small>Товари оновлено: <span id="synced">—</span></small>
@@ -4488,6 +4520,9 @@ function renderStatus(c) {
   if (c.auth_ok) { st.className = 'status ok'; st.textContent = '✔ Підключено' + (c.cashier ? ` · касир: ${c.cashier}` : ''); }
   else { st.className = 'status bad'; st.textContent = '✖ Не підключено' + (c.auth_error ? `: ${c.auth_error}` : ''); }
   $('#cashierName').textContent = c.auth_ok ? (c.cashier ? 'Касир: ' + c.cashier : '') : '⚠ Каса не підключена';
+  const r = c.auth_ok && c.register;
+  $('#regInfo').textContent = r && r.fiscal_number ? `ФН каси ${r.fiscal_number}` : '';
+  $('#regInfo').title = r ? [r.title, r.address, r.number != null ? `№ ${r.number}` : ''].filter(Boolean).join(' · ') : '';
 }
 async function loadConfig() {
   cfgCache = await api('/api/config');
@@ -4859,6 +4894,7 @@ def _startup_connect(cfg):
                 log.info("Авторизовано (%s)", auth_mode(cfg))
             APP.auth_ok, APP.auth_error = True, None
             APP.cashier = (me or {}).get("full_name")
+            APP.register_info()                  # фіскальний номер каси — лише якщо ще не збережено
         except (CheckboxError, net.RequestException) as e:
             APP.auth_ok, APP.auth_error = False, str(e)
             log.warning("Не вдалося авторизуватися: %s", e)
