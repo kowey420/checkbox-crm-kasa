@@ -1915,7 +1915,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/terminal/save":
             self._run(APP.terminal_save, body)
         elif path == "/api/update/install":
-            self._run(update_install)
+            self._run(update_install, (body or {}).get("target") or "stable")
         elif path == "/api/quit":
             self._send(200, {"ok": True})
             # shutdown() не можна викликати з потоку, що обслуговує запит
@@ -2628,6 +2628,8 @@ PAGE = r"""<!DOCTYPE html>
     <span id="verInfo" class="muted">Версія…</span>
     <span class="row" style="gap:8px;flex-wrap:nowrap">
       <button class="btn small" id="updNowBtn" style="display:none">⬆ Оновити</button>
+      <button class="btn sec small" id="updAlphaBtn" style="display:none">🧪 Alpha</button>
+      <button class="btn sec small" id="updBackBtn" style="display:none">↩ На стабільну</button>
       <button class="btn sec small" id="checkUpdBtn">Перевірити оновлення</button>
     </span>
   </div>
@@ -5707,13 +5709,21 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 function renderUpdate(r) {
   const v = $('#verInfo'), b = $('#updateBanner');
   $('#updNowBtn').style.display = r.available ? '' : 'none';
+  // прихований канал: «"update_channel": "alpha"» у config.json — кнопка лише в налаштуваннях, без банера
+  const a = r.alpha || {}, ab = $('#updAlphaBtn');
+  ab.style.display = r.channel === 'alpha' && a.available ? '' : 'none';
+  if (a.latest) ab.textContent = `🧪 Alpha ${a.latest}`;
+  const back = r.stable_back || {}, bb = $('#updBackBtn');
+  bb.style.display = back.available && !r.available ? '' : 'none';
+  if (back.latest) bb.textContent = `↩ На стабільну ${back.latest}`;
   v.textContent = `Версія каси ${r.current}` + (r.enabled === false ? ' · оновлення не налаштовано'
-    : r.error ? ` · ⚠ ${r.error}` : r.newer ? ` · доступна ${r.latest}` : r.latest ? ' · це остання версія' : '');
+    : r.error ? ` · ⚠ ${r.error}` : r.newer ? ` · доступна ${r.latest}` : r.latest ? ' · це остання версія' : '')
+    + (r.channel === 'alpha' ? (a.error ? ` · alpha: ⚠ ${a.error}` : a.latest && !a.newer ? ` · alpha ${a.latest} — встановлено` : '') : '');
   const link = r.url ? ` · <a href="${esc(r.url)}" target="_blank" rel="noopener">що нового</a>` : '';
   if (r.available) {
     b.innerHTML = `<span>🎉 Доступна нова версія каси <b>${esc(r.latest)}</b> (у вас ${esc(r.current)})${link}</span>
       <button class="btn small" id="updateBtn">Оновити</button>`;
-    b.style.display = ''; $('#updateBtn').onclick = runUpdate;
+    b.style.display = ''; $('#updateBtn').onclick = () => runUpdate();
     $('#updNowBtn').textContent = `⬆ Оновити до ${r.latest}`;
   } else if (r.newer && r.problem) {
     b.innerHTML = `<span>ℹ Доступна версія <b>${esc(r.latest)}</b>: ${esc(r.problem)}${link}</span>`; b.style.display = '';
@@ -5729,12 +5739,17 @@ $('#checkUpdBtn').onclick = e => busy(e.target, async () => {
   if (r && r.error) throw new Error(r.error);
 });
 $('#updNowBtn').onclick = () => runUpdate();
-async function runUpdate() {
+$('#updAlphaBtn').onclick = () => runUpdate('alpha');
+$('#updBackBtn').onclick = () => runUpdate('back');
+async function runUpdate(target) {
+  target = target || 'stable';
+  const ver = target === 'alpha' ? updateInfo.alpha.latest : target === 'back' ? updateInfo.stable_back.latest : updateInfo.latest;
   const warn = cart.length ? 'У кошику є товари — після оновлення кошик буде порожній.\n\n' : '';
-  if (!(await ask(`${warn}Оновити касу до версії ${updateInfo.latest}? Каса перезапуститься — це до хвилини.`, { title: 'Оновлення', ok: 'Оновити', icon: '⬆️' }))) return;
+  const kind = target === 'alpha' ? ' Це тестова версія (alpha).' : target === 'back' ? ' Повернення з тестової на стабільну версію.' : '';
+  if (!(await ask(`${warn}Оновити касу до версії ${ver}?${kind} Каса перезапуститься — це до хвилини.`, { title: 'Оновлення', ok: 'Оновити', icon: target === 'alpha' ? '🧪' : '⬆️' }))) return;
   const ov = $('#updateOverlay'); ov.style.display = 'flex';
-  $('#updateStage').textContent = `Завантажую й встановлюю версію ${updateInfo.latest}…`;
-  try { await api('/api/update/install', {}); }
+  $('#updateStage').textContent = `Завантажую й встановлюю версію ${ver}…`;
+  try { await api('/api/update/install', { target }); }
   catch (e) { ov.style.display = 'none'; toast('Оновлення не вдалося: ' + e.message, true); return; }
   $('#updateStage').textContent = 'Каса перезапускається…';
   // чекаємо, поки стара копія зупиниться, а нова відповість; тоді перезавантажуємо сторінку
@@ -5931,11 +5946,13 @@ def update_check(force=False):
         return {"enabled": True, "current": APP_VERSION, "error": str(e)}
 
 
-def update_install():
+def update_install(target="stable"):
     """Встановити оновлення і перезапустити касу (сторінка дочекається й перезавантажиться)."""
     global RESTART_AFTER_STOP
+    if target not in ("stable", "alpha", "back"):
+        raise UserError("Невідомий канал оновлення")
     try:
-        version = kasa_update.install()
+        version = kasa_update.install(target)
     except kasa_update.UpdateError as e:
         log.warning("Оновлення не вдалося: %s", e)
         raise UserError(str(e))
