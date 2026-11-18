@@ -1434,6 +1434,24 @@ PAGE = r"""<!DOCTYPE html>
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
   .grid { display: grid; grid-template-columns: 1fr 440px; gap: 20px; align-items: start; }
   @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  /* вкладка «Товари»: меню розділів зліва */
+  .sublayout { display: grid; grid-template-columns: 236px minmax(0, 1fr); gap: 20px; align-items: start; }
+  .subnav { position: sticky; top: 12px; display: flex; flex-direction: column; gap: 4px; padding: 8px;
+            border: 1px solid var(--line); border-radius: 12px; background: var(--card); }
+  .subnav button { display: flex; align-items: center; gap: 10px; width: 100%; padding: 10px 12px; border: 0; border-radius: 8px;
+                   background: none; color: var(--text); font: inherit; font-size: 14px; text-align: left; cursor: pointer; }
+  .subnav button:hover { background: var(--hover); }
+  .subnav button.on { background: var(--accent-btn); color: #fff; font-weight: 600; }
+  .subnav .si { width: 20px; text-align: center; font-size: 16px; }
+  .subnav .st { flex: 1; white-space: nowrap; }
+  .subnav .sc { font-size: 12px; color: var(--muted); background: var(--subtle); border-radius: 10px; padding: 1px 8px; min-width: 22px; text-align: center; }
+  .subnav button.on .sc { color: #fff; background: rgba(255,255,255,.22); }
+  .subpane { display: none; } .subpane.on { display: block; }
+  @media (max-width: 900px) {
+    .sublayout { grid-template-columns: 1fr; }
+    .subnav { position: static; flex-direction: row; overflow-x: auto; }
+    .subnav button { width: auto; white-space: nowrap; }
+  }
   input[type=text], input[type=number], input[type=password] { width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; font: inherit; }
   input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
   button.btn { border: 0; border-radius: 8px; padding: 9px 16px; font: inherit; font-weight: 600; cursor: pointer; background: var(--accent-btn); color: #fff; }
@@ -1725,7 +1743,14 @@ PAGE = r"""<!DOCTYPE html>
 
   <!-- ТОВАРИ -->
   <section id="goods" class="tab">
-    <div class="card">
+   <div class="sublayout">
+    <aside class="subnav" id="goodsNav">
+      <button data-pane="gpGoods"><span class="si">📦</span><span class="st">Товари</span><span class="sc" id="navGoodsN"></span></button>
+      <button data-pane="gpGroups"><span class="si">📁</span><span class="st">Групи товарів</span><span class="sc" id="navGroupsN"></span></button>
+      <button data-pane="gpTaxes"><span class="si">％</span><span class="st">Податкові ставки</span><span class="sc" id="navTaxesN"></span></button>
+    </aside>
+    <div class="subpanes">
+    <div class="card subpane" id="gpGoods">
       <div class="stats">
         <div><span class="muted">Товарів</span><b id="stCount">0</b></div>
         <div><span class="muted">Нульовий залишок</span><b id="stZero">0</b></div>
@@ -1746,7 +1771,7 @@ PAGE = r"""<!DOCTYPE html>
         <tbody id="goodsTable"></tbody>
       </table>
     </div>
-    <div class="card" style="margin-top:20px">
+    <div class="card subpane" id="gpGroups">
       <div class="row" style="justify-content:space-between">
         <h3 style="margin:0">Групи товарів</h3>
         <button class="btn" id="grpAdd">+ Група</button>
@@ -1754,7 +1779,7 @@ PAGE = r"""<!DOCTYPE html>
       <p class="muted" style="font-size:12px;margin:6px 0 0">Групи й підгрупи — як у Checkbox. Зміни груп ідуть у Checkbox одразу. Клік по ▸ / ▾ — згорнути чи розгорнути.</p>
       <div class="gtree" id="grpTree"></div>
     </div>
-    <div class="card" style="margin-top:20px">
+    <div class="card subpane" id="gpTaxes">
       <div class="row" style="justify-content:space-between">
         <h3 style="margin:0">Податкові ставки організації</h3>
         <small class="muted">Джерело: <span id="taxSource">—</span></small>
@@ -1764,6 +1789,8 @@ PAGE = r"""<!DOCTYPE html>
         <tbody id="taxTable"></tbody>
       </table>
     </div>
+    </div>
+   </div>
   </section>
 
   <!-- ЗМІНА -->
@@ -2377,7 +2404,7 @@ async function loadGoods() {
   renderPending(d.pending);
   renderTaxes(d.taxes_source);
   $('#synced').textContent = d.synced_at ? d.synced_at.replace('T', ' ') : '—';
-  renderSearch(); renderGoodsTable(); renderCart(); renderGroupTree();
+  renderSearch(); renderGoodsTable(); renderCart(); renderGroupTree(); renderGoodsNav();
 }
 const match = (g, q) => {
   q = q.trim().toLowerCase();
@@ -2526,6 +2553,23 @@ function renderGoodsTable() {
 $('#goodsGroup').onchange = renderGoodsTable;
 $('#search').oninput = renderSearch;
 $('#goodsFilter').oninput = renderGoodsTable;
+
+// --- вкладка «Товари»: меню розділів ---
+let goodsPane = (() => { try { return localStorage.getItem('kasa_goods_pane') || 'gpGoods'; } catch (e) { return 'gpGoods'; } })();
+function showGoodsPane(id) {
+  if (!document.getElementById(id)) id = 'gpGoods';
+  goodsPane = id;
+  try { localStorage.setItem('kasa_goods_pane', id); } catch (e) {}
+  document.querySelectorAll('#goods .subpane').forEach(p => p.classList.toggle('on', p.id === id));
+  document.querySelectorAll('#goodsNav button').forEach(b => b.classList.toggle('on', b.dataset.pane === id));
+}
+function renderGoodsNav() {
+  $('#navGoodsN').textContent = goods.length;
+  $('#navGroupsN').textContent = groupList.length;
+  $('#navTaxesN').textContent = taxes.length;
+}
+$('#goodsNav').onclick = e => { const b = e.target.closest('button[data-pane]'); if (b) showGoodsPane(b.dataset.pane); };
+showGoodsPane(goodsPane);
 
 // --- плитки: групи — папки, товари — картки ---
 const ICON_FOLDER = '<svg class="ico" viewBox="0 0 48 48" aria-hidden="true"><path d="M5 13a4 4 0 0 1 4-4h10l4 5h16a4 4 0 0 1 4 4v19a4 4 0 0 1-4 4H9a4 4 0 0 1-4-4z" fill="#f5b740"/><path d="M5 19h38v18a4 4 0 0 1-4 4H9a4 4 0 0 1-4-4z" fill="#fcd36b"/></svg>';
