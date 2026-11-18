@@ -9,6 +9,7 @@
 Залежності: лише стандартна бібліотека Python 3.9+.
 """
 
+import base64
 import json
 import os
 import re
@@ -481,6 +482,7 @@ class App:
             "synced_at": self.db.meta("synced_at"),
             "cash_rounding": self.rounding_mode(),
             "pending": self.db.pending_count(),
+            "images": images_index(),
         }
 
     def rounding_mode(self):
@@ -1104,6 +1106,87 @@ class App:
 
 APP: App = None
 
+# --- власні зображення плиток (лише локально, у папці даних) ---
+IMG_DIR = DATA_DIR / "images"
+IMG_KINDS = ("good", "group")          # товар — за кодом, група — за id з Checkbox
+IMG_TYPES = {"png": b"\x89PNG", "jpeg": b"\xff\xd8\xff", "webp": b"RIFF", "gif": b"GIF8"}
+IMG_MAX = 3 * 1024 * 1024
+
+
+def _img_stem(kind, key):
+    return f"{kind}_{key.encode('utf-8').hex()}"
+
+
+def _img_check(kind, key):
+    key = str(key or "").strip()
+    if kind not in IMG_KINDS or not key or len(key) > 200:
+        raise UserError("Невірний об'єкт для зображення")
+    return key
+
+
+def images_index():
+    """{"good:<код>": версія, "group:<id>": версія} — щоб сторінка знала, де показати власну картинку."""
+    out = {}
+    if IMG_DIR.is_dir():
+        for f in IMG_DIR.iterdir():
+            kind, _, rest = f.stem.partition("_")
+            if kind in IMG_KINDS and f.suffix[1:] in IMG_TYPES:
+                try:
+                    out[f"{kind}:{bytes.fromhex(rest).decode('utf-8')}"] = int(f.stat().st_mtime * 1000)
+                except (ValueError, OSError):
+                    continue
+    return out
+
+
+def _img_files(kind, key):
+    stem = _img_stem(kind, key)
+    return [IMG_DIR / f"{stem}.{ext}" for ext in IMG_TYPES]
+
+
+def image_set(body):
+    kind = (body or {}).get("kind")
+    key = _img_check(kind, body.get("key"))
+    m = re.match(r"^data:image/(png|jpeg|webp|gif);base64,(.+)$", str(body.get("data") or ""), re.S)
+    if not m:
+        raise UserError("Потрібне зображення PNG, JPEG, WebP або GIF")
+    try:
+        raw = base64.b64decode(m.group(2), validate=False)
+    except ValueError:
+        raise UserError("Пошкоджене зображення")
+    ext = m.group(1)
+    if not raw.startswith(IMG_TYPES[ext]) or len(raw) > IMG_MAX:
+        raise UserError("Пошкоджене або завелике зображення (до 3 МБ)")
+    IMG_DIR.mkdir(parents=True, exist_ok=True)
+    for f in _img_files(kind, key):
+        f.unlink(missing_ok=True)
+    target = IMG_DIR / f"{_img_stem(kind, key)}.{ext}"
+    tmp = target.with_suffix(".tmp")
+    tmp.write_bytes(raw)
+    tmp.replace(target)
+    log.info("Зображення плитки %s %s: %d байт", kind, key, len(raw))
+    return {"ok": True, "images": images_index()}
+
+
+def image_delete(body):
+    kind = (body or {}).get("kind")
+    key = _img_check(kind, body.get("key"))
+    for f in _img_files(kind, key):
+        f.unlink(missing_ok=True)
+    log.info("Зображення плитки %s %s прибрано", kind, key)
+    return {"ok": True, "images": images_index()}
+
+
+def image_file(k):
+    kind, _, key = str(k or "").partition(":")
+    try:
+        key = _img_check(kind, key)
+    except UserError:
+        return None, None
+    for f in _img_files(kind, key):
+        if f.is_file():
+            return f.read_bytes(), "image/" + f.suffix[1:]
+    return None, None
+
 
 def termlog(body):
     """
@@ -1124,12 +1207,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # тиша в консолі
 
-    def _send(self, code, data, ctype="application/json; charset=utf-8"):
+    def _send(self, code, data, ctype="application/json; charset=utf-8", cache="no-store"):
         body = data if isinstance(data, bytes) else json.dumps(data, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")  # завжди свіжа версія сторінки після оновлень
+        self.send_header("Cache-Control", cache)  # no-store: завжди свіжа версія сторінки після оновлень
         self.end_headers()
         self.wfile.write(body)
 
@@ -1183,6 +1266,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, PAGE.encode(), "text/html; charset=utf-8")
         elif u.path in routes:
             self._run(routes[u.path])
+        elif u.path == "/img":      # власне зображення плитки; ?v= змінюється при заміні — можна кешувати
+            data, ctype = image_file((q.get("k") or [""])[0])
+            if data is None:
+                self._send(404, {"error": "not found"})
+            else:
+                self._send(200, data, ctype, "private, max-age=31536000, immutable")
         elif u.path == "/api/receipt_text":
             self._run(APP.receipt_text, (q.get("id") or [""])[0])
         elif u.path == "/api/receipt_png":
@@ -1225,6 +1314,10 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.group_delete, body)
         elif path == "/api/groups/move-goods":
             self._run(APP.group_move_goods, body)
+        elif path == "/api/image/set":
+            self._run(image_set, body, locked=False)
+        elif path == "/api/image/delete":
+            self._run(image_delete, body, locked=False)
         elif path == "/api/termlog":
             self._run(termlog, body, locked=False)
         elif path == "/api/prepay":
@@ -1503,6 +1596,19 @@ PAGE = r"""<!DOCTYPE html>
   .tile .dot.err { background: var(--bad); }
   .tile .incart { position: absolute; top: 6px; left: 6px; min-width: 22px; height: 22px; padding: 0 6px; border-radius: 11px; background: var(--ok-btn); color: #fff; font-size: 12px; font-weight: 700; line-height: 22px; }
   .tile.off { opacity: .55; }
+  .tile .pic { width: 72px; height: 72px; object-fit: contain; border-radius: 8px; margin: -6px 0 -2px; }
+  .tile .fbadge { position: absolute; top: 6px; left: 6px; }
+  .tile .fbadge .ico { width: 22px; height: 22px; }
+  .tile.drop { border-color: var(--accent); border-style: dashed; background: var(--hover); }
+  .ctxmenu { position: fixed; z-index: 1000; min-width: 220px; padding: 5px; border: 1px solid var(--line); border-radius: 10px;
+             background: var(--card); box-shadow: 0 10px 30px rgba(0,0,0,.22); display: none; }
+  .ctxmenu.show { display: block; }
+  .ctxmenu .ch { font-size: 12px; color: var(--muted); padding: 5px 10px 6px; border-bottom: 1px solid var(--line); margin-bottom: 4px;
+                 max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ctxmenu button { display: block; width: 100%; text-align: left; border: 0; background: none; color: var(--text); font: inherit; font-size: 14px;
+                    padding: 7px 10px; border-radius: 6px; cursor: pointer; }
+  .ctxmenu button:hover, .ctxmenu button:focus { background: var(--hover); outline: none; }
+  .ctxmenu button.danger { color: var(--bad); }
   .tilesbox { max-height: 62vh; overflow: auto; padding: 2px; }
   .ghead.sub { text-transform: none; letter-spacing: 0; font-size: 13px; border-bottom-style: dashed; margin-top: 6px; }
   .grow-sub td { font-weight: 600 !important; }
@@ -2043,6 +2149,8 @@ PAGE = r"""<!DOCTYPE html>
     <button class="btn danger" id="clsOut">Винести й закрити</button>
   </div>
 </div></div>
+<div class="ctxmenu" id="ctxMenu" role="menu"></div>
+<input type="file" id="imgFile" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" style="display:none">
 <div class="modal" id="grpModal"><div class="card">
   <div class="row" style="justify-content:space-between">
     <h3 style="margin:0" id="grpTitle">Група</h3>
@@ -2108,6 +2216,7 @@ PAGE = r"""<!DOCTYPE html>
 
 <script>
 const $ = s => document.querySelector(s);
+let images = {};        // власні картинки плиток: {"good:<код>"|"group:<id>": версія}
 let goods = [], cart = [], useLeftovers = false, roundingMode = null, cartTotal = 0, taxes = [];
 let cartDisc = null;
 // групи товарів: groupList — [{id, name, parent_id, path}], posGroup — обрана група в касі (null — усі)
@@ -2260,7 +2369,7 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
 // --- товари ---
 async function loadGoods() {
   const d = await api('/api/goods');
-  goods = d.goods; useLeftovers = !!d.use_leftovers; roundingMode = d.cash_rounding; taxes = d.taxes || [];
+  goods = d.goods; images = d.images || {}; useLeftovers = !!d.use_leftovers; roundingMode = d.cash_rounding; taxes = d.taxes || [];
   setGroups(d.groups || []);
   renderPending(d.pending);
   renderTaxes(d.taxes_source);
@@ -2446,7 +2555,7 @@ function tilesHtml(cur, q, opts) {
   const tileGood = g => {
     const inCart = opts.cartQty ? opts.cartQty(g) : 0, dot = g.pending ? `<span class="dot${g.pending_error ? ' err' : ''}" title="${g.pending_error ? 'Не відправлено в Checkbox' : 'Змінено локально'}"></span>` : '';
     return `<div class="tile${g.count === 0 && useLeftovers ? ' off' : ''}" data-good="${esc(g.id)}" title="${esc(g.name)}\n${esc(g.barcode || g.code)}">
-      ${inCart ? `<span class="incart">${esc(inCart)}</span>` : ''}${dot}${goodIcon(g)}
+      ${inCart ? `<span class="incart">${esc(inCart)}</span>` : ''}${dot}${picHtml('good', g.code) || goodIcon(g)}
       <span class="tn">${esc(g.name)}</span>
       ${searching && g.group_path && g.group_path.length ? `<span class="tg">📁 ${esc(g.group_path.join(' / '))}</span>` : ''}
       <span class="tp">${uah(g.price)} ₴</span><span class="ts ${g.count === 0 ? 'zero' : ''}">${g.count != null ? qtyStr(g.count, g.is_weight) : (g.is_weight ? 'кг' : 'шт')}</span></div>`;
@@ -2461,7 +2570,7 @@ function tilesHtml(cur, q, opts) {
     html += (groupChildren[cur || ''] || []).slice().sort(byName).map(c => {
       const st = folderStats(c.id);
       if (!st.n && !opts.showEmpty) return '';
-      return `<div class="tile folder" data-fold="${esc(c.id)}" title="${esc(c.path.join(' / '))}">${ICON_FOLDER}
+      return `<div class="tile folder" data-fold="${esc(c.id)}" title="${esc(c.path.join(' / '))}">${picHtml('group', c.id) ? '<span class="fbadge">' + ICON_FOLDER + '</span>' + picHtml('group', c.id) : ICON_FOLDER}
         <span class="tn">${esc(c.path[c.path.length - 1])}</span>
         <span class="ts">${plural(st.n, 'товар', 'товари', 'товарів')}${st.subs ? ' · ' + plural(st.subs, 'підгрупа', 'підгрупи', 'підгруп') : ''}</span></div>`;
     }).join('');
@@ -2485,6 +2594,112 @@ $('#gdTiles').onclick = e => {
   const f = e.target.closest('[data-fold]'); if (f) { gdFolder = f.dataset.fold || null; return renderGoodsTable(); }
   const t = e.target.closest('[data-good]'); if (t) openGood(goods.find(g => g.id === t.dataset.good));
 };
+
+// --- власні зображення плиток: ПКМ по плитці або перетягнути файл на неї ---
+const imgKey = (kind, key) => kind + ':' + String(key == null ? '' : key).trim();
+function picHtml(kind, key) {
+  const k = imgKey(kind, key), v = images[k];
+  return v ? `<img class="pic" src="/img?k=${encodeURIComponent(k)}&v=${v}" alt="" loading="lazy" draggable="false">` : '';
+}
+function tileTarget(el) {     // плитка → {kind, key, name, good?}
+  const t = el && el.closest('.tile');
+  if (!t || t.classList.contains('up')) return null;
+  if (t.dataset.good) {
+    const g = goods.find(x => x.id === t.dataset.good);
+    return g && String(g.code || '').trim() ? { kind: 'good', key: String(g.code).trim(), name: g.name, good: g } : null;
+  }
+  if (t.dataset.fold && groupById[t.dataset.fold]) {
+    const gr = groupById[t.dataset.fold];
+    return { kind: 'group', key: gr.id, name: gr.path[gr.path.length - 1], group: gr };
+  }
+  return null;
+}
+// Зменшуємо до 256 px по більшій стороні й кладемо у WebP (або PNG, якщо браузер не вміє) — кілька десятків КБ
+function shrinkImage(file) {
+  return new Promise((resolve, reject) => {
+    if (!file || !/^image\//.test(file.type)) return reject(new Error('Це не зображення'));
+    const url = URL.createObjectURL(file), img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const max = 256, k = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, Math.round(img.naturalWidth * k)); c.height = Math.max(1, Math.round(img.naturalHeight * k));
+      const cx = c.getContext('2d'); cx.imageSmoothingQuality = 'high'; cx.drawImage(img, 0, 0, c.width, c.height);
+      let data = c.toDataURL('image/webp', 0.88);
+      if (!data.startsWith('data:image/webp')) data = c.toDataURL('image/png');
+      resolve(data);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Не вдалося прочитати зображення')); };
+    img.src = url;
+  });
+}
+function rerenderTiles() { renderSearch(); renderGoodsTable(); }
+async function setTileImage(t, file) {
+  try {
+    const data = await shrinkImage(file);
+    const r = await api('/api/image/set', { kind: t.kind, key: t.key, data });
+    images = r.images || images; rerenderTiles(); toast('Зображення встановлено: ' + t.name);
+  } catch (e) { toast(e.message, true); }
+}
+async function clearTileImage(t) {
+  try { const r = await api('/api/image/delete', { kind: t.kind, key: t.key }); images = r.images || {}; rerenderTiles(); toast('Повернуто стандартний значок'); }
+  catch (e) { toast(e.message, true); }
+}
+let ctxTarget = null;
+function closeCtx() { $('#ctxMenu').classList.remove('show'); }
+function openCtx(e, t, where) {
+  e.preventDefault();
+  ctxTarget = t;
+  const has = !!images[imgKey(t.kind, t.key)], m = $('#ctxMenu');
+  m.innerHTML = `<div class="ch">${t.kind === 'group' ? '📁' : '📦'} ${esc(t.name)}</div>
+    <button data-a="img">🖼 ${has ? 'Змінити зображення…' : 'Встановити зображення…'}</button>
+    ${has ? '<button data-a="clr" class="danger">✕ Прибрати зображення</button>' : ''}
+    ${t.kind === 'good' && where === 'pos' ? '<button data-a="add">➕ Додати в кошик</button>' : ''}
+    ${t.kind === 'good' ? '<button data-a="edit">✏ Редагувати товар</button>' : '<button data-a="grp">✏ Редагувати групу</button>'}`;
+  m.classList.add('show');
+  const w = m.offsetWidth, h = m.offsetHeight;
+  m.style.left = Math.min(e.clientX, innerWidth - w - 6) + 'px';
+  m.style.top = Math.min(e.clientY, innerHeight - h - 6) + 'px';
+  m.querySelector('button').focus();
+}
+$('#ctxMenu').onclick = e => {
+  const b = e.target.closest('button'); if (!b || !ctxTarget) return;
+  const t = ctxTarget; closeCtx();
+  if (b.dataset.a === 'img') { $('#imgFile').value = ''; $('#imgFile').click(); return; }
+  if (b.dataset.a === 'clr') return clearTileImage(t);
+  if (b.dataset.a === 'add') { addToCart(t.good.id); return renderSearch(); }
+  if (b.dataset.a === 'edit') return openGood(t.good);
+  if (b.dataset.a === 'grp') return openGroup(t.key);
+};
+$('#ctxMenu').onkeydown = e => {
+  const bs = [...$('#ctxMenu').querySelectorAll('button')], i = bs.indexOf(document.activeElement);
+  if (e.key === 'Escape') { closeCtx(); e.preventDefault(); }
+  else if (e.key === 'ArrowDown') { bs[(i + 1) % bs.length].focus(); e.preventDefault(); }
+  else if (e.key === 'ArrowUp') { bs[(i - 1 + bs.length) % bs.length].focus(); e.preventDefault(); }
+};
+document.addEventListener('mousedown', e => { if (!e.target.closest('#ctxMenu')) closeCtx(); });
+window.addEventListener('blur', closeCtx);
+window.addEventListener('resize', closeCtx);
+document.addEventListener('scroll', closeCtx, true);
+$('#imgFile').onchange = () => { const f = $('#imgFile').files[0]; if (f && ctxTarget) setTileImage(ctxTarget, f); };
+[['#posTilesGrid', 'pos'], ['#gdTiles', 'goods']].forEach(([sel, where]) => {
+  const box = $(sel);
+  box.addEventListener('contextmenu', e => { const t = tileTarget(e.target); if (t) openCtx(e, t, where); });
+  box.addEventListener('dragover', e => {
+    if (!e.dataTransfer || ![...e.dataTransfer.types].includes('Files')) return;
+    const tile = e.target.closest('.tile'); if (!tileTarget(tile)) return;
+    e.preventDefault(); box.querySelectorAll('.tile.drop').forEach(x => x !== tile && x.classList.remove('drop')); tile.classList.add('drop');
+  });
+  box.addEventListener('dragleave', e => { const tile = e.target.closest('.tile'); if (tile && !tile.contains(e.relatedTarget)) tile.classList.remove('drop'); });
+  box.addEventListener('drop', e => {
+    const tile = e.target.closest('.tile'), t = tileTarget(tile); if (!t) return;
+    e.preventDefault(); tile.classList.remove('drop');
+    const f = e.dataTransfer.files[0]; if (f) setTileImage(t, f);
+  });
+});
+// файл, кинутий повз плитку, не має відкриватися замість каси
+window.addEventListener('dragover', e => e.preventDefault());
+window.addEventListener('drop', e => e.preventDefault());
 
 // --- дерево груп і їх редагування (одразу в Checkbox) ---
 function subtreeCount(id) { return goods.filter(g => inGroup(g, id)).length; }
