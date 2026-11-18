@@ -11,6 +11,7 @@
 Перед заміною .py-файлів робиться резервна копія в DATA_DIR/backup/.
 """
 
+import base64
 import hashlib
 import io
 import os
@@ -227,14 +228,51 @@ def _ps_quote(s):
     return "'" + str(s).replace("'", "''") + "'"
 
 
+def _ps_encoded(script):
+    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+
+
+def _powershell():
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    ps = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    return ps if os.path.isfile(ps) else "powershell.exe"
+
+
+def _spawn_via_wmi(pids, relaunch):
+    """
+    Запустити помічника, який НЕ є дочірнім процесом каси: його створює служба WMI Windows.
+    Будь-який живий дочірній процес у момент виходу (нова Kasa.exe, PowerShell…) заважав
+    завантажувачу onefile видалити папку _MEI… — «Failed to remove temporary directory».
+    Короткий PowerShell лише передає завдання WMI й завершується ще до виходу каси.
+    Помічник чекає, поки стара копія і її завантажувач завершаться, і запускає нову Kasa.exe
+    з чистим середовищем (без жодних змінних PyInstaller).
+    """
+    envs = {"CHECKBOX_NO_BROWSER": "1", "CHECKBOX_RESTARTED": "1", "CHECKBOX_CLEAN_SPAWN": "1"}
+    if relaunch:
+        envs["CHECKBOX_RELAUNCHED"] = "1"
+    inner = (f"Wait-Process -Id {','.join(map(str, pids))} -Timeout 120 -ErrorAction SilentlyContinue; "
+             "Start-Sleep -Milliseconds 500; "
+             + "".join(f"$env:{k}={_ps_quote(v)}; " for k, v in envs.items())
+             + f"Start-Process -FilePath {_ps_quote(sys.executable)} -WorkingDirectory {_ps_quote(APP_DIR)}")
+    cmd = f'"{_powershell()}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {_ps_encoded(inner)}'
+    outer = ("$si = ([wmiclass]'root\\cimv2:Win32_ProcessStartup').CreateInstance(); $si.ShowWindow = 0; "
+             f"$r = ([wmiclass]'root\\cimv2:Win32_Process').Create({_ps_quote(cmd)}, {_ps_quote(APP_DIR)}, $si); "
+             "Write-Output ('wmi:' + $r.ReturnValue + ':' + $r.ProcessId)")
+    r = subprocess.run([_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                        "-EncodedCommand", _ps_encoded(outer)],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       timeout=30, creationflags=0x08000000)          # CREATE_NO_WINDOW; чекаємо завершення
+    out = (r.stdout or b"").decode("utf-8", "replace") + (r.stderr or b"").decode("utf-8", "replace")
+    m = re.search(r"wmi:(\d+):(\d*)", out)
+    if not m or m.group(1) != "0":
+        raise OSError(f"WMI не запустив помічника: {out.strip()[:300] or r.returncode}")
+    return m.group(2)
+
+
 def spawn_restarted(relaunch=False):
     """
     Запустити нову копію каси (після того, як стара звільнила порт).
-
-    Kasa.exe на Windows: нову копію запускає не сама каса, а окремий прихований PowerShell, який
-    спершу чекає, поки стара копія (і її завантажувач) повністю завершиться й прибере свою
-    тимчасову папку _MEI…. Тоді нова не може ні зачепити, ні заблокувати старі файли — і вікна
-    «Failed to remove temporary directory» немає. Немає PowerShell — запускаємо напряму, як раніше.
+    Kasa.exe на Windows — через помічника від WMI (див. _spawn_via_wmi); не вдалося — напряму, як раніше.
     """
     env = _clean_env()
     if relaunch:
@@ -253,22 +291,13 @@ def spawn_restarted(relaunch=False):
                 pids.append(ppid)
         except (AttributeError, OSError):
             pass
-        exe = sys.executable
-        script = (f"Wait-Process -Id {','.join(map(str, pids))} -Timeout 40 -ErrorAction SilentlyContinue; "
-                  "Start-Sleep -Milliseconds 300; "
-                  f"Start-Process -FilePath {_ps_quote(exe)} -WorkingDirectory {_ps_quote(APP_DIR)}")
-        root = os.environ.get("SystemRoot", r"C:\Windows")
-        ps = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
         try:
-            subprocess.Popen([ps if os.path.isfile(ps) else "powershell.exe", "-NoProfile", "-NonInteractive",
-                              "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", script],
-                             env=env, cwd=str(APP_DIR), close_fds=True,
-                             creationflags=0x08000000 | 0x00000200)     # CREATE_NO_WINDOW | NEW_PROCESS_GROUP
-            log.info("Каса перезапускається після оновлення (нова копія стартує після виходу цієї; чекаю PID %s)",
-                     ", ".join(map(str, pids)))
+            hp = _spawn_via_wmi(pids, relaunch)
+            log.info("Каса перезапускається після оновлення: помічник PID %s (від WMI) запустить нову копію "
+                     "після виходу PID %s", hp, ", ".join(map(str, pids)))
             return
-        except OSError as e:
-            log.warning("PowerShell недоступний (%s) — запускаю нову копію напряму", e)
+        except (OSError, subprocess.SubprocessError) as e:
+            log.warning("Перезапуск через WMI не вдався (%s) — запускаю нову копію напряму", e)
     kw = {"env": env, "cwd": str(APP_DIR), "close_fds": True}
     if os.name == "nt":
         flags = 0x00000200                                  # CREATE_NEW_PROCESS_GROUP
