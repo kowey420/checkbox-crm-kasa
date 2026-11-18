@@ -210,14 +210,52 @@ def _latest_via_web():
             raise UpdateError(f"GitHub: HTTP {e.code}")
     except (OSError, http.client.HTTPException) as e:
         raise UpdateError(f"Немає зв'язку з GitHub: {getattr(e, 'reason', e)}")
-    tag = urllib.parse.unquote(location.rsplit("/releases/tag/", 1)[1].split("?")[0].strip("/"))
+    return _release_from_tag(urllib.parse.unquote(location.rsplit("/releases/tag/", 1)[1].split("?")[0].strip("/")))
+
+
+_cache = {"time": 0, "data": None}
+
+
+def channel():
+    """Прихований канал оновлень: «"update_channel": "alpha"» у config.json (у налаштуваннях його немає)."""
+    try:
+        from checkbox_app import load_config
+        return "alpha" if str(load_config().get("update_channel") or "").strip().lower() == "alpha" else "stable"
+    except Exception:
+        return "stable"
+
+
+def _release_from_tag(tag):
+    tag = str(tag)
     base = f"{WEB}/{repo()}/releases/download/{urllib.parse.quote(tag)}"
     return {"tag_name": tag, "html_url": f"{WEB}/{repo()}/releases/tag/{urllib.parse.quote(tag)}", "body": "",
             "assets": [{"name": n, "browser_download_url": f"{base}/{n}"} for n in (EXE_ASSET, PY_ASSET, SUMS_ASSET)],
             "_via": "web"}
 
 
-_cache = {"time": 0, "data": None}
+def _newest_any():
+    """Найновіший випуск разом із тестовими (prerelease). Без ліміту API — через стрічку releases.atom."""
+    try:
+        rels = _get(f"{API}/repos/{repo()}/releases?per_page=20")
+        rels = [r for r in rels if not r.get("draft") and r.get("tag_name")]
+        return max(rels, key=lambda r: parse_version(r["tag_name"])) if rels else None
+    except RateLimited:
+        log.info("API GitHub обмежив запити — тестові випуски шукаю через releases.atom")
+    try:
+        req = urllib.request.Request(f"{WEB}/{repo()}/releases.atom", headers={"User-Agent": f"checkbox-kasa/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=20, context=net.ssl_context()) as r:
+            feed = r.read().decode("utf-8", "replace")
+    except (OSError, http.client.HTTPException) as e:
+        raise UpdateError(f"Немає зв'язку з GitHub: {getattr(e, 'reason', e)}")
+    tags = {urllib.parse.unquote(t) for t in re.findall(r"/releases/tag/([^\"<>?#]+)", feed)}
+    return _release_from_tag(max(tags, key=parse_version)) if tags else None
+
+
+def _info(rel, kind):
+    latest = str(rel.get("tag_name") or "").lstrip("vV")
+    assets = {a["name"]: a["browser_download_url"] for a in rel.get("assets") or []}
+    need = EXE_ASSET if kind == "exe" else PY_ASSET
+    return latest, assets, bool(kind and need in assets and SUMS_ASSET in assets and not install_problem())
 
 
 def check(force=False):
@@ -250,14 +288,31 @@ def check(force=False):
         data["problem"] = "Цю збірку оновлюють вручну — завантажте нову версію зі сторінки випуску"
     elif newer and (need not in assets or SUMS_ASSET not in assets):
         data["problem"] = f"У випуску {latest} ще немає файлу {need} — можливо, збирання ще триває"
+    if parse_version(APP_VERSION)[4] == 0 and latest and not newer and parse_version(latest) != parse_version(APP_VERSION):
+        # стоїть тестова (alpha), а остання стабільна — старша за номером: можна повернутися на прод
+        _, _, ok = _info(rel, kind)
+        data["stable_back"] = {"latest": latest, "available": ok, "url": rel.get("html_url"), "_assets": assets}
+    if channel() == "alpha":
+        data["channel"] = "alpha"
+        try:
+            pre = _newest_any()
+        except UpdateError as e:
+            data["alpha"] = {"error": str(e)}
+            pre = None
+        if pre:
+            a_latest, a_assets, ok = _info(pre, kind)
+            a_newer = parse_version(a_latest) > parse_version(APP_VERSION)
+            data["alpha"] = {"latest": a_latest, "newer": a_newer, "available": bool(a_newer and ok),
+                             "url": pre.get("html_url"), "_assets": a_assets}
     _cache.update(time=time.time(), data=data)
-    log.info("Перевірка оновлень: поточна %s, остання %s%s", APP_VERSION, latest or "—",
-             " — доступне оновлення" if data["available"] else "")
+    log.info("Перевірка оновлень: поточна %s, остання %s%s%s", APP_VERSION, latest or "—",
+             " — доступне оновлення" if data["available"] else "",
+             f"; канал alpha: {data['alpha'].get('latest') or data['alpha'].get('error')}" if data.get("alpha") else "")
     return data
 
 
 def public(info):
-    return {k: v for k, v in info.items() if not k.startswith("_")}
+    return {k: (public(v) if isinstance(v, dict) else v) for k, v in info.items() if not k.startswith("_")}
 
 
 def _download_verified(assets, name):
@@ -366,12 +421,17 @@ def _swap_now():
     log.info("Kasa.exe оновлено; попередня версія — %s", old.name)
 
 
-def install():
-    """Завантажити й встановити останній випуск. Після цього треба перезапустити касу."""
-    info = check(force=True)
+def install(target="stable"):
+    """
+    Завантажити й встановити випуск. target: «stable» — остання стабільна; «alpha» — найновіша тестова
+    (лише з «update_channel»: «alpha» у config.json); «back» — повернутися з тестової на стабільну.
+    Після цього треба перезапустити касу.
+    """
+    full = check(force=True)
+    kind = full["kind"]
+    info = full if target == "stable" else (full.get("alpha") if target == "alpha" else full.get("stable_back")) or {}
     if not info.get("available"):
-        raise UpdateError(info.get("problem") or "Оновлень немає")
-    kind = info["kind"]
+        raise UpdateError(info.get("problem") or info.get("error") or "Оновлень немає")
     name = EXE_ASSET if kind == "exe" else PY_ASSET
     log.info("Оновлення до %s (%s)…", info["latest"], name)
     data = _download_verified(info["_assets"], name)
