@@ -15,6 +15,7 @@
 Залежності: лише стандартна бібліотека Python 3.9+ (certifi — необов'язково).
 """
 
+import contextlib
 import hashlib
 import http.client
 import json
@@ -874,32 +875,35 @@ class CheckboxAPI:
     RECEIPTS_PAGE = 500          # чеків за запит; якщо Checkbox не прийме — 100
     RECEIPTS_MAX = 300_000       # запобіжник від нескінченного циклу
 
-    def search_receipts(self, date_from, date_to, limit=None, on_page=None):
+    def search_receipts(self, date_from, date_to, limit=None, on_page=None, guard=None):
         """
         Чеки за період (datetime з поясом). GET /receipts/search з пагінацією limit/offset.
         on_page(batch) — обробити сторінку одразу (тоді в пам'яті лише одна сторінка) і повернути кількість;
-        без on_page — повертає список чеків.
+        без on_page — повертає список чеків. on_page може повернути False — зупинити завантаження.
+        guard — блокування на кожну сторінку (фонове завантаження не заважає продажам між сторінками).
         """
         limit = limit or self.RECEIPTS_PAGE
         out, offset, total = [], 0, 0
         while True:
-            try:
-                data = self._req("GET", "/receipts/search", params={
-                    "from_date": date_from.isoformat(timespec="seconds"),
-                    "to_date": date_to.isoformat(timespec="seconds"),
-                    "desc": "true", "limit": limit, "offset": offset})
-            except CheckboxError as e:
-                if limit > 100 and offset == 0 and str(e).startswith(("HTTP 400", "HTTP 422")):
-                    log.info("Checkbox не прийняв limit=%d для /receipts/search (%s) — завантажую по 100", limit, e)
-                    CheckboxAPI.RECEIPTS_PAGE = limit = 100
-                    continue
-                raise
-            batch = (data or {}).get("results", []) if isinstance(data, dict) else (data or [])
-            total += len(batch)
-            if on_page:
-                on_page(batch)
-            else:
-                out.extend(batch)
+            with guard or contextlib.nullcontext():
+                try:
+                    data = self._req("GET", "/receipts/search", params={
+                        "from_date": date_from.isoformat(timespec="seconds"),
+                        "to_date": date_to.isoformat(timespec="seconds"),
+                        "desc": "true", "limit": limit, "offset": offset})
+                except CheckboxError as e:
+                    if limit > 100 and offset == 0 and str(e).startswith(("HTTP 400", "HTTP 422")):
+                        log.info("Checkbox не прийняв limit=%d для /receipts/search (%s) — завантажую по 100", limit, e)
+                        CheckboxAPI.RECEIPTS_PAGE = limit = 100
+                        continue
+                    raise
+                batch = (data or {}).get("results", []) if isinstance(data, dict) else (data or [])
+                total += len(batch)
+                if on_page:
+                    if on_page(batch) is False:
+                        return total
+                else:
+                    out.extend(batch)
             if len(batch) < limit or offset >= self.RECEIPTS_MAX:
                 return total if on_page else out
             offset += limit

@@ -19,6 +19,7 @@ import sys
 import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+import contextlib
 import threading
 import http.client
 import urllib.error
@@ -1560,42 +1561,99 @@ class App:
     def fetch_receipts(self, full=False):
         """
         Чеки з Checkbox. Чеки цієї каси вже в журналі (записуються з відповіді при пробитті), тож сюди
-        потрапляють лише пробиті деінде. Перше (або повне) завантаження — за JOURNAL_DAYS днів, далі —
-        лише від попереднього завантаження (з запасом FETCH_OVERLAP). Кожна сторінка — одразу в базу.
+        потрапляють лише пробиті деінде. Перше (або повне) завантаження — за JOURNAL_DAYS днів, у фоні
+        з прогресом (/api/sales/fetch/status); далі — лише від попереднього завантаження (з запасом FETCH_OVERLAP).
         """
-        now = datetime.now().astimezone()
-        start = now - timedelta(days=JOURNAL_DAYS)
         last, full_days = self.db.meta("receipts_fetched_at"), int(self.db.meta("receipts_full_days") or 0)
+        start = None
         if not full and last and full_days >= JOURNAL_DAYS:
             try:
-                start = max(start, datetime.fromisoformat(last).astimezone() - FETCH_OVERLAP)
+                start = datetime.fromisoformat(last).astimezone() - FETCH_OVERLAP
             except ValueError:
-                full = True
-        else:
-            full = True
-        counts = {"new": 0}
+                start = None
+        if start is None:                              # повне — у фоні, щоб каса працювала далі
+            return self.start_full_fetch()
+        return self._fetch_receipts(start, False)
+
+    def _fetch_receipts(self, start, full, guard=None, job=None):
+        now = datetime.now().astimezone()
+        start = max(start, now - timedelta(days=JOURNAL_DAYS))
+        lock = guard or contextlib.nullcontext()
+        counts = {"new": 0, "fetched": 0}
+        span = max((now - start).total_seconds(), 1)
 
         def page(batch):
             counts["new"] += self.db.add_checkbox_receipts(batch)
+            counts["fetched"] += len(batch)
+            if job is not None:
+                oldest = min((r.get("created_at") or "" for r in batch), default="")
+                try:
+                    done = (now - datetime.fromisoformat(oldest.replace("Z", "+00:00"))).total_seconds() / span
+                except ValueError:
+                    done = job["progress"]
+                job.update(fetched=counts["fetched"], new=counts["new"],
+                           progress=round(min(max(done, job["progress"]), 0.99), 3))
+                if job.get("stop"):
+                    return False
 
-        fetched = self.call(self.api.search_receipts, start, now, None, page)
+        fetched = self.call(self.api.search_receipts, start, now, None, page, guard)
+        if job is not None and job.get("stop"):
+            log.info("Повне завантаження чеків зупинено: отримано %d, нових %d", counts["fetched"], counts["new"])
+            return {"fetched": counts["fetched"], "new": counts["new"], "stopped": True, "full": full}
         z_new, z_error = 0, None
-        try:
-            for z in self.call(self.api.z_reports, start, now):
-                z_new += 1 if self.db.add_z_report(z) else 0
-        except (CheckboxError, net.RequestException) as e:
-            z_error = str(e)
-            log.warning("Z-звіти з Checkbox не завантажено: %s", e)
-        stamp = now.replace(tzinfo=None).isoformat(timespec="seconds")   # початок запиту: нічого не пропустимо
-        with self.db.con:
-            self.db.con.execute("INSERT OR REPLACE INTO meta VALUES ('receipts_fetched_at', ?)", (stamp,))
-            if full:
-                self.db.con.execute("INSERT OR REPLACE INTO meta VALUES ('receipts_full_days', ?)", (str(JOURNAL_DAYS),))
-        removed, _ = self.purge_old()
+        with lock:
+            try:
+                for z in self.call(self.api.z_reports, start, now):
+                    z_new += 1 if self.db.add_z_report(z) else 0
+            except (CheckboxError, net.RequestException) as e:
+                z_error = str(e)
+                log.warning("Z-звіти з Checkbox не завантажено: %s", e)
+            stamp = now.replace(tzinfo=None).isoformat(timespec="seconds")   # початок запиту: нічого не пропустимо
+            with self.db.con:
+                self.db.con.execute("INSERT OR REPLACE INTO meta VALUES ('receipts_fetched_at', ?)", (stamp,))
+                if full:
+                    self.db.con.execute("INSERT OR REPLACE INTO meta VALUES ('receipts_full_days', ?)", (str(JOURNAL_DAYS),))
+            removed, _ = self.purge_old()
         log.info("Завантаження чеків з Checkbox (%s, з %s): отримано %d, нових %d", "повне" if full else "нові",
                  start.strftime("%Y-%m-%d %H:%M"), fetched, counts["new"])
         return {"fetched": fetched, "new": counts["new"], "removed": removed, "fetched_at": stamp, "full": full,
                 "z_new": z_new, "z_error": z_error}
+
+    # ---- повне завантаження у фоні ----
+    fetch_job = {"running": False}
+
+    def start_full_fetch(self):
+        if self.fetch_job.get("running"):
+            return {"background": True, "job": self.fetch_status()}
+        if not self.auth_ok:
+            raise UserError("Каса не підключена — відкрийте «Налаштування»")
+        job = {"running": True, "progress": 0.0, "fetched": 0, "new": 0, "days": JOURNAL_DAYS,
+               "started_at": datetime.now().isoformat(timespec="seconds"), "result": None, "error": None, "stop": False}
+        App.fetch_job = job
+        start = datetime.now().astimezone() - timedelta(days=JOURNAL_DAYS)
+
+        def work():
+            try:
+                job["result"] = self._fetch_receipts(start, True, APP_LOCK, job)
+                job["progress"] = 1.0 if not job["result"].get("stopped") else job["progress"]
+            except Exception as e:       # noqa — показати на сторінці, а не загубити в потоці
+                job["error"] = str(e)
+                log.warning("Повне завантаження чеків не вдалося: %s", e)
+            finally:
+                job["running"] = False
+                job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+
+        log.info("Повне завантаження чеків за %d днів — у фоні", JOURNAL_DAYS)
+        threading.Thread(target=work, name="receipts-full", daemon=True).start()
+        return {"background": True, "job": self.fetch_status()}
+
+    def fetch_status(self):
+        return {k: v for k, v in self.fetch_job.items() if k != "stop"}
+
+    def stop_full_fetch(self):
+        if self.fetch_job.get("running"):
+            self.fetch_job["stop"] = True
+        return self.fetch_status()
 
     def receipt_text(self, receipt_id):
         if not receipt_id:
@@ -1836,6 +1894,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"app": APP_ID})
         if u.path == "/api/config":         # лише читає прапорці — без черги, щоб показати «Підключаюся…»
             return self._run(APP.config, locked=False)
+        if u.path == "/api/sales/fetch/status":   # прогрес фонового завантаження — без черги
+            return self._run(APP.fetch_status, locked=False)
         if u.path == "/api/update/check":   # звернення до GitHub — без черги, щоб не гальмувати касу
             return self._run(update_check, bool(q.get("force")), locked=False)
         routes = {
@@ -1941,6 +2001,8 @@ class Handler(BaseHTTPRequestHandler):
             self._run(APP.save_good, body)
         elif path == "/api/sales/fetch":
             self._run(APP.fetch_receipts, bool((body or {}).get("full")))
+        elif path == "/api/sales/fetch/stop":
+            self._run(APP.stop_full_fetch, locked=False)
         elif path == "/api/goods/discard":
             self._run(APP.discard_good, body)
         elif path == "/api/terminal/save":
@@ -2122,6 +2184,12 @@ PAGE = r"""<!DOCTYPE html>
   details.shift table { background: var(--card); }
   .upd { display: flex; justify-content: center; align-items: center; gap: 14px; padding: 8px 20px; background: var(--ok-bg); color: var(--ok-fg); border-bottom: 1px solid var(--ok-line); font-size: 14px; }
   .upd a { color: inherit; }
+  .jobbar { position: sticky; top: 0; z-index: 50; background: var(--card); border-bottom: 1px solid var(--line); padding: 6px 20px 8px; }
+  .jobtrack { height: 6px; border-radius: 999px; background: var(--subtle); overflow: hidden; }
+  .jobfill { height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width .4s ease; }
+  .jobbar.indet .jobfill { width: 30% !important; animation: jobind 1.2s ease-in-out infinite; }
+  @keyframes jobind { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+  .jobtext { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 5px; font-size: 13px; color: var(--muted); }
   .upd-overlay { position: fixed; inset: 0; background: rgba(15,23,42,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
   .upd-overlay .card { text-align: center; min-width: 320px; }
   .spin { width: 34px; height: 34px; margin: 4px auto 12px; border: 4px solid var(--info-bg); border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }
@@ -2348,6 +2416,11 @@ PAGE = r"""<!DOCTYPE html>
   <button class="btn sec" id="quitBtn" title="Зупинити касу">⏻ Вийти</button>
 </header>
 <div id="updateBanner" class="upd" style="display:none"></div>
+<div id="jobBar" class="jobbar" style="display:none">
+  <div class="jobtrack"><div class="jobfill" id="jobFill"></div></div>
+  <div class="jobtext"><span id="jobText">Завантаження чеків…</span>
+    <button class="btn sec small" id="jobStop">Зупинити</button></div>
+</div>
 <div id="updateOverlay" class="upd-overlay" style="display:none"><div class="card"><div class="spin"></div><b id="updateStage">Оновлення…</b>
   <p class="muted" id="updateHint" style="margin:6px 0 0">Не закривайте цю вкладку — вона перезавантажиться сама.</p></div></div>
 <nav>
@@ -5366,14 +5439,45 @@ $('#salesDays').onclick = e => {
 };
 async function fetchReceipts(btn, full) {
   return busy(btn, async () => {
-    if (full && !(await ask('Заново перевірити в Checkbox усі чеки за останні 30 днів? Для каси з тисячами чеків на день це може тривати кілька хвилин; касу можна використовувати далі.', { title: 'Повне завантаження', ok: 'Завантажити' }))) return;
+    if (full && !(await ask('Заново перевірити в Checkbox усі чеки за останні 30 днів? Для каси з тисячами чеків на день це може тривати кілька хвилин. Завантаження йде у фоні — касою можна користуватися, прогрес видно вгорі сторінки.', { title: 'Повне завантаження', ok: 'Завантажити' }))) return;
     const r = await api('/api/sales/fetch', { full });
+    if (r.background) { jobWatching = true; renderJob(r.job); pollJob(); toast('Повне завантаження чеків іде у фоні — касою можна користуватися'); return; }
     toast((r.full ? 'Повне завантаження: ' : 'Нові з Checkbox: ') + `отримано чеків ${r.fetched}, нових у журналі ${r.new}`
       + (r.removed ? ` · видалено старих: ${r.removed}` : '')
       + (r.z_error ? ` · Z-звіти не завантажено: ${r.z_error}` : r.z_new ? ` · нових Z-звітів: ${r.z_new}` : ''), !!r.z_error);
     await loadSales();
   });
 }
+// фонове повне завантаження: смуга прогресу вгорі — на всіх вкладках
+let jobTimer = null;
+const fmtN = n => Number(n || 0).toLocaleString('uk-UA');
+function renderJob(j) {
+  const bar = $('#jobBar');
+  if (!j || !j.running) { bar.style.display = 'none'; return; }
+  bar.style.display = '';
+  const pct = Math.round((j.progress || 0) * 100);
+  bar.classList.toggle('indet', !j.fetched);
+  $('#jobFill').style.width = pct + '%';
+  $('#jobText').textContent = j.fetched ? `Завантаження чеків з Checkbox за ${j.days} днів: ${pct}% · отримано ${fmtN(j.fetched)}, нових ${fmtN(j.new)}`
+    : `Завантаження чеків з Checkbox за ${j.days} днів: підготовка…`;
+}
+async function pollJob() {
+  clearTimeout(jobTimer);
+  let j; try { j = await api('/api/sales/fetch/status'); } catch (e) { jobTimer = setTimeout(pollJob, 3000); return; }
+  renderJob(j);
+  if (j.running) { jobWatching = true; jobTimer = setTimeout(pollJob, 1000); return; }
+  if (jobWatching && j.finished_at) {                              // щойно закінчилось — повідомити
+    jobWatching = false;
+    const r = j.result || {};
+    if (j.error) toast('Повне завантаження чеків не вдалося: ' + j.error, true);
+    else if (r.stopped) toast(`Завантаження зупинено: отримано ${fmtN(r.fetched)}, нових ${fmtN(r.new)}.`);
+    else toast(`Повне завантаження: отримано чеків ${fmtN(r.fetched)}, нових у журналі ${fmtN(r.new)}`
+      + (r.z_error ? ` · Z-звіти не завантажено: ${r.z_error}` : r.z_new ? ` · нових Z-звітів: ${r.z_new}` : ''), !!r.z_error);
+    if ($('#sales').classList.contains('active')) loadSales();
+  }
+}
+let jobWatching = false;
+$('#jobStop').onclick = async () => { try { renderJob(await api('/api/sales/fetch/stop', {})); } catch (e) { toast(e.message, true); } };
 $('#fetchReceipts').onclick = e => fetchReceipts(e.target, false);
 $('#fetchReceiptsFull').onclick = e => fetchReceipts(e.target, true);
 
@@ -6005,7 +6109,8 @@ async function runUpdate(target) {
   $('#updateHint').textContent = 'Запустіть касу ще раз — оновлення вже встановлено.';
   document.querySelector('#updateOverlay .spin').style.display = 'none';
 }
-setTimeout(() => checkUpdates(false), 1500);   // у фоні, щоб не гальмувати відкриття каси
+setTimeout(() => checkUpdates(false), 1500);
+setTimeout(pollJob, 800);   // завантаження могло йти до оновлення сторінки   // у фоні, щоб не гальмувати відкриття каси
 </script>
 </body>
 </html>
