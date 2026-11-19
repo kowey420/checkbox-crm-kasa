@@ -1082,8 +1082,14 @@ class App:
             log.warning("Після списання товари не оновлено: %s", e)
         return result
 
-    def stock_docs(self):
-        return {"docs": self.db.stock_docs(), "writeoff_reasons": list(self.WRITEOFF_REASONS)}
+    def stock_docs(self, kind=None, supplier=None, date_from=None, date_to=None):
+        kind = kind if kind in ("IN", "OUT") else None
+        for d in (date_from, date_to):
+            if d and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+                raise UserError("Невірна дата")
+        docs = self.db.stock_docs(1000, kind, supplier or None, date_from or None, date_to or None)
+        return {"docs": docs, "limit": 1000, "parties": self.db.stock_doc_parties(kind) if kind else [],
+                "writeoff_reasons": list(self.WRITEOFF_REASONS)}
 
     # ---- пошук товару за штрихкодом у відкритих базах ----
     def barcode_lookup(self, code):
@@ -1928,7 +1934,8 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/api/goods/next-code":
             self._run(APP.next_code)
         elif u.path == "/api/stock-docs":
-            self._run(APP.stock_docs)
+            a = lambda k: (q.get(k) or [""])[0] or None
+            self._run(APP.stock_docs, a("kind"), a("supplier"), a("from"), a("to"))
         elif u.path == "/api/barcode/lookup":
             self._run(APP.barcode_lookup, (q.get("code") or [""])[0])
         elif u.path == "/api/excise/check":
@@ -2117,6 +2124,8 @@ PAGE = r"""<!DOCTYPE html>
     .subnav { position: static; flex-direction: row; overflow-x: auto; }
     .subnav button { width: auto; white-space: nowrap; }
   }
+  input[type=date] { padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; font: inherit; background: var(--surface); color: inherit; }
+  :root[data-theme="dark"] input[type=date] { color-scheme: dark; }
   input[type=text], input[type=number], input[type=password] { width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; font: inherit; }
   input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent; }
   button.btn { border: 0; border-radius: 8px; padding: 9px 16px; font: inherit; font-weight: 600; cursor: pointer; background: var(--accent-btn); color: #fff; }
@@ -2208,6 +2217,11 @@ PAGE = r"""<!DOCTYPE html>
   th.sortable { cursor: pointer; user-select: none; } th.sortable:hover { color: var(--text); }
   th.sortable[data-dir]:not([data-dir=""])::after { content: ' ' attr(data-dir); font-size: 10px; color: var(--accent); }
   #spDocs tr[data-id] { cursor: pointer; } #spDocs tr[data-id]:hover { background: var(--hover); }
+  .spfilter { gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 8px; }
+  .spfilter label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+  .spfilter select { min-width: 220px; width: auto; } .spfilter input[type=date] { width: 160px; }
+  .spfilter .btn { margin-bottom: 1px; }
+  .spfilter #spFSum { margin-left: auto; align-self: center; }
   .modal .card.settings { max-width: 760px; overflow-x: hidden; padding-bottom: 0; }
   .card.settings h4.sect { margin: 18px 0 8px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
     color: var(--muted); padding-bottom: 6px; border-bottom: 1px solid var(--line); }
@@ -2485,7 +2499,8 @@ PAGE = r"""<!DOCTYPE html>
       <button data-pane="gpGoods"><span class="si">📦</span><span class="st">Товари</span><span class="sc" id="navGoodsN"></span></button>
       <button data-pane="gpGroups"><span class="si">📁</span><span class="st">Групи товарів</span><span class="sc" id="navGroupsN"></span></button>
       <button data-pane="gpTaxes"><span class="si">％</span><span class="st">Податкові ставки</span><span class="sc" id="navTaxesN"></span></button>
-      <button data-pane="gpSupply"><span class="si">📥</span><span class="st">Поставка / списання</span><span class="sc" id="navSupplyN"></span></button>
+      <button data-pane="gpSupply" data-m="in"><span class="si">📥</span><span class="st">Поставки</span><span class="sc" id="navSupplyN"></span></button>
+      <button data-pane="gpSupply" data-m="out"><span class="si">📤</span><span class="st">Списання</span><span class="sc" id="navWriteoffN"></span></button>
       <button data-pane="gpExcise"><span class="si">🏷</span><span class="st">Акцизні марки</span><span class="sc" id="navExciseN"></span></button>
     </aside>
     <div class="subpanes">
@@ -2535,7 +2550,8 @@ PAGE = r"""<!DOCTYPE html>
     </div>
     <div class="card subpane" id="gpSupply">
       <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:10px">
-        <div class="viewsw" id="spMode"><button data-m="in">📥 Поставка</button><button data-m="out">📤 Списання</button></div>
+        <h3 style="margin:0" id="spTitle">📥 Поставка</h3>
+        <div class="viewsw" id="spMode" style="display:none"><button data-m="in">📥 Поставка</button><button data-m="out">📤 Списання</button></div>
         <small class="muted" id="spSub">Скануйте товари підряд; кількість і собівартість можна змінити</small>
       </div>
       <div class="form" style="margin-top:12px" id="spInFields">
@@ -2564,8 +2580,15 @@ PAGE = r"""<!DOCTYPE html>
           <button class="btn ok" id="spPost">✔ Провести поставку</button>
         </span>
       </div>
-      <h4 style="margin:22px 0 6px">Проведені документи</h4>
-      <table><thead><tr><th>Дата</th><th>Документ</th><th>Постачальник / причина</th><th>№ накладної</th><th class="num">Позицій</th><th class="num">Сума, ₴</th><th>Checkbox</th></tr></thead>
+      <h4 style="margin:22px 0 6px" id="spDocsTitle">Проведені поставки</h4>
+      <div class="row spfilter">
+        <label><span id="spFPartyL">Постачальник</span><select id="spFParty"><option value="">Усі</option></select></label>
+        <label>Від<input type="date" id="spFFrom"></label>
+        <label>До<input type="date" id="spFTo"></label>
+        <button class="btn sec small" id="spFReset" title="Усі за останній рік">Скинути</button>
+        <small class="muted" id="spFSum"></small>
+      </div>
+      <table><thead><tr><th>Дата</th><th>№</th><th id="spDocsParty">Постачальник</th><th class="spInCol">№ накладної</th><th class="num">Позицій</th><th class="num">Сума, ₴</th><th>Checkbox</th></tr></thead>
         <tbody id="spDocs"></tbody></table>
     </div>
     <div class="card subpane" id="gpExcise">
@@ -3468,7 +3491,8 @@ function showGoodsPane(id) {
   goodsPane = id;
   try { localStorage.setItem('kasa_goods_pane', id); } catch (e) {}
   document.querySelectorAll('#goods .subpane').forEach(p => p.classList.toggle('on', p.id === id));
-  document.querySelectorAll('#goodsNav button').forEach(b => b.classList.toggle('on', b.dataset.pane === id));
+  document.querySelectorAll('#goodsNav button').forEach(b => b.classList.toggle('on', b.dataset.pane === id
+    && (!b.dataset.m || typeof stockMode === 'undefined' || b.dataset.m === stockMode)));
   if (id === 'gpExcise') loadExcise();
   if (id === 'gpSupply' && typeof supply !== 'undefined' && supply) { renderSupply(); loadStockDocs(); setTimeout(() => $('#spScan').focus(), 30); }
 }
@@ -3479,6 +3503,7 @@ function renderGoodsNav() {
   if (window.exciseTotal != null) $('#navExciseN').textContent = window.exciseTotal;
   if (typeof supply !== 'undefined' && supply) {        // поставка оголошена нижче за кодом
     $('#navSupplyN').textContent = supply.lines.length || '';
+    $('#navWriteoffN').textContent = writeoff.lines.length || '';
     if (goodsPane === 'gpSupply' && !document.activeElement.closest('#spLines')) renderSupply();
   }
 }
@@ -3502,7 +3527,11 @@ $('#taxRefresh').onclick = e => busy(e.target, async () => {
   showTaxDiff(r.shift_diff);
   toast(`Податкові ставки оновлено: ${r.taxes}` + (r.shift_diff ? ' · у відкритій зміні діють попередні — див. попередження' : ''), !!r.shift_diff);
 });
-$('#goodsNav').onclick = e => { const b = e.target.closest('button[data-pane]'); if (b) showGoodsPane(b.dataset.pane); };
+$('#goodsNav').onclick = e => {
+  const b = e.target.closest('button[data-pane]'); if (!b) return;
+  if (b.dataset.m && typeof stockMode !== 'undefined') { stockMode = b.dataset.m; saveSupply(); spHint(''); }
+  showGoodsPane(b.dataset.pane);
+};
 let exciseTimer = null;
 async function loadExcise() {
   try {
@@ -3880,6 +3909,8 @@ function renderSupply(hotId) {
   setViewButtons($('#spMode'), stockMode);
   $('#spMode').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.m === stockMode));
   $('#spInFields').style.display = out ? 'none' : ''; $('#spOutFields').style.display = out ? '' : 'none';
+  $('#spTitle').textContent = out ? '📤 Списання' : '📥 Поставка';
+  if (spDocsKind !== stockMode) { spDocsKind = stockMode; spFilterReset(); loadStockDocs(); }
   $('#spSub').textContent = out ? 'Скануйте товари для списання; кількість можна змінити' : 'Скануйте товари підряд; кількість і собівартість можна змінити';
   $('#spPost').textContent = out ? '✔ Провести списання' : '✔ Провести поставку';
   $('#spPost').className = 'btn ' + (out ? 'danger' : 'ok');
@@ -3911,7 +3942,8 @@ function renderSupply(hotId) {
       <td><button class="x" data-a="del" title="Прибрати">✕</button></td></tr>`;
   }).join('') || '<tr><td colspan="6" class="muted">Відскануйте перший товар</td></tr>';
   $('#spTotal').textContent = doc.lines.length ? `Позицій: ${doc.lines.length} · ${out ? 'за собівартістю' : 'сума закупівлі'}: ${uah(total)} ₴` : '';
-  $('#navSupplyN').textContent = (supply.lines.length + writeoff.lines.length) || '';
+  $('#navSupplyN').textContent = supply.lines.length || '';
+  $('#navWriteoffN').textContent = writeoff.lines.length || '';
   $('#spPost').disabled = !doc.lines.length;
 }
 function supplyAdd(g, opts) {
@@ -4132,19 +4164,38 @@ async function postWriteoff() {
                : `Списання проведено в касі, але Checkbox його не прийняв: ${r.error}`, !r.sent);
   await loadGoods(); renderSupply(); loadStockDocs(); $('#spScan').focus();
 }
+// проведені документи поточного розділу (поставки / списання) з фільтром за постачальником / причиною й датами
+var spDocsKind = null;
+const isoDay = d => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+function spFilterReset() {
+  const t = new Date(), y = new Date(t); y.setFullYear(t.getFullYear() - 1);
+  $('#spFParty').value = ''; $('#spFFrom').value = isoDay(y); $('#spFTo').value = isoDay(t);
+}
 async function loadStockDocs() {
+  const out = stockMode === 'out', kind = out ? 'OUT' : 'IN';
+  const qs = new URLSearchParams({ kind, supplier: $('#spFParty').value, from: $('#spFFrom').value, to: $('#spFTo').value });
   try {
-    const { docs, writeoff_reasons } = await api('/api/stock-docs');
+    const { docs, parties, limit, writeoff_reasons } = await api('/api/stock-docs?' + qs);
     if (writeoff_reasons && writeoff_reasons.length) writeoffReasons = writeoff_reasons;
     stockDocs = docs;
+    $('#spDocsTitle').textContent = out ? 'Проведені списання' : 'Проведені поставки';
+    $('#spFPartyL').textContent = $('#spDocsParty').textContent = out ? 'Причина' : 'Постачальник';
+    const sel = $('#spFParty'), cur = sel.value;
+    sel.innerHTML = '<option value="">Усі</option>' + parties.map(x => `<option>${esc(x)}</option>`).join('');
+    sel.value = parties.includes(cur) ? cur : '';
+    document.querySelectorAll('.spInCol').forEach(x => x.style.display = out ? 'none' : '');
+    const total = docs.reduce((a, d) => a + (d.total_cost || 0), 0);
+    $('#spFSum').textContent = docs.length ? `Документів: ${docs.length}${docs.length >= limit ? '+' : ''} · сума: ${uah(total)} ₴` : '';
     $('#spDocs').innerHTML = docs.map(d => `<tr data-id="${d.id}" title="Клацніть, щоб переглянути документ">
-      <td>${esc(d.created_at.replace('T', ' ').slice(0, 16))}</td><td>${DOC_KIND[d.kind] || esc(d.kind)}</td>
-      <td>${esc(d.supplier || '—')}</td><td>${esc(d.doc_no || '—')}</td>
+      <td>${esc(d.created_at.replace('T', ' ').slice(0, 16))}</td><td>${d.id}</td>
+      <td>${esc(d.supplier || '—')}</td>${out ? '' : `<td>${esc(d.doc_no || '—')}</td>`}
       <td class="num">${d.positions}</td><td class="num">${uah(d.total_cost || 0)}</td>
       <td>${DOC_STATUS[d.status] || esc(d.status)}${d.error ? ` <small class="muted" title="${esc(d.error)}">ⓘ</small>` : ''}</td></tr>`).join('')
-      || '<tr><td colspan="7" class="muted">Документів ще не було</td></tr>';
+      || `<tr><td colspan="7" class="muted">${out ? 'Списань' : 'Поставок'} за цей період не було</td></tr>`;
   } catch (e) { toast(e.message, true); }
 }
+['#spFParty', '#spFFrom', '#spFTo'].forEach(id => $(id).onchange = loadStockDocs);
+$('#spFReset').onclick = () => { spFilterReset(); loadStockDocs(); };
 // перегляд проведеного документа
 const DOC_STATUS = { SENT: '✅ Відправлено', PENDING: '⏳ Не відправлено', FAILED: '❌ Не прийнято', LOCAL: '…' };
 const DOC_KIND = { IN: '📥 Поставка', OUT: '📤 Списання' };
@@ -4178,7 +4229,7 @@ $('#sdX').onclick = $('#sdClose').onclick = closeStockDoc;
 $('#stockDocModal').onclick = e => { if (e.target.id === 'stockDocModal') closeStockDoc(); };
 $('#stockDocModal').onkeydown = e => { if (e.key === 'Escape') closeStockDoc(); };
 
-if (goodsPane === 'gpSupply') { renderSupply(); loadStockDocs(); }
+if (goodsPane === 'gpSupply') showGoodsPane('gpSupply');   // меню вже знає режим (поставка / списання)
 
 // --- сканування нових товарів (штрихкод → відкрита база → картка товару) ---
 const scanNew = { active: false, current: null, log: [] };

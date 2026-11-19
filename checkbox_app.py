@@ -34,7 +34,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "1.7.4.1"      # версія каси; тег випуску на GitHub — v + ця версія
+APP_VERSION = "1.7.4.2"      # версія каси; тег випуску на GitHub — v + ця версія
 # Репозиторій з випусками для оновлення («власник/назва»). Порожній — оновлення вимкнено.
 GITHUB_REPO = "kowey420/checkbox-crm-kasa"
 
@@ -1287,9 +1287,25 @@ class LocalDB:
         with self.con:
             self.con.execute("UPDATE stock_docs SET status=?, error=? WHERE id=?", (status, error, doc_id))
 
-    def stock_docs(self, limit=50):
-        return [dict(r, lines=json.loads(r["lines"] or "[]")) for r in
-                self.con.execute("SELECT * FROM stock_docs ORDER BY id DESC LIMIT ?", (limit,))]
+    def stock_docs(self, limit=50, kind=None, supplier=None, date_from=None, date_to=None):
+        """Проведені документи; kind — IN/OUT, supplier — постачальник або причина, дати — «РРРР-ММ-ДД» включно."""
+        where, args = [], []
+        if kind:
+            where.append("kind = ?"); args.append(kind)
+        if supplier:
+            where.append("supplier = ?"); args.append(supplier)
+        if date_from:
+            where.append("created_at >= ?"); args.append(date_from)
+        if date_to:
+            where.append("created_at < ?"); args.append(date_to + "Z")      # «РРРР-ММ-ДДT…» < «РРРР-ММ-ДДZ»
+        sql = "SELECT * FROM stock_docs" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id DESC LIMIT ?"
+        return [dict(r, lines=json.loads(r["lines"] or "[]")) for r in self.con.execute(sql, (*args, limit))]
+
+    def stock_doc_parties(self, kind):
+        """Постачальники (IN) або причини (OUT), що трапляються в документах — для фільтра."""
+        return [r[0] for r in self.con.execute(
+            "SELECT supplier FROM stock_docs WHERE kind = ? AND COALESCE(supplier, '') <> '' "
+            "GROUP BY supplier ORDER BY MAX(id) DESC", (kind,))]
 
     # --- собівартість і постачальник ---
     def extras(self):
